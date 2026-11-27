@@ -1,0 +1,262 @@
+import { fetchWithAuth } from "./fetchWithAuth";
+
+export async function getCoachWellbeing(coachEmail?: string, compact = false) {
+  const params = new URLSearchParams();
+  if (coachEmail) params.set("coach_email", coachEmail);
+  if (compact) params.set("compact", "1");
+  params.set("_", String(Date.now()));
+  const query = params.toString() ? `?${params.toString()}` : "";
+  return await fetchWithAuth(`/coach-wellbeing-dashboard/${query}`);
+}
+
+export async function getLearnerWellbeingReport(learnerId: string | number) {
+  return await fetchWithAuth(`/learner-wellbeing-report/${encodeURIComponent(String(learnerId))}/`);
+}
+
+export async function getCoachWellbeingWorkflow(coachEmail?: string) {
+  const params = new URLSearchParams();
+  if (coachEmail) params.set("coach_email", coachEmail);
+  const query = params.toString() ? `?${params.toString()}` : "";
+  return await fetchWithAuth(`/coach-wellbeing-workflow/${query}`);
+}
+
+export async function getCoachOptions() {
+  return await fetchWithAuth(`/coach-options/?_=${Date.now()}`, { cache: "no-store" });
+}
+
+export type CreateSupportTicketPayload = {
+  wellbeing_record_id: number | string;
+  ticket_type: "wellbeing" | "safeguarding";
+  subject: string;
+  details?: string;
+  urgency?: "low" | "medium" | "high" | "urgent";
+  preferred_contact?: "email" | "phone";
+  incident_date?: string;
+  incident_time?: string;
+  created_by?: string;
+  days_to_close?: number;
+  creator_role?: string;
+};
+
+export async function createSupportTicket(payload: CreateSupportTicketPayload) {
+  return await fetchWithAuth("/support-tickets/", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getSupportTickets(coachEmail?: string) {
+  const query = coachEmail ? `?coach_email=${encodeURIComponent(coachEmail)}` : "";
+  return await fetchWithAuth(`/support-tickets/list/${query}`);
+}
+
+export type UpdateSupportTicketPayload = {
+  status?: string;
+  urgency?: string;
+  subject?: string;
+  details?: string;
+  ticket_type?: string;
+  preferred_contact?: string;
+  assigned_owner?: string;
+};
+
+export async function updateSupportTicket(ticketId: number, payload: UpdateSupportTicketPayload) {
+  return await fetchWithAuth(`/support-tickets/${ticketId}/`, {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function deleteTicket(ticketId: number) {
+  return await fetchWithAuth(`/support-tickets/${ticketId}/`, { method: "DELETE" });
+}
+
+export async function getTicketNotes(ticketId: number) {
+  return await fetchWithAuth(`/support-tickets/${ticketId}/notes/`);
+}
+
+export async function createTicketNote(ticketId: number, note: string) {
+  return await fetchWithAuth(`/support-tickets/${ticketId}/notes/`, {
+    method: "POST",
+    body: JSON.stringify({ note }),
+  });
+}
+
+export async function getTicketEvidence(ticketId: number) {
+  return await fetchWithAuth(`/support-tickets/${ticketId}/evidence/`);
+}
+
+export async function getTicketSurveyResponses(ticketId: number) {
+  return await fetchWithAuth(`/support-tickets/${ticketId}/survey-responses/`);
+}
+
+export async function archiveTicket(ticketId: number) {
+  return await fetchWithAuth(`/support-tickets/${ticketId}/archive/`, { method: "POST" });
+}
+
+export async function restoreTicket(ticketId: number) {
+  return await fetchWithAuth(`/support-tickets/${ticketId}/restore/`, { method: "POST" });
+}
+
+export async function getArchivedTickets(coachEmail?: string) {
+  const query = coachEmail ? `?coach_email=${encodeURIComponent(coachEmail)}` : "";
+  return await fetchWithAuth(`/support-tickets/archived/${query}`);
+}
+
+export async function uploadEvidenceFile(file: File) {
+  const form = new FormData();
+  form.append("file", file);
+  return await fetchWithAuth("/evidence/upload/", { method: "POST", body: form });
+}
+
+export async function createTicketEvidence(
+  ticketId: number,
+  payload: { description: string; file_url?: string; file_name?: string; mime_type?: string; data_url?: string }
+) {
+  return await fetchWithAuth(`/support-tickets/${ticketId}/evidence/`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export type BookingAppointmentPayload = {
+  date: string;
+  time: string;
+  duration?: number;
+  service_id?: string;
+  staff_member_id?: string;
+  customer_name?: string;
+  customer_email?: string;
+  notes?: string;
+};
+
+export async function getBookingStaff(serviceId: string): Promise<{ id: string; displayName: string }[]> {
+  return await fetchWithAuth(`/bookings/staff/?service_id=${encodeURIComponent(serviceId)}`);
+}
+
+export async function createBookingAppointment(payload: BookingAppointmentPayload) {
+  return await fetchWithAuth("/bookings/appointments/", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getBookingServices(): Promise<{ id: string; displayName: string }[]> {
+  return await fetchWithAuth("/bookings/services/");
+}
+
+export async function getBookingAvailability(serviceId: string, date: string): Promise<{ slots: string[]; duration: number; fallback?: boolean }> {
+  return await fetchWithAuth(`/bookings/availability/?service_id=${encodeURIComponent(serviceId)}&date=${date}`);
+}
+
+export async function getOnboardingReports(coachEmail?: string, archived = false) {
+  const params = new URLSearchParams();
+  if (coachEmail) params.set("coach_email", coachEmail);
+  if (archived) params.set("archived", "1");
+  params.set("_", String(Date.now()));
+  const query = params.toString() ? `?${params.toString()}` : "";
+  return await fetchWithAuth(`/onboarding-reports/${query}`);
+}
+
+export async function getOnboardingReportDetail(reportId: string) {
+  return await fetchWithAuth(`/onboarding-reports/${encodeURIComponent(reportId)}/`);
+}
+
+export type InclusionTicketDetails = {
+  subject: string;
+  category: string;
+  source_report_id: string;
+  created_by: string;
+  preferred_contact: "email" | "phone";
+  incident_date: string | null;
+  incident_time: string | null;
+  details?: string;
+};
+
+export type CreateInclusionTicketPayload = {
+  ticket_id: string;
+  roster_learner_id: string;
+  subject: string;
+  details: string;
+  category: string;
+  risk_level: "Low" | "Moderate" | "High";
+  preferred_contact: "email" | "phone";
+  incident_date: string;
+  incident_time: string;
+  evidence_description: string;
+};
+
+export type InclusionTicketLearner = {
+  id: string;
+  learner_name: string;
+  learner_email: string;
+  programme: string;
+  coach_name: string;
+  coach_email: string;
+};
+
+export async function getInclusionTicketLearners(coachEmail?: string): Promise<{ learners: InclusionTicketLearner[] }> {
+  const params = new URLSearchParams({ _: String(Date.now()) });
+  if (coachEmail) params.set("coach_email", coachEmail);
+  return await fetchWithAuth(`/onboarding-ticket-learners/?${params}`, { cache: "no-store" });
+}
+
+export async function createInclusionTicket(payload: CreateInclusionTicketPayload, files: File[]) {
+  const form = new FormData();
+  Object.entries(payload).forEach(([key, value]) => {
+    if (value) form.append(key, value);
+  });
+  files.forEach((file) => form.append("files", file));
+  try {
+    return await fetchWithAuth("/onboarding-tickets/", { method: "POST", body: form });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Could not create ticket. Please try again.";
+    const jsonStart = message.indexOf("{");
+    if (jsonStart >= 0) {
+      let detail: string | undefined;
+      try { detail = JSON.parse(message.slice(jsonStart)).detail; } catch { /* Keep the original error. */ }
+      if (detail) throw new Error(detail);
+    }
+    throw new Error(message);
+  }
+}
+
+export async function getOnboardingReportNotes(reportId: string) {
+  return await fetchWithAuth(`/onboarding-reports/${reportId}/notes/`);
+}
+
+export async function createOnboardingReportNote(reportId: string, note: string) {
+  return await fetchWithAuth(`/onboarding-reports/${reportId}/notes/`, {
+    method: "POST",
+    body: JSON.stringify({ note }),
+  });
+}
+
+export async function getOnboardingReportEvidence(reportId: string) {
+  return await fetchWithAuth(`/onboarding-reports/${reportId}/evidence/`);
+}
+
+export async function createOnboardingReportEvidence(
+  reportId: string,
+  payload: { description: string; file_url?: string; file_name?: string; mime_type?: string; data_url?: string }
+) {
+  return await fetchWithAuth(`/onboarding-reports/${reportId}/evidence/`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function updateOnboardingReport(reportId: string, payload: { status?: string; progress_tier?: number | null }) {
+  return await fetchWithAuth(`/onboarding-reports/${reportId}/update/`, {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function archiveOnboardingReport(reportId: string) {
+  return await fetchWithAuth(`/onboarding-reports/${reportId}/archive/`, { method: "POST" });
+}
+
+export async function restoreOnboardingReport(reportId: string) {
+  return await fetchWithAuth(`/onboarding-reports/${reportId}/restore/`, { method: "POST" });
+}

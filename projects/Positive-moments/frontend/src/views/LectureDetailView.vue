@@ -1,0 +1,766 @@
+<script setup lang="ts">
+/**
+ * One lecture, in full. The single canonical detail page, keyed by lecture_id.
+ *
+ * The page states the platform's own answers and derives none of them. In
+ * particular `retry_eligibility` and the recover-attendance plan come from the
+ * server, so a disabled action is disabled for a reason the platform can name,
+ * and a confirmation dialog shows the plan the server generated rather than
+ * one this component imagined.
+ *
+ * There is no Force Reprocess here and there is no generic action runner. The
+ * three guarded endpoints, plus the manual transcript upload (store, then
+ * process this lecture only), are the whole mutation surface. The upload is
+ * offered only when the server says Teams listed a transcript part for this
+ * lecture that holds no content.
+ *
+ * The Positive Moments tab is the lecture's Media view: analysis, recording
+ * and every moment with its clip (components/media/LectureMomentsPanel.vue).
+ * Lecture Parts do not exist yet, so no tab promises them.
+ *
+ * The full recording is opened through an authenticated API call on click;
+ * its URL is never embedded in the page.
+ */
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+
+import ActionPlanDialog from '../components/ActionPlanDialog.vue'
+import ProcessingJobStatus from '../components/operations/ProcessingJobStatus.vue'
+import TranscriptUploadDialog from '../components/operations/TranscriptUploadDialog.vue'
+import LectureMomentsPanel from '../components/media/LectureMomentsPanel.vue'
+import AppIcon from '../components/AppIcon.vue'
+import AttendanceCell from '../components/operations/AttendanceCell.vue'
+import EmptyState from '../components/EmptyState.vue'
+import ErrorState from '../components/ErrorState.vue'
+import LoadingSkeleton from '../components/LoadingSkeleton.vue'
+import PageHeader from '../components/PageHeader.vue'
+import SectionPanel from '../components/SectionPanel.vue'
+import StageChip from '../components/operations/StageChip.vue'
+import StageMatrix from '../components/operations/StageMatrix.vue'
+import StatusBadge from '../components/StatusBadge.vue'
+import TabNav from '../components/TabNav.vue'
+import TechnicalDetails from '../components/TechnicalDetails.vue'
+import {
+  getDirectory, getLecture, getRecoverAttendancePlan, getRetryPlan, getTeamsTranscriptRetry,
+  getTranscriptUploadStatus, queueTeamsTranscriptRetry, recoverAttendance, retryLecture,
+} from '../services/operations'
+import { openRecording } from '../services/media'
+import { errorMessage, openSafely } from '../utils/format'
+import type {
+  DirectoryEntry, LectureDetail, ProcessingJob, TeamsTranscriptRetryStatus, TranscriptUploadStatus,
+} from '../types/operations'
+import { businessDateLong, cairoDateTime, cairoTimeRange } from '../utils/datetime'
+import {
+  actionLabel, actionTone, bucketLabel, bucketTone, humanise, perfectReason,
+  recordingOwner, recordingSource, retryReason, stageLabel, stageState,
+} from '../utils/labels'
+
+const route = useRoute()
+const router = useRouter()
+
+const lecture = ref<LectureDetail | null>(null)
+const entry = ref<DirectoryEntry | null>(null)
+const recoverPlan = ref<Record<string, unknown> | null>(null)
+const loading = ref(true)
+const error = ref('')
+const notice = ref('')
+const actionKind = ref<'Retry' | 'Recover attendance' | 'Retry Teams transcript' | ''>('')
+const actionPlan = ref<Record<string, unknown> | null>(null)
+const actionBusy = ref(false)
+/** Manual transcript upload: the server's target and processing plan, or null when unavailable. */
+const uploadStatus = ref<TranscriptUploadStatus | null>(null)
+const uploadOpen = ref(false)
+const uploadProcessOnly = ref(false)
+/** Retry Teams transcript: the server's plan for this lecture and its latest job, or null. */
+const teamsRetry = ref<TeamsTranscriptRetryStatus | null>(null)
+
+const lectureId = computed(() => String(route.params.lectureId))
+const tab = computed(() => (typeof route.query.tab === 'string' ? route.query.tab : 'overview'))
+
+function selectTab(id: string) {
+  router.replace({ query: { ...route.query, tab: id === 'overview' ? undefined : id } })
+}
+
+async function load() {
+  loading.value = true
+  error.value = ''
+  try {
+    // The plan needs only the id, so it is asked for alongside the lecture
+    // rather than after it; the directory needs the lecture's date.
+    const plan = getRecoverAttendancePlan(lectureId.value).catch(() => null)
+    const upload = getTranscriptUploadStatus(lectureId.value).catch(() => null)
+    const teams = getTeamsTranscriptRetry(lectureId.value).catch(() => null)
+    const detail = await getLecture(lectureId.value)
+    lecture.value = detail
+    const [directory, recover, uploadState, teamsState] = await Promise.all([
+      getDirectory(detail.session_date, detail.session_date), plan, upload, teams,
+    ])
+    entry.value = directory.lectures.find((row) => row.lecture_id === detail.lecture_id) ?? null
+    recoverPlan.value = recover
+    uploadStatus.value = uploadState
+    teamsRetry.value = teamsState
+  } catch (caught) {
+    error.value = caught instanceof Error ? caught.message : 'This lecture could not be loaded.'
+  } finally {
+    loading.value = false
+  }
+}
+onMounted(load)
+watch(lectureId, load)
+
+/** Re-read the lecture after an upload without the loading skeleton (which would close the dialog). */
+async function refreshAfterUpload() {
+  try {
+    const [detail, uploadState, teamsState] = await Promise.all([
+      getLecture(lectureId.value), getTranscriptUploadStatus(lectureId.value).catch(() => null),
+      getTeamsTranscriptRetry(lectureId.value).catch(() => null),
+    ])
+    lecture.value = detail
+    uploadStatus.value = uploadState
+    teamsRetry.value = teamsState
+  } catch {
+    // The dialog already reported the outcome; the page catches up on its next load.
+  }
+}
+
+// While the lecture's background job is queued or running, re-read its status every 20 s, and the
+// lecture once more when it settles. The worker does the work; this page only watches.
+const JOB_POLL_MS = 20_000
+let jobTimer: ReturnType<typeof setTimeout> | null = null
+/** The lecture's latest background job, whichever request made it (upload or Teams retry). */
+const latestJob = computed<ProcessingJob | null>(() => uploadStatus.value?.job ?? teamsRetry.value?.job ?? null)
+const jobActive = computed(() => ['QUEUED', 'RUNNING'].includes(latestJob.value?.status ?? ''))
+
+function scheduleJobPoll() {
+  if (jobTimer) clearTimeout(jobTimer)
+  jobTimer = null
+  if (!jobActive.value) return
+  jobTimer = setTimeout(async () => {
+    try {
+      const [state, teamsState] = await Promise.all([
+        getTranscriptUploadStatus(lectureId.value).catch(() => null),
+        getTeamsTranscriptRetry(lectureId.value).catch(() => null),
+      ])
+      const job = state?.job ?? teamsState?.job ?? null
+      const settled = !['QUEUED', 'RUNNING'].includes(job?.status ?? '')
+      uploadStatus.value = state
+      teamsRetry.value = teamsState
+      if (settled) {
+        // The job's own status now says how it ended; a "queued" notice would be stale.
+        notice.value = ''
+        await refreshAfterUpload()
+      }
+    } catch {
+      // A missed poll is retried on the next tick.
+    }
+    scheduleJobPoll()
+  }, JOB_POLL_MS)
+}
+watch(() => latestJob.value?.status, scheduleJobPoll)
+onBeforeUnmount(() => { if (jobTimer) clearTimeout(jobTimer) })
+
+function openUpload(processOnly: boolean) {
+  uploadProcessOnly.value = processOnly
+  uploadOpen.value = true
+  notice.value = ''
+}
+
+/** The current manual upload, when the stored transcript came from one. */
+/** Plain words for the transcript fault the server reports. */
+const TRANSCRIPT_PROBLEMS: Record<string, string> = {
+  EMPTY_TRANSCRIPT_FOR_OCCURRENCE:
+    'Teams only had a transcript too short or empty to use, so the lecture was closed as not delivered.',
+  NO_TRANSCRIPT_FOR_OCCURRENCE: 'Teams had no transcript for this lecture, so it was closed as not delivered.',
+  TRANSCRIPT_LISTING_NOT_SETTLED:
+    'Teams was last asked before the meeting had finished, so its full transcript may not have existed yet.',
+}
+const teamsRetryAvailable = computed(() => teamsRetry.value?.plan.available === true)
+const transcriptProblem = computed(() => {
+  const code = teamsRetry.value?.plan.problem
+  return code ? (TRANSCRIPT_PROBLEMS[code] ?? `The transcript step stopped: ${humanise(code)}.`) : null
+})
+const TEAMS_RETRY_SUMMARY = 'Microsoft Teams is asked again for this lecture\u2019s transcript only. If Teams now '
+  + 'has a usable transcript, it is selected with the platform\u2019s normal rules and the lecture continues '
+  + 'through its pipeline: attendance, engagement, the quality evaluation (one model call), Perfect and the '
+  + 'recording link. Nothing already complete is redone and no other lecture is touched. It runs in the '
+  + 'background: you can leave this page and come back.'
+
+function openTeamsRetry() {
+  if (!teamsRetry.value) return
+  actionKind.value = 'Retry Teams transcript'
+  actionPlan.value = teamsRetry.value.plan as unknown as Record<string, unknown>
+  notice.value = ''
+}
+
+const manualTranscript = computed(() =>
+  uploadStatus.value?.uploads.filter((item) => item.is_current_content).slice(-1)[0] ?? null)
+
+const stages = computed(() => lecture.value?.stages)
+const qa = computed(() => stages.value?.QA_EVALUATION ?? null)
+const perfect = computed(() => stages.value?.PERFECT_ELIGIBILITY ?? null)
+const attendanceStage = computed(() => stages.value?.ATTENDANCE ?? null)
+const recoverAvailable = computed(() => recoverPlan.value?.available === true)
+/** The platform's Recording Link answer for this lecture; never a URL. */
+const recording = computed(() => lecture.value?.recording_link ?? null)
+const codedRecordings = computed(() => recording.value?.recording_link_mode === 'write')
+const momentKey = computed(() => entry.value?.legacy_session_key ?? null)
+const momentCount = computed(() => entry.value?.positive_clips_count ?? 0)
+const analysed = computed(() => entry.value?.clips_analysis_completeness === 'positive_clips_v5_final')
+
+const tabs = computed(() => [
+  { id: 'overview', label: 'Overview' },
+  { id: 'pipeline', label: 'Pipeline' },
+  { id: 'qa', label: 'Quality' },
+  { id: 'moments', label: 'Positive Moments', count: null },
+])
+
+const versionEntries = computed<[string, string][]>(() => {
+  const detail = lecture.value
+  if (!detail) return []
+  const rows: [string, string][] = [['lecture_id', detail.lecture_id],
+    ['orchestration_version', detail.orchestration_version]]
+  for (const [key, value] of Object.entries(detail.versions ?? {})) {
+    rows.push([key, Array.isArray(value) ? value.join(', ') : String(value)])
+  }
+  if (detail.duplicate_resolution?.winner_lecture_id) {
+    rows.push(['duplicate_winner_lecture_id', detail.duplicate_resolution.winner_lecture_id])
+  }
+  return rows
+})
+
+/** The full recording, fetched on click through the authenticated API. */
+async function openFullRecording() {
+  try {
+    openSafely(await openRecording(lectureId.value))
+  } catch (caught) {
+    notice.value = errorMessage(caught, 'This lecture has no recording that can be opened yet.')
+  }
+}
+
+async function openAction(kind: 'Retry' | 'Recover attendance') {
+  actionKind.value = kind
+  actionPlan.value = null
+  notice.value = ''
+  try {
+    actionPlan.value = kind === 'Retry'
+      ? await getRetryPlan(lectureId.value)
+      : await getRecoverAttendancePlan(lectureId.value)
+  } catch (caught) {
+    actionKind.value = ''
+    notice.value = caught instanceof Error ? caught.message : 'The action plan could not be loaded.'
+  }
+}
+
+async function confirmAction() {
+  if (!actionKind.value || !actionPlan.value) return
+  actionBusy.value = true
+  try {
+    if (actionKind.value === 'Retry Teams transcript') {
+      const result = await queueTeamsTranscriptRetry(lectureId.value)
+      actionKind.value = ''
+      actionPlan.value = null
+      await refreshAfterUpload()
+      notice.value = result.created
+        ? 'Queued. The background worker will ask Microsoft Teams for this lecture\u2019s transcript and '
+          + 'continue its processing. Progress is shown under Meeting and transcript.'
+        : (result.reason_message ?? 'Processing is already queued or running for this lecture.')
+      return
+    }
+    if (actionKind.value === 'Retry') {
+      await retryLecture(lectureId.value, String(actionPlan.value.action ?? ''))
+    } else {
+      await recoverAttendance(lectureId.value)
+    }
+    actionKind.value = ''
+    actionPlan.value = null
+    await load()
+    notice.value = 'The action completed and this lecture has been re-read from persisted state.'
+  } catch (caught) {
+    notice.value = errorMessage(caught, 'The guarded action was refused. Nothing was changed.')
+    if (actionKind.value === 'Retry Teams transcript') {
+      actionKind.value = ''
+      actionPlan.value = null
+      await refreshAfterUpload()
+    }
+  } finally {
+    actionBusy.value = false
+  }
+}
+</script>
+
+<template>
+  <div class="page stack">
+    <RouterLink class="btn-quiet" :to="{ name: 'lectures' }">
+      <AppIcon name="chevronLeft" :size="14" /> Lectures
+    </RouterLink>
+
+    <LoadingSkeleton v-if="loading" variant="cards" :rows="4" />
+    <ErrorState v-else-if="error" :message="error" @retry="load" />
+
+    <template v-else-if="lecture">
+      <PageHeader :kicker="entry?.trainer ?? 'Lecture'" :title="lecture.subject">
+        <template #meta>
+          <div class="mt-2.5 flex flex-wrap items-center gap-x-4 gap-y-1.5 text-sm text-muted">
+            <span class="inline-flex items-center gap-1.5">
+              <AppIcon name="calendar" :size="15" />{{ businessDateLong(lecture.session_date) }}
+            </span>
+            <span
+              v-if="cairoTimeRange(entry?.scheduled_start ?? lecture.scheduled_start, entry?.scheduled_end)"
+              class="inline-flex items-center gap-1.5"
+            >
+              <AppIcon name="clock" :size="15" />
+              {{ cairoTimeRange(entry?.scheduled_start ?? lecture.scheduled_start, entry?.scheduled_end) }} Cairo
+            </span>
+            <span v-if="entry?.trainer" class="inline-flex items-center gap-1.5">
+              <AppIcon name="users" :size="15" />{{ entry.trainer }}
+            </span>
+          </div>
+          <div class="mt-3 flex flex-wrap gap-2">
+            <StatusBadge :label="bucketLabel(lecture.bucket)" :tone="bucketTone(lecture.bucket)" :title="lecture.bucket" />
+            <StatusBadge
+              :label="actionLabel(lecture.next_executable_action)"
+              :tone="actionTone(lecture.next_executable_action)"
+              :title="lecture.next_executable_action"
+            />
+            <StatusBadge
+              v-if="lecture.blocking_stage"
+              :label="`At: ${stageLabel(lecture.blocking_stage)}`"
+              tone="neutral"
+            />
+          </div>
+        </template>
+        <template #actions>
+          <button
+            v-if="lecture.retry_eligibility.retry_eligible"
+            type="button"
+            class="btn-secondary"
+            @click="openAction('Retry')"
+          >
+            <AppIcon name="refresh" :size="16" /> Retry
+          </button>
+          <button
+            v-if="recoverAvailable"
+            type="button"
+            class="btn-primary"
+            @click="openAction('Recover attendance')"
+          >
+            <AppIcon name="users" :size="16" /> Recover attendance
+          </button>
+          <button
+            v-if="teamsRetryAvailable"
+            type="button"
+            class="btn-primary"
+            data-test="open-teams-transcript-retry"
+            @click="openTeamsRetry"
+          >
+            <AppIcon name="refresh" :size="16" /> Retry Teams transcript
+          </button>
+          <button
+            v-if="uploadStatus?.upload_allowed"
+            type="button"
+            class="btn-secondary"
+            data-test="open-transcript-upload"
+            @click="openUpload(false)"
+          >
+            <AppIcon name="upload" :size="16" /> Upload transcript
+          </button>
+          <button
+            v-if="uploadStatus?.processing.available"
+            type="button"
+            class="btn-primary"
+            data-test="open-transcript-processing"
+            @click="openUpload(true)"
+          >
+            <AppIcon name="refresh" :size="16" /> Process uploaded transcript
+          </button>
+        </template>
+      </PageHeader>
+
+      <p v-if="notice" class="notice" role="status">
+        <AppIcon name="info" :size="16" class="mt-0.5" />{{ notice }}
+      </p>
+
+      <div
+        v-if="lecture.is_suppressed_duplicate"
+        class="notice-warn"
+        role="note"
+      >
+        <AppIcon name="layers" :size="16" class="mt-0.5" />
+        <span>
+          <strong class="font-semibold">Duplicate calendar event suppressed.</strong>
+          The teaching calendar carried a second event for this lecture. It is kept for audit and never
+          enters processing.
+          <RouterLink
+            v-if="lecture.duplicate_resolution?.winner_lecture_id"
+            class="font-semibold underline"
+            :to="{ name: 'lecture', params: { lectureId: lecture.duplicate_resolution.winner_lecture_id } }"
+          >Open the lecture that was kept.</RouterLink>
+        </span>
+      </div>
+
+      <TabNav :tabs="tabs" :active="tab" @select="selectTab" />
+
+      <!-- ================= Overview ================= -->
+      <template v-if="tab === 'overview'">
+        <section class="grid gap-3 lg:grid-cols-3">
+          <SectionPanel title="What happens next">
+            <p class="text-sm leading-6 text-body">{{ actionLabel(lecture.next_action) }}</p>
+            <p v-if="lecture.blocking_stage" class="mt-1.5 text-xs text-muted">
+              Current step: {{ stageLabel(lecture.blocking_stage) }}
+            </p>
+            <div class="mt-3 divider" />
+            <p class="mt-3 text-xs font-semibold uppercase tracking-kicker text-muted">Retry</p>
+            <p class="mt-1 text-sm" :class="lecture.retry_eligibility.retry_eligible ? 'text-emerald-700' : 'text-muted'">
+              {{ lecture.retry_eligibility.retry_eligible ? 'Available' : 'Not available' }}
+            </p>
+            <p v-if="lecture.retry_eligibility.retry_reason" class="mt-0.5 text-xs leading-5 text-muted">
+              {{ retryReason(lecture.retry_eligibility.retry_reason) }}
+            </p>
+          </SectionPanel>
+
+          <SectionPanel title="Attendance">
+            <!--
+              A suppressed duplicate is not waiting for anything - nothing will
+              ever be read for it - so it must not borrow the waiting language.
+            -->
+            <template v-if="lecture.is_suppressed_duplicate">
+              <StatusBadge label="Not applicable" tone="quiet" />
+              <p class="mt-3 text-xs leading-5 text-muted">
+                Attendance is never resolved for a suppressed duplicate calendar event.
+              </p>
+            </template>
+            <template v-else>
+              <AttendanceCell
+                v-if="attendanceStage"
+                :authoritative="lecture.attendance_source_authoritative"
+                :not-delivered="lecture.not_delivered"
+                :coverage-status="lecture.attendance_coverage_status"
+                :attended-count="(attendanceStage.attended_count as number | undefined) ?? null"
+              />
+              <p class="mt-3 text-xs leading-5 text-muted">
+                Attendance is read from an external source. Until that source answers, the platform reports
+                waiting rather than a confirmed zero.
+              </p>
+            </template>
+          </SectionPanel>
+
+          <SectionPanel title="Perfect lecture">
+            <StatusBadge
+              :label="perfectReason(perfect?.reason as string | null).label"
+              :tone="perfectReason(perfect?.reason as string | null).tone"
+              :title="(perfect?.reason as string | null) ?? undefined"
+            />
+            <dl class="mt-3 space-y-1.5 text-sm">
+              <div class="flex items-center justify-between">
+                <dt class="text-muted">Eligibility</dt>
+                <dd><StageChip :state="stages!.PERFECT_ELIGIBILITY.state" /></dd>
+              </div>
+              <div class="flex items-center justify-between">
+                <dt class="text-muted">Synced to legacy</dt>
+                <dd><StageChip :state="stages!.PERFECT_SYNC.state" /></dd>
+              </div>
+            </dl>
+          </SectionPanel>
+        </section>
+
+        <section class="grid gap-3 lg:grid-cols-2">
+          <SectionPanel title="Meeting and transcript">
+            <dl class="space-y-2 text-sm">
+              <div class="flex items-center justify-between gap-4">
+                <dt class="text-muted">Teams meeting match</dt><dd><StageChip :state="stages!.MEETING.state" /></dd>
+              </div>
+              <div class="flex items-center justify-between gap-4">
+                <dt class="text-muted">Transcript retrieved</dt><dd><StageChip :state="stages!.TRANSCRIPT.state" /></dd>
+              </div>
+              <div class="flex items-center justify-between gap-4">
+                <dt class="text-muted">Canonical transcript</dt><dd><StageChip :state="stages!.CANONICAL_CUES.state" /></dd>
+              </div>
+              <div class="flex items-center justify-between gap-4">
+                <dt class="text-muted">Speakers attributed</dt><dd><StageChip :state="stages!.SPEAKERS.state" /></dd>
+              </div>
+              <div class="flex items-center justify-between gap-4">
+                <dt class="text-muted">Engagement measured</dt><dd><StageChip :state="stages!.ENGAGEMENT.state" /></dd>
+              </div>
+            </dl>
+            <p v-if="manualTranscript" class="mt-3 text-xs leading-5 text-muted" data-test="manual-transcript-source">
+              Transcript source: <strong class="font-semibold text-body">manual upload</strong>
+              <template v-if="manualTranscript.uploaded_by"> by {{ manualTranscript.uploaded_by }}</template>
+              on {{ cairoDateTime(manualTranscript.uploaded_at) }}
+              ({{ manualTranscript.original_filename }}), because Microsoft Graph could not retrieve it.
+            </p>
+            <div
+              v-if="transcriptProblem && (teamsRetryAvailable || !latestJob)"
+              class="notice-warn mt-3"
+              role="note"
+              data-test="transcript-problem"
+            >
+              <AppIcon name="info" :size="16" class="mt-0.5" />
+              <span>
+                {{ transcriptProblem }}
+                <template v-if="teamsRetryAvailable">
+                  Use <strong class="font-semibold">Retry Teams transcript</strong> to ask Teams again.
+                </template>
+              </span>
+            </div>
+            <div v-if="latestJob" class="mt-3" data-test="manual-transcript-job">
+              <p class="eyebrow mb-1">Background processing</p>
+              <ProcessingJobStatus :job="latestJob" />
+            </div>
+            <p
+              v-else-if="manualTranscript && uploadStatus?.processing.available"
+              class="mt-2 text-xs leading-5 text-muted"
+              data-test="manual-transcript-qa-pending"
+            >
+              Processing of the uploaded transcript is not queued yet. Use <strong>Process uploaded transcript</strong>
+              to queue it; it then runs in the background, quality evaluation included.
+            </p>
+          </SectionPanel>
+
+          <SectionPanel title="Recording and reporting">
+            <dl class="space-y-2 text-sm">
+              <div class="flex items-center justify-between gap-4">
+                <dt class="text-muted">Recording link</dt><dd><StageChip :state="stages!.RECORDING_LINK.state" /></dd>
+              </div>
+              <div class="flex items-center justify-between gap-4">
+                <dt class="text-muted">Excel sync</dt><dd><StageChip :state="stages!.EXCEL_SYNC.state" /></dd>
+              </div>
+              <div class="flex items-center justify-between gap-4">
+                <dt class="text-muted">QA sync to legacy</dt><dd><StageChip :state="stages!.LEGACY_QA_SYNC.state" /></dd>
+              </div>
+            </dl>
+            <p v-if="codedRecordings" class="mt-3 text-xs leading-5 text-muted">
+              The recording link is made by this platform's recording step, only for an exact, unique Teams
+              recording. The Excel stamp is still produced by the legacy workflow.
+            </p>
+            <p v-else class="mt-3 text-xs leading-5 text-muted">
+              The recording link and the Excel stamp are produced by the live legacy workflows, not by this
+              platform. Waiting on them does not hold the lecture open.
+            </p>
+            <button
+              v-if="entry?.recording_url"
+              type="button"
+              class="btn-secondary btn-sm mt-3"
+              @click="openFullRecording"
+            >
+              <AppIcon name="play" :size="14" /> Open full recording
+            </button>
+          </SectionPanel>
+        </section>
+
+        <TechnicalDetails :entries="versionEntries" />
+      </template>
+
+      <!-- ================= Pipeline ================= -->
+      <template v-else-if="tab === 'pipeline'">
+        <StageMatrix
+          :stage-order="lecture.stage_order"
+          :stages="lecture.stages"
+          :blocking-stage="lecture.blocking_stage"
+        />
+
+        <SectionPanel
+          v-if="recording && !lecture.is_suppressed_duplicate"
+          title="Recording link"
+          :note="codedRecordings
+            ? 'Linked automatically by the pipeline, only for one exact recording.'
+            : 'Observed only: the legacy n8n recording workflow still makes this link.'"
+        >
+          <template #actions>
+            <StatusBadge
+              v-if="recording.state"
+              :label="stageState(recording.state).label"
+              :tone="stageState(recording.state).tone"
+            />
+          </template>
+
+          <p v-if="recording.refused_to_guess" class="notice-warn mb-4" role="note">
+            <AppIcon name="info" :size="16" class="mt-0.5" />
+            <span>
+              <strong class="font-semibold">The platform deliberately did not choose a recording.</strong>
+              More than one file (or no exactly matching file) fits this lecture, and linking the wrong
+              lecture's recording is worse than linking none. A person needs to decide.
+            </span>
+          </p>
+
+          <dl class="grid gap-x-6 gap-y-2 text-sm sm:grid-cols-2">
+            <div class="flex items-center justify-between gap-4">
+              <dt class="text-muted">Recording available</dt>
+              <dd class="font-semibold" :class="recording.recording_available ? 'text-emerald-700' : 'text-muted'">
+                {{ recording.recording_available ? 'Yes' : 'No' }}
+              </dd>
+            </div>
+            <div v-if="recording.owner" class="flex items-center justify-between gap-4">
+              <dt class="text-muted">Linked by</dt>
+              <dd>{{ recording.recording_available ? recordingOwner(recording.owner) : '—' }}</dd>
+            </div>
+            <div class="flex items-center justify-between gap-4">
+              <dt class="text-muted">Next step</dt>
+              <dd>{{ actionLabel(recording.action ?? 'NOTHING_TO_DO') }}</dd>
+            </div>
+            <div v-if="recording.last_status" class="flex items-center justify-between gap-4">
+              <dt class="text-muted">Last result</dt>
+              <dd class="font-mono text-2xs" :title="recording.last_reason ?? undefined">{{ recording.last_status }}</dd>
+            </div>
+            <div v-if="recording.last_checked_at" class="flex items-center justify-between gap-4">
+              <dt class="text-muted">Last checked</dt>
+              <dd>{{ cairoDateTime(recording.last_checked_at) }}</dd>
+            </div>
+            <div v-if="recording.attempt_count" class="flex items-center justify-between gap-4">
+              <dt class="text-muted">Checks so far</dt>
+              <dd class="tabular-nums">{{ recording.attempt_count }}</dd>
+            </div>
+            <div v-if="recording.next_attempt_after" class="flex items-center justify-between gap-4">
+              <dt class="text-muted">Next automatic check</dt>
+              <dd>{{ cairoDateTime(recording.next_attempt_after) }}</dd>
+            </div>
+            <div v-if="recording.source" class="flex items-center justify-between gap-4">
+              <dt class="text-muted">Found in</dt>
+              <dd>
+                {{ recordingSource(recording.source) }}
+                <span v-if="recording.timestamp_difference_seconds !== null" class="text-2xs text-faint">
+                  · {{ recording.timestamp_difference_seconds.toFixed(1) }} s before Teams
+                </span>
+              </dd>
+            </div>
+          </dl>
+
+          <p
+            v-if="recording.last_reason || recording.reason"
+            class="mt-3 text-xs leading-5 text-muted"
+          >
+            {{ recording.last_reason ?? humanise(recording.reason) }}
+          </p>
+
+          <button
+            v-if="recording.recording_available"
+            type="button"
+            class="btn-secondary btn-sm mt-3"
+            @click="openFullRecording"
+          >
+            <AppIcon name="play" :size="14" /> Open full recording
+          </button>
+        </SectionPanel>
+
+        <SectionPanel title="Run history" flush>
+          <EmptyState
+            v-if="!lecture.run_history.length"
+            compact
+            tone="neutral"
+            icon="clock"
+            title="This lecture has not appeared in a recorded run"
+          />
+          <table v-else class="data-table">
+            <thead>
+              <tr>
+                <th scope="col">Action</th>
+                <th scope="col">Result</th>
+                <th scope="col">From → to</th>
+                <th scope="col" class="text-right">When</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="(item, index) in lecture.run_history" :key="index">
+                <td class="font-semibold text-ink">{{ actionLabel(String(item.action ?? '')) }}</td>
+                <td>{{ humanise(String(item.status ?? '')) }}</td>
+                <td class="text-muted">
+                  {{ humanise(String(item.initial_state ?? '')) }} → {{ humanise(String(item.final_state ?? '')) }}
+                </td>
+                <td class="whitespace-nowrap text-right text-muted">
+                  {{ cairoDateTime(item.started_at as string | null) }}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </SectionPanel>
+      </template>
+
+      <!-- ================= Quality ================= -->
+      <template v-else-if="tab === 'qa'">
+        <section class="grid gap-3 lg:grid-cols-3">
+          <SectionPanel title="Checklist outcome">
+            <div v-if="qa && qa.met_count !== undefined" class="space-y-2">
+              <div class="flex items-center justify-between">
+                <span class="text-sm text-muted">Met</span>
+                <span class="text-lg font-bold tabular-nums text-emerald-700">{{ qa.met_count }}</span>
+              </div>
+              <div class="flex items-center justify-between">
+                <span class="text-sm text-muted">Partial</span>
+                <span class="text-lg font-bold tabular-nums text-amber-700">{{ qa.partial_count }}</span>
+              </div>
+              <div class="flex items-center justify-between">
+                <span class="text-sm text-muted">Not met</span>
+                <span class="text-lg font-bold tabular-nums text-rose-700">{{ qa.not_met_count }}</span>
+              </div>
+            </div>
+            <p v-else class="text-sm text-muted">The checklist has not been evaluated for this lecture yet.</p>
+          </SectionPanel>
+
+          <SectionPanel title="Quality pipeline">
+            <dl class="space-y-2 text-sm">
+              <div class="flex items-center justify-between gap-4">
+                <dt class="text-muted">Evaluation</dt><dd><StageChip :state="stages!.QA_EVALUATION.state" /></dd>
+              </div>
+              <div class="flex items-center justify-between gap-4">
+                <dt class="text-muted">Report rendered</dt><dd><StageChip :state="stages!.QA_RENDER.state" /></dd>
+              </div>
+              <div class="flex items-center justify-between gap-4">
+                <dt class="text-muted">Written to legacy record</dt><dd><StageChip :state="stages!.LEGACY_QA_SYNC.state" /></dd>
+              </div>
+            </dl>
+            <p v-if="qa?.qa_status" class="mt-3 text-xs text-muted">
+              Platform status: {{ humanise(String(qa.qa_status)) }}
+            </p>
+          </SectionPanel>
+
+          <SectionPanel title="Perfect policy">
+            <StatusBadge
+              :label="perfectReason(perfect?.reason as string | null).label"
+              :tone="perfectReason(perfect?.reason as string | null).tone"
+            />
+            <p class="mt-3 text-xs leading-5 text-muted">
+              Pending attendance is not a failure — the policy simply cannot be applied until the attendance
+              source has answered.
+            </p>
+            <p class="mt-2 text-2xs text-faint">
+              Policy {{ lecture.versions.perfect_eligibility_version }}
+            </p>
+          </SectionPanel>
+        </section>
+
+        <p class="text-xs text-muted">
+          Model prompts and raw model responses are deliberately not exposed in this console.
+        </p>
+      </template>
+
+      <!-- ================= Positive Moments / Media ================= -->
+      <template v-else>
+        <LectureMomentsPanel :lecture-id="lecture.lecture_id" :session-date="lecture.session_date" />
+        <p v-if="analysed && momentKey" class="text-xs text-muted">
+          The historical V5 analysis ({{ momentCount }} moment{{ momentCount === 1 ? '' : 's' }}) is still available in
+          <RouterLink class="font-semibold underline" :to="{ name: 'positive-moment-detail', params: { sessionKey: momentKey } }">the Positive Moments archive</RouterLink>.
+        </p>
+      </template>
+
+      <ActionPlanDialog
+        :open="Boolean(actionKind)"
+        :title="actionKind"
+        :plan="actionPlan"
+        :busy="actionBusy"
+        :summary="actionKind === 'Retry Teams transcript' ? TEAMS_RETRY_SUMMARY : undefined"
+        :confirm-label="actionKind === 'Retry Teams transcript' ? 'Queue the retry' : undefined"
+        :busy-label="actionKind === 'Retry Teams transcript' ? 'Queuing\u2026' : undefined"
+        @close="actionKind = ''"
+        @confirm="confirmAction"
+      />
+
+      <TranscriptUploadDialog
+        :open="uploadOpen"
+        :lecture-id="lecture.lecture_id"
+        :status="uploadStatus"
+        :process-only="uploadProcessOnly"
+        @close="uploadOpen = false"
+        @changed="refreshAfterUpload"
+      />
+    </template>
+  </div>
+</template>

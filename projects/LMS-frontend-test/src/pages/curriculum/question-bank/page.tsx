@@ -1,0 +1,543 @@
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { Link } from 'react-router-dom';
+import { WorkspaceShell } from '@/components/feature/WorkspaceShell';
+import { WorkspaceHeroBanner } from '@/components/feature/WorkspaceHeroBanner';
+import { ThemedSelect } from '@/components/feature/ThemedSelect';
+import { QuestionAnswersView } from '@/components/feature/QuestionTypeRenderer';
+import { useToast } from '@/hooks/useToast';
+import { roleNavMap } from '@/mocks/navigation';
+
+const curriculumNav = roleNavMap.curriculum;
+
+type QuestionType = 'single_choice' | 'multiple_choice' | 'true_false' | 'matching' | 'image_matching' | 'keywords' | 'fill_gap' | 'ordering';
+
+const questionTypeOptions: { value: QuestionType; label: string }[] = [
+  { value: 'single_choice', label: 'Single choice' },
+  { value: 'multiple_choice', label: 'Multiple choice' },
+  { value: 'true_false', label: 'True-False' },
+  { value: 'matching', label: 'Matching' },
+  { value: 'image_matching', label: 'Image matching' },
+  { value: 'keywords', label: 'Keywords' },
+  { value: 'fill_gap', label: 'Fill in the gap' },
+  { value: 'ordering', label: 'Ordering' },
+];
+
+interface QuestionBankProgramme {
+  name: string;
+  questionCount: number;
+  quizCount: number;
+  moduleRows?: number;
+  trainingPlanRows?: number;
+}
+
+interface QuestionBankQuestion {
+  id: number;
+  text: string;
+  questionType: QuestionType;
+  explanation: string;
+  quizStatus: string;
+  programme: string;
+  programmeKey: string;
+  module: string;
+  quizId: number;
+  quizTitle: string;
+  linkedQuizzes?: {
+    id: number;
+    title: string;
+    module: string;
+    status: string;
+  }[];
+  answers: {
+    id: number;
+    text: string;
+    isCorrect: boolean;
+  }[];
+}
+
+interface QuestionBankData {
+  programmes: QuestionBankProgramme[];
+  questions: QuestionBankQuestion[];
+  quizzes: QuestionBankQuiz[];
+  totalQuestions: number;
+}
+
+interface QuestionBankQuiz {
+  id: number;
+  title: string;
+  module: string;
+  programme: string;
+  programmeKey: string;
+  questions: number;
+  status: string;
+}
+
+function questionLabel(type: QuestionType) {
+  return questionTypeOptions.find(option => option.value === type)?.label || type;
+}
+
+function statusLabel(status: string) {
+  if (status === 'trash') return 'Archive';
+  if (status === 'validating') return 'Pending';
+  return status ? status.charAt(0).toUpperCase() + status.slice(1) : 'Draft';
+}
+
+function statusClasses(status: string) {
+  if (status === 'published') return 'CHANGE_ME';
+  if (status === 'pending' || status === 'validating') return 'bg-amber-100 text-amber-700';
+  if (status === 'private') return 'bg-sky-100 text-sky-700';
+  return 'bg-[#e8edf4] text-[#526173]';
+}
+
+function statusIcon(status: string) {
+  if (status === 'published') return 'ri-checkbox-circle-line';
+  if (status === 'pending' || status === 'validating') return 'ri-time-line';
+  if (status === 'private') return 'ri-lock-line';
+  return 'ri-file-edit-line';
+}
+
+export default function QuestionBankPage() {
+  const { success, error: toastError } = useToast();
+  const [questionBank, setQuestionBank] = useState<QuestionBankData | null>(null);
+  const [bankProgramme, setBankProgramme] = useState<'all' | string>('all');
+  const [bankSearch, setBankSearch] = useState('');
+  const [typeFilter, setTypeFilter] = useState<'all' | QuestionType>('all');
+  const [statusFilter, setStatusFilter] = useState('all');
+  const [bankLoading, setBankLoading] = useState(true);
+  const [bankError, setBankError] = useState('');
+  const [selectedQuestion, setSelectedQuestion] = useState<QuestionBankQuestion | null>(null);
+  const [targetQuizId, setTargetQuizId] = useState('');
+  const [addingQuestion, setAddingQuestion] = useState(false);
+
+  const loadQuestionBank = useCallback(async (background = false, signal?: AbortSignal) => {
+    if (!background) setBankLoading(true);
+    setBankError('');
+    const params = new URLSearchParams();
+    params.set('programme', bankProgramme);
+    if (bankSearch.trim()) params.set('search', bankSearch.trim());
+
+    try {
+      const response = await fetch(`/quiz_api/question-bank/?${params.toString()}`, { signal });
+      if (!response.ok) throw new Error('Could not load question bank');
+      const data: QuestionBankData = await response.json();
+      setQuestionBank(data);
+    } catch (err) {
+      if ((err as DOMException).name !== 'AbortError') {
+        setBankError(err instanceof Error ? err.message : 'Could not load question bank');
+      }
+    } finally {
+      setBankLoading(false);
+    }
+  }, [bankProgramme, bankSearch]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void loadQuestionBank(false, controller.signal);
+    return () => controller.abort();
+  }, [loadQuestionBank]);
+
+  useEffect(() => {
+    const refresh = () => {
+      if (document.visibilityState === 'visible') void loadQuestionBank(true);
+    };
+    const interval = window.setInterval(refresh, 60000);
+    window.addEventListener('focus', refresh);
+    document.addEventListener('visibilitychange', refresh);
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener('focus', refresh);
+      document.removeEventListener('visibilitychange', refresh);
+    };
+  }, [loadQuestionBank]);
+
+  const bankProgrammes = questionBank?.programmes ?? [];
+  const filteredQuestions = useMemo(() => {
+    return (questionBank?.questions ?? []).filter(question => {
+      if (typeFilter !== 'all' && question.questionType !== typeFilter) return false;
+      if (statusFilter !== 'all' && question.quizStatus !== statusFilter) return false;
+      return true;
+    });
+  }, [questionBank?.questions, statusFilter, typeFilter]);
+  const bankQuestionsByProgramme = useMemo(() => {
+    const grouped = new Map<string, QuestionBankQuestion[]>();
+    for (const question of filteredQuestions) {
+      const key = question.programme || 'Unassigned';
+      grouped.set(key, [...(grouped.get(key) ?? []), question]);
+    }
+    return Array.from(grouped.entries());
+  }, [filteredQuestions]);
+  const activeBankCount = bankProgrammes.filter(programme => programme.questionCount > 0).length;
+  const totalBankCount = bankProgrammes.length;
+  const totalQuestionCount = questionBank?.totalQuestions ?? 0;
+  const visibleQuestionCount = filteredQuestions.length;
+  const visibleKsbTaggedCount = filteredQuestions.filter(question => /(\bksb\b|knowledge|skill|behaviour|behavior|k\d|s\d|b\d)/i.test(question.explanation)).length;
+  const ksbTaggedPercent = visibleQuestionCount ? Math.round((visibleKsbTaggedCount / visibleQuestionCount) * 100) : 0;
+  const hasActiveQuestionFilters = typeFilter !== 'all' || statusFilter !== 'all' || Boolean(bankSearch.trim());
+  const statusOptions = useMemo(() => {
+    const statuses = Array.from(new Set((questionBank?.questions ?? []).map(question => question.quizStatus).filter(Boolean)));
+    return [
+      { value: 'all', label: 'All statuses' },
+      ...statuses.sort().map(status => ({ value: status, label: statusLabel(status) })),
+    ];
+  }, [questionBank?.questions]);
+  const typeOptions: { value: 'all' | QuestionType; label: string }[] = useMemo(() => [
+    { value: 'all' as const, label: 'All types' },
+    ...questionTypeOptions,
+  ], []);
+  const selectedQuestionCurrentQuiz = useMemo(() => {
+    if (!selectedQuestion) return null;
+    return (questionBank?.quizzes ?? []).find(quiz => quiz.id === selectedQuestion.quizId) ?? null;
+  }, [questionBank?.quizzes, selectedQuestion]);
+  const availableTargetQuizzes = useMemo(() => {
+    if (!selectedQuestion) return [];
+    return (questionBank?.quizzes ?? [])
+      .filter(quiz => quiz.programmeKey === selectedQuestion.programmeKey && quiz.id !== selectedQuestion.quizId);
+  }, [questionBank?.quizzes, selectedQuestion]);
+  const targetQuizOptions = useMemo(() => {
+    return availableTargetQuizzes
+      .map(quiz => ({
+        value: String(quiz.id),
+        label: `${quiz.title} (${quiz.questions} questions)`,
+      }));
+  }, [availableTargetQuizzes]);
+
+  const openAddToQuiz = (question: QuestionBankQuestion) => {
+    const options = (questionBank?.quizzes ?? [])
+      .filter(quiz => quiz.programmeKey === question.programmeKey && quiz.id !== question.quizId);
+    setSelectedQuestion(question);
+    setTargetQuizId(options[0] ? String(options[0].id) : '');
+  };
+
+  const addQuestionToQuiz = async () => {
+    if (!selectedQuestion || !targetQuizId) return;
+    setAddingQuestion(true);
+    try {
+      const response = await fetch(`/quiz_api/question-bank/questions/${selectedQuestion.id}/add-to-quiz/`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ quizId: Number(targetQuizId) }),
+      });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null);
+        throw new Error(payload?.error || 'Could not add question to quiz');
+      }
+      const targetQuiz = questionBank?.quizzes.find(quiz => String(quiz.id) === targetQuizId);
+      if (targetQuiz) {
+        const sourceQuestion = selectedQuestion;
+        setQuestionBank(prev => prev ? ({
+          ...prev,
+          questions: prev.questions.map(question => {
+            const sameQuestion = question.programmeKey === sourceQuestion.programmeKey
+              && question.questionType === sourceQuestion.questionType
+              && question.text.trim().toLowerCase() === sourceQuestion.text.trim().toLowerCase();
+            if (!sameQuestion) return question;
+            const existingLinked = question.linkedQuizzes?.length
+              ? question.linkedQuizzes
+              : [{ id: question.quizId, title: question.quizTitle, module: question.module, status: question.quizStatus }];
+            const nextLinked = existingLinked.some(quiz => quiz.id === targetQuiz.id)
+              ? existingLinked
+              : [
+                ...existingLinked,
+                {
+                  id: targetQuiz.id,
+                  title: targetQuiz.title,
+                  module: targetQuiz.module,
+                  status: targetQuiz.status,
+                },
+              ];
+            return { ...question, linkedQuizzes: nextLinked };
+          }),
+          quizzes: prev.quizzes.map(quiz => quiz.id === targetQuiz.id ? { ...quiz, questions: quiz.questions + 1 } : quiz),
+        }) : prev);
+      }
+      success('Question added', targetQuiz ? `Added to ${targetQuiz.title}.` : 'Question copied to the selected quiz.');
+      setSelectedQuestion(null);
+      setTargetQuizId('');
+      await loadQuestionBank(true);
+    } catch (err) {
+      toastError('Add failed', err instanceof Error ? err.message : 'Could not add question to quiz');
+    } finally {
+      setAddingQuestion(false);
+    }
+  };
+
+  return (
+    <WorkspaceShell role="curriculum" roleLabel={curriculumNav.label} navItems={curriculumNav.items} workspaceLabel={curriculumNav.workspaceLabel} pageTitle="Question Bank" pageSubtitle="Programme-scoped quiz questions" userName="Rachel Myers" userRole="Curriculum Designer">
+      <div className="curriculum-library-page min-h-full bg-[#f7f6f4] p-4 sm:p-5 lg:p-6 space-y-4">
+        <WorkspaceHeroBanner
+          className="curriculum-library-hero question-bank-hero"
+          decorative
+          eyebrow="Learning resources"
+          title="Question Bank"
+          description="Create, manage and organize questions to support assessment and learning."
+          icon="ri-database-2-line"
+          statIconPosition="leading"
+          stats={[
+            { label: 'Banks', value: String(activeBankCount), icon: 'ri-database-2-line' },
+            { label: 'Questions', value: String(totalQuestionCount), icon: 'ri-file-line' },
+            { label: 'KSB Tagged', value: `${ksbTaggedPercent}%`, icon: 'ri-price-tag-3-line' },
+          ]}
+          actions={(
+            <button type="button" className="inline-flex h-[4.5rem] min-w-[7.5rem] items-center justify-center whitespace-nowrap rounded-[0.75rem] bg-[#b27715] px-3 text-xs font-semibold text-white transition-smooth hover:bg-[#986511]">
+              <AppIcon className="mr-1" name="ri-add-line" size={13} /> Create Bank
+            </button>
+          )}
+        />
+
+        <section className="rounded-2xl border border-[#ded8e8] bg-white shadow-sm overflow-hidden">
+          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 px-6 py-5 border-b border-[#e2e8f0] bg-[#fbfbfd]">
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="w-9 h-9 rounded-xl bg-[#f2f0ff] text-[#5b2dbb] flex items-center justify-center">
+                  <AppIcon className="ri-questionnaire-line text-lg"></AppIcon>
+                </span>
+                <p className="text-xs font-bold uppercase tracking-wider text-[#5b2dbb]">Question Bank</p>
+              </div>
+              <h2 className="text-2xl font-heading font-bold text-foreground-900">Programme Question Bank</h2>
+              <p className="text-sm text-[#647083] mt-1">Questions are grouped by the linked Training Plan programme and stay quietly up to date for concurrent curriculum work.</p>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <Link to="/curriculum/quiz-xml" className="h-10 px-4 rounded-lg bg-[#b27715] text-white text-sm font-semibold hover:bg-[#986511] transition-smooth flex items-center">
+                <AppIcon className="ri-arrow-left-line mr-1"></AppIcon> Quiz Workspace
+              </Link>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-[320px_1fr] min-h-[calc(100vh-260px)]">
+            <aside className="border-r border-[#e2e8f0] bg-white p-4 overflow-y-auto quiz-preview-scroll">
+              <button
+                onClick={() => setBankProgramme('all')}
+                className={`w-full rounded-xl border px-3 py-3 text-left transition-smooth mb-3 ${bankProgramme === 'all' ? 'border-[#a78bfa] bg-[#f2f0ff]' : 'border-[#e2e8f0] bg-white hover:bg-[#f8fafc]'}`}
+              >
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-sm font-semibold text-foreground-900">All programmes</span>
+                  <span className="text-xs font-bold text-[#5b2dbb]">{questionBank?.totalQuestions ?? 0}</span>
+                </div>
+              </button>
+              <div className="space-y-2">
+                {bankProgrammes.map(programme => {
+                  const value = programme.name === 'Unassigned' ? '__unassigned__' : programme.name;
+                  return (
+                    <button
+                      key={programme.name}
+                      onClick={() => setBankProgramme(value)}
+                      className={`w-full rounded-xl border px-3 py-3 text-left transition-smooth ${bankProgramme === value ? 'border-[#a78bfa] bg-[#f2f0ff]' : 'border-[#e2e8f0] bg-white hover:bg-[#f8fafc]'}`}
+                    >
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <p className="text-sm font-semibold text-foreground-900 truncate">{programme.name}</p>
+                          <p className="text-[11px] text-[#647083] mt-1">{programme.quizCount} quizzes - {programme.moduleRows ?? programme.trainingPlanRows ?? 0} module rows</p>
+                        </div>
+                        <span className="text-xs font-bold text-[#5b2dbb] bg-white rounded-full px-2 py-1 shrink-0">{programme.questionCount}</span>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            </aside>
+
+            <section className="min-w-0 bg-[#f7f6f4] p-5">
+              <div className="sticky top-0 z-10 -mx-5 -mt-5 mb-5 border-b border-[#e2e8f0] bg-[#f7f6f4]/95 px-5 py-4 backdrop-blur">
+                <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+                  <div>
+                    <p className="text-sm font-heading font-bold text-foreground-900">{bankProgramme === 'all' ? 'All programme questions' : bankProgramme === '__unassigned__' ? 'Unassigned questions' : bankProgramme}</p>
+                    <p className="text-xs text-[#647083] mt-1">{filteredQuestions.length} of {questionBank?.questions.length ?? 0} questions shown</p>
+                  </div>
+                  <div className="flex w-full flex-col gap-2 md:w-auto md:flex-row md:items-center">
+                    <ThemedSelect
+                      value={typeFilter}
+                      options={typeOptions}
+                      onChange={value => setTypeFilter(value as 'all' | QuestionType)}
+                      className="w-full md:w-44"
+                    />
+                    <ThemedSelect
+                      value={statusFilter}
+                      options={statusOptions}
+                      onChange={setStatusFilter}
+                      className="w-full md:w-40"
+                    />
+                    <div className="relative w-full md:w-80">
+                      <input value={bankSearch} onChange={event => setBankSearch(event.target.value)} placeholder="Search question bank" className="h-10 w-full rounded-lg bg-white border border-[#d8dde6] pl-4 pr-10 text-sm outline-none focus:border-[#8b5cf6] focus:ring-2 focus:ring-[#ede9fe]" />
+                      <AppIcon className="ri-search-line absolute right-3 top-1/2 -translate-y-1/2 text-[#647083]"></AppIcon>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {bankError && <div className="mb-4 rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-700">{bankError}</div>}
+              {bankLoading && <div className="py-16 text-center text-sm text-[#647083]">Loading question bank...</div>}
+              {!bankLoading && (!questionBank || filteredQuestions.length === 0) && (
+                <div className="rounded-2xl border border-[#e2e8f0] bg-white p-10 text-center">
+                  <span className="w-14 h-14 rounded-2xl bg-[#f2f0ff] text-[#5b2dbb] flex items-center justify-center mx-auto mb-3">
+                    <AppIcon className="ri-question-answer-line text-xl"></AppIcon>
+                  </span>
+                  <p className="text-sm font-semibold text-foreground-700">No questions match this view</p>
+                  <p className="text-xs text-[#647083] mt-1">
+                    {hasActiveQuestionFilters
+                      ? 'The current type, status, or search filter is hiding the available questions.'
+                      : 'Upload a quiz file with a matched Training Plan programme to populate this bank.'}
+                  </p>
+                  {hasActiveQuestionFilters && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setTypeFilter('all');
+                        setStatusFilter('all');
+                        setBankSearch('');
+                      }}
+                      className="mt-4 h-9 px-4 rounded-lg bg-[#5b2dbb] text-white text-xs font-semibold hover:bg-[#4c1d95] transition-smooth"
+                    >
+                      Clear filters
+                    </button>
+                  )}
+                </div>
+              )}
+
+              {!bankLoading && questionBank && filteredQuestions.length > 0 && (
+                <div className="space-y-5">
+                  {bankQuestionsByProgramme.map(([programme, questions]) => (
+                    <div key={programme} className="space-y-3">
+                      {bankProgramme === 'all' && (
+                        <div className="flex items-center gap-3">
+                          <h3 className="text-sm font-heading font-bold text-foreground-900">{programme}</h3>
+                          <span className="text-[11px] font-bold rounded-full bg-[#f2f0ff] text-[#5b2dbb] px-2 py-1">{questions.length} questions</span>
+                        </div>
+                      )}
+                      {questions.map(question => {
+                        const hasKsbTag = /(\bksb\b|knowledge|skill|behaviour|behavior|k\d|s\d|b\d)/i.test(question.explanation);
+                        return (
+                          <article key={question.id} className="rounded-2xl border border-[#dfe4ec] bg-white p-5 shadow-sm">
+                            <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-3 mb-4">
+                              <div className="min-w-0">
+                                <p className="text-[15px] font-semibold text-foreground-900 leading-7">{question.text}</p>
+                                <p className="text-xs text-[#647083] mt-2">
+                                  {question.module || 'No module'} - {question.quizTitle}
+                                </p>
+                                <div className="mt-3 flex flex-wrap items-center gap-2">
+                                  {(question.linkedQuizzes?.length ? question.linkedQuizzes : [{ id: question.quizId, title: question.quizTitle, module: question.module, status: question.quizStatus }]).map(linkedQuiz => {
+                                    const isCurrent = linkedQuiz.id === question.quizId;
+                                    return (
+                                      <span
+                                        key={linkedQuiz.id}
+                                        className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-[11px] font-bold shadow-sm ${isCurrent ? 'border-[#c4b5fd] bg-[#ede9fe] text-[#43207d]' : 'border-emerald-200 bg-emerald-50 text-emerald-800'}`}
+                                      >
+                                        <AppIcon className={isCurrent ? 'ri-folder-info-line text-[#5b2dbb]' : 'ri-links-line text-emerald-600'}></AppIcon>
+                                        {isCurrent ? 'Currently in' : 'Also in'}: {linkedQuiz.title}
+                                      </span>
+                                    );
+                                  })}
+                                </div>
+                              </div>
+                              <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+                                {hasKsbTag && <span className="inline-flex w-fit items-center gap-1 rounded-md bg-[#eefcf7] px-2 py-1 text-[10px] font-bold uppercase text-emerald-700"><AppIcon className="ri-price-tag-3-line text-[11px]"></AppIcon>KSB tagged</span>}
+                                <span className={`inline-flex w-fit items-center gap-1 rounded-md px-2 py-1 text-[10px] font-bold uppercase ${statusClasses(question.quizStatus)}`}><AppIcon className={`${statusIcon(question.quizStatus)} text-[11px]`}></AppIcon>{statusLabel(question.quizStatus)}</span>
+                                <span className="inline-flex w-fit items-center gap-1 rounded-md bg-[#e8edf4] px-2 py-1 text-[10px] font-bold uppercase text-[#526173]"><AppIcon className="ri-list-check-2-line text-[11px]"></AppIcon>{questionLabel(question.questionType)}</span>
+                                <button type="button" onClick={() => openAddToQuiz(question)} className="inline-flex h-8 items-center justify-center gap-1.5 rounded-lg bg-[#5b2dbb] px-3 text-xs font-semibold text-white hover:bg-[#4c1d95] transition-smooth">
+                                  <AppIcon className="ri-add-line text-sm"></AppIcon>Add to quiz
+                                </button>
+                              </div>
+                            </div>
+                            <QuestionAnswersView type={question.questionType} answers={question.answers} fallbackText={question.explanation} compact />
+                          </article>
+                        );
+                      })}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </section>
+          </div>
+        </section>
+
+        {selectedQuestion && (
+          <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/45 p-4" onClick={() => setSelectedQuestion(null)}>
+            <div className="w-full max-w-lg rounded-2xl border border-[#ded8e8] bg-white shadow-2xl" onClick={event => event.stopPropagation()}>
+              <div className="flex items-start justify-between gap-4 border-b border-[#e2e8f0] p-5">
+                <div className="min-w-0">
+                  <p className="text-xs font-bold uppercase tracking-wider text-[#5b2dbb] mb-1">Add to quiz</p>
+                  <h3 className="text-lg font-heading font-bold text-foreground-900">Copy question to an existing quiz</h3>
+                </div>
+                <button onClick={() => setSelectedQuestion(null)} className="w-9 h-9 rounded-xl bg-[#f8fafc] hover:bg-[#f1f5f9] text-[#475569] transition-smooth">
+                  <AppIcon className="ri-close-line text-lg"></AppIcon>
+                </button>
+              </div>
+
+              <div className="p-5 space-y-4">
+                <div className="rounded-xl border border-[#e2e8f0] bg-[#f8fafc] p-4">
+                  <p className="text-sm font-semibold text-foreground-900 leading-6 line-clamp-3">{selectedQuestion.text}</p>
+                  <p className="text-xs text-[#647083] mt-2">{selectedQuestion.programme} - from {selectedQuestion.quizTitle}</p>
+                </div>
+
+                <div className="rounded-xl border border-[#ddd6fe] bg-[#fbf9ff] p-4">
+                  <p className="text-[11px] font-bold uppercase tracking-wider text-[#5b2dbb] mb-2">Currently used in</p>
+                  <div className="space-y-2">
+                    {(selectedQuestion.linkedQuizzes?.length ? selectedQuestion.linkedQuizzes : [{
+                      id: selectedQuestion.quizId,
+                      title: selectedQuestionCurrentQuiz?.title ?? selectedQuestion.quizTitle,
+                      module: selectedQuestionCurrentQuiz?.module || selectedQuestion.module,
+                      status: selectedQuestionCurrentQuiz?.status ?? selectedQuestion.quizStatus,
+                    }]).map(linkedQuiz => {
+                      const isCurrent = linkedQuiz.id === selectedQuestion.quizId;
+                      return (
+                        <div key={linkedQuiz.id} className={`rounded-lg border px-3 py-2 ${isCurrent ? 'border-[#c4b5fd] bg-white' : 'border-emerald-200 bg-emerald-50'}`}>
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="min-w-0">
+                              <p className="text-sm font-semibold text-[#1f2937]">{linkedQuiz.title}</p>
+                              <p className="mt-1 text-xs text-[#647083]">
+                                {(linkedQuiz.module || 'No module')} - {statusLabel(linkedQuiz.status)}
+                              </p>
+                            </div>
+                            <span className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold uppercase ${isCurrent ? 'bg-[#ede9fe] text-[#43207d]' : 'bg-white text-emerald-700'}`}>
+                              {isCurrent ? 'Current' : 'Linked'}
+                            </span>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {targetQuizOptions.length > 0 ? (
+                  <div className="space-y-3">
+                    <div>
+                      <label className="block text-xs font-semibold text-foreground-600 mb-2">Available quizzes to add this question to</label>
+                      <ThemedSelect
+                        value={targetQuizId}
+                        options={targetQuizOptions}
+                        onChange={setTargetQuizId}
+                        buttonClassName="h-11"
+                        menuClassName="max-h-56"
+                      />
+                      <p className="text-xs text-[#647083] mt-2">Only other quizzes linked to the same programme are shown, so questions do not mix across programmes.</p>
+                    </div>
+                    <div className="rounded-xl border border-[#e2e8f0] bg-white p-3">
+                      <p className="text-[11px] font-bold uppercase tracking-wider text-[#647083] mb-2">Available in this programme</p>
+                      <div className="space-y-2 max-h-36 overflow-y-auto quiz-preview-scroll pr-1">
+                        {availableTargetQuizzes.map(quiz => (
+                          <div key={quiz.id} className={`rounded-lg border px-3 py-2 text-xs ${String(quiz.id) === targetQuizId ? 'border-[#a78bfa] bg-[#f2f0ff] text-[#43207d]' : 'border-[#e2e8f0] bg-[#f8fafc] text-[#475569]'}`}>
+                            <p className="font-semibold">{quiz.title}</p>
+                            <p className="mt-1 text-[#647083]">{quiz.module || 'No module'} - {quiz.questions} questions - {statusLabel(quiz.status)}</p>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800">
+                    This question is already in its current quiz, and there are no other available quizzes in the same programme yet.
+                  </div>
+                )}
+              </div>
+
+              <div className="flex items-center justify-end gap-2 border-t border-[#e2e8f0] p-5">
+                <button onClick={() => setSelectedQuestion(null)} className="h-10 px-4 rounded-lg bg-[#f8fafc] text-sm font-semibold text-foreground-700 hover:bg-[#f1f5f9] transition-smooth">Cancel</button>
+                <button onClick={() => void addQuestionToQuiz()} disabled={!targetQuizId || addingQuestion} className="h-10 px-4 rounded-lg bg-[#5b2dbb] text-white text-sm font-semibold hover:bg-[#4c1d95] disabled:opacity-45 disabled:cursor-not-allowed transition-smooth">
+                  {addingQuestion ? 'Adding...' : 'Add question'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </WorkspaceShell>
+  );
+}

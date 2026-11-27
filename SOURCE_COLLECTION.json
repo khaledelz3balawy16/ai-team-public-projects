@@ -1,0 +1,309 @@
+{
+  "source_owner": "aiteamKBC",
+  "portfolio_owner": "khaledelz3balawy16",
+  "visibility": "public",
+  "project_count": 43,
+  "projects": [
+    {
+      "name": "admin_dashboard",
+      "source_repository": "aiteamKBC/admin_dashboard",
+      "source_commit": "c1b00daf777523086f3b6c66137d5605ccf214fa",
+      "source_empty": false,
+      "source_visibility": "public"
+    },
+    {
+      "name": "alfanar-learning-dashboard",
+      "source_repository": "aiteamKBC/alfanar-learning-dashboard",
+      "source_commit": "8fa16b62f7aad11c1447699d596610ba5192860e",
+      "source_empty": false,
+      "source_visibility": "public"
+    },
+    {
+      "name": "API-for-aptem",
+      "source_repository": "aiteamKBC/API-for-aptem",
+      "source_commit": "1078dc84220a7417d5d493075654b4da25d98aa8",
+      "source_empty": false,
+      "source_visibility": "public"
+    },
+    {
+      "name": "aptem-docs",
+      "source_repository": "aiteamKBC/aptem-docs",
+      "source_commit": "bcae7684cdcd936effaebb5764cdd3f114a151fe",
+      "source_empty": false,
+      "source_visibility": "public"
+    },
+    {
+      "name": "attendence_qr",
+      "source_repository": "aiteamKBC/attendence_qr",
+      "source_commit": "e0b0674023dc35db481582b908bd587e4e213f55",
+      "source_empty": false,
+      "source_visibility": "public"
+    },
+    {
+      "name": "Communication_Centre",
+      "source_repository": "aiteamKBC/Communication_Centre",
+      "source_commit": "aca77e2c4605365f97ba2115e582ec2cb11f8ea5",
+      "source_empty": false,
+      "source_visibility": "public"
+    },
+    {
+      "name": "devops_pipeline",
+      "source_repository": "aiteamKBC/devops_pipeline",
+      "source_commit": null,
+      "source_empty": true,
+      "source_visibility": "public"
+    },
+    {
+      "name": "enrollment",
+      "source_repository": "aiteamKBC/enrollment",
+      "source_commit": "4d0c91505e8b488b143c42518f4965e2bda73078",
+      "source_empty": false,
+      "source_visibility": "public"
+    },
+    {
+      "name": "evidence-content-fetch",
+      "source_repository": "aiteamKBC/evidence-content-fetch",
+      "source_commit": "fd99bd8d8237264ef1bdffccfc8492b38a485f2e",
+      "source_empty": false,
+      "source_visibility": "public"
+    },
+    {
+      "name": "help-desk",
+      "source_repository": "aiteamKBC/help-desk",
+      "source_commit": "2405058d62c4e20cb5bdc8859accacc59b6fc4c0",
+      "source_empty": false,
+      "source_visibility": "public"
+    },
+    {
+      "name": "Image_uploader",
+      "source_repository": "aiteamKBC/Image_uploader",
+      "source_commit": "9d831066fccc55fd3eb5a969421341819c20ecbc",
+      "source_empty": false,
+      "source_visibility": "public"
+    },
+    {
+      "name": "initial_assessment",
+      "source_repository": "aiteamKBC/initial_assessment",
+      "source_commit": "09b3986f8a52e2e43f41e2507eca3f20df916f9d",
+      "source_empty": false,
+      "source_visibility": "public"
+    },
+    {
+      "name": "IPC",
+      "source_repository": "aiteamKBC/IPC",
+      "source_commit": null,
+      "source_empty": true,
+      "source_visibility": "public"
+    },
+    {
+      "name": "kbc-django-react-demo",
+      "source_repository": "aiteamKBC/kbc-django-react-demo",
+      "source_commit": "b472927362e70fc5590b0cbaeed696d9a3466ddf",
+      "source_empty": false,
+      "source_visibility": "public"
+    },
+    {
+      "name": "KBC-Quality",
+      "source_repository": "aiteamKBC/KBC-Quality",
+      "source_commit": "d56bcab30a685b7b2c5ed87d68d1b9b6897ca376",
+      "source_empty": false,
+      "source_visibility": "public"
+    },
+    {
+      "name": "khalidouapp",
+      "source_repository": "aiteamKBC/khalidouapp",
+      "source_commit": "cadc439a05fabef1300c5695b1e80ff52f8777b1",
+      "source_empty": false,
+      "source_visibility": "public"
+    },
+    {
+      "name": "learnhub_demo",
+      "source_repository": "aiteamKBC/learnhub_demo",
+      "source_commit": "41c6e82e74575e7b3424566ddffc9fb43c8fd1cb",
+      "source_empty": false,
+      "source_visibility": "public"
+    },
+    {
+      "name": "learn_hub",
+      "source_repository": "aiteamKBC/learn_hub",
+      "source_commit": "a7e7913fb3d64c6fedf4d6514d37a84fb42bd44e",
+      "source_empty": false,
+      "source_visibility": "public"
+    },
+    {
+      "name": "library",
+      "source_repository": "aiteamKBC/library",
+      "source_commit": "33c267c837a41bbb5bf75c95a398534afa84e8e5",
+      "source_empty": false,
+      "source_visibility": "public"
+    },
+    {
+      "name": "LMS-frontend-test",
+      "source_repository": "aiteamKBC/LMS-frontend-test",
+      "source_commit": "a4e49f47f2c14bf53cab11669e21fb4efd66a815",
+      "source_empty": false,
+      "source_visibility": "public"
+    },
+    {
+      "name": "LMS-V3",
+      "source_repository": "aiteamKBC/LMS-V3",
+      "source_commit": "45274f1b61e663ce19e24b714a7f42568772e87d",
+      "source_empty": false,
+      "source_visibility": "public"
+    },
+    {
+      "name": "LMS_infrastructure",
+      "source_repository": "aiteamKBC/LMS_infrastructure",
+      "source_commit": "9d685b39d3664102ec070b25fbf5423d06cff429",
+      "source_empty": false,
+      "source_visibility": "public"
+    },
+    {
+      "name": "LMS_v2",
+      "source_repository": "aiteamKBC/LMS_v2",
+      "source_commit": "6fc6e269368143f8f3dea94e559e2930c3e6a7fa",
+      "source_empty": false,
+      "source_visibility": "public"
+    },
+    {
+      "name": "mcr",
+      "source_repository": "aiteamKBC/mcr",
+      "source_commit": "895c5abfcac16c3110b279a244cc20f58438b2b5",
+      "source_empty": false,
+      "source_visibility": "public"
+    },
+    {
+      "name": "pathway_app",
+      "source_repository": "aiteamKBC/pathway_app",
+      "source_commit": "4c3e08789ca4a07c2550451eb6a41b5ab45dca15",
+      "source_empty": false,
+      "source_visibility": "public"
+    },
+    {
+      "name": "Performance-by-Aryan-Harikumar",
+      "source_repository": "aiteamKBC/Performance-by-Aryan-Harikumar",
+      "source_commit": "ee39362dc6a9c87e256fcc68a3372771713fec90",
+      "source_empty": false,
+      "source_visibility": "public"
+    },
+    {
+      "name": "Performance_dashboard",
+      "source_repository": "aiteamKBC/Performance_dashboard",
+      "source_commit": "eec4049209d2d791301a8693049f030ebfba2e33",
+      "source_empty": false,
+      "source_visibility": "public"
+    },
+    {
+      "name": "PMP",
+      "source_repository": "aiteamKBC/PMP",
+      "source_commit": "f222c100fc30d2a99964a474a2f76b337b927d45",
+      "source_empty": false,
+      "source_visibility": "public"
+    },
+    {
+      "name": "Positive-moments",
+      "source_repository": "aiteamKBC/Positive-moments",
+      "source_commit": "8fce1af66f78815669cda72e629deaa90d638fb7",
+      "source_empty": false,
+      "source_visibility": "public"
+    },
+    {
+      "name": "provider",
+      "source_repository": "aiteamKBC/provider",
+      "source_commit": "cc6266671cd049eb0c6851c12f52c4228ba29c03",
+      "source_empty": false,
+      "source_visibility": "public"
+    },
+    {
+      "name": "pr_dashborad",
+      "source_repository": "aiteamKBC/pr_dashborad",
+      "source_commit": "96a18fb60a38af85582bde80e6ef924ea4b3fe62",
+      "source_empty": false,
+      "source_visibility": "public"
+    },
+    {
+      "name": "psycho-dash",
+      "source_repository": "aiteamKBC/psycho-dash",
+      "source_commit": "c8cca6bdc31f5d67420a427ba334ce4819d77f5d",
+      "source_empty": false,
+      "source_visibility": "public"
+    },
+    {
+      "name": "QR-Teams",
+      "source_repository": "aiteamKBC/QR-Teams",
+      "source_commit": "bf62cd18dadbba3b5145fe61832ee5b37540e9d1",
+      "source_empty": false,
+      "source_visibility": "public"
+    },
+    {
+      "name": "QR_attendance",
+      "source_repository": "aiteamKBC/QR_attendance",
+      "source_commit": "d679665ba2c10c19d43c8c467ee10cc1c50ade47",
+      "source_empty": false,
+      "source_visibility": "public"
+    },
+    {
+      "name": "Recruitment-Portal",
+      "source_repository": "aiteamKBC/Recruitment-Portal",
+      "source_commit": "fe744f8249d34a4971f4949e7a55ac005bde6b10",
+      "source_empty": false,
+      "source_visibility": "public"
+    },
+    {
+      "name": "safegarding-quiz",
+      "source_repository": "aiteamKBC/safegarding-quiz",
+      "source_commit": "77d4022e35138575fb4c8c3386d413778598883e",
+      "source_empty": false,
+      "source_visibility": "public"
+    },
+    {
+      "name": "sales-operation-system",
+      "source_repository": "aiteamKBC/sales-operation-system",
+      "source_commit": null,
+      "source_empty": true,
+      "source_visibility": "public"
+    },
+    {
+      "name": "StudentDetails",
+      "source_repository": "aiteamKBC/StudentDetails",
+      "source_commit": "07163189bed4a927007e9f474c299f94afd35bda",
+      "source_empty": false,
+      "source_visibility": "public"
+    },
+    {
+      "name": "superAdminDashboard",
+      "source_repository": "aiteamKBC/superAdminDashboard",
+      "source_commit": "172cebc50d232941317f9fc448b90aaec44cd7ac",
+      "source_empty": false,
+      "source_visibility": "public"
+    },
+    {
+      "name": "Tasky_App",
+      "source_repository": "aiteamKBC/Tasky_App",
+      "source_commit": "93ae63025f79fe7fdaa814ad75959b663232354e",
+      "source_empty": false,
+      "source_visibility": "public"
+    },
+    {
+      "name": "Tasky_App_V2",
+      "source_repository": "aiteamKBC/Tasky_App_V2",
+      "source_commit": "30e2ffb3397576e1124014cffe3d1b490b6278fb",
+      "source_empty": false,
+      "source_visibility": "public"
+    },
+    {
+      "name": "Tutor_Dashboard",
+      "source_repository": "aiteamKBC/Tutor_Dashboard",
+      "source_commit": "fed8b76a88cbb67d74d0be302ea6caacb11370ce",
+      "source_empty": false,
+      "source_visibility": "public"
+    },
+    {
+      "name": "who-i-am",
+      "source_repository": "aiteamKBC/who-i-am",
+      "source_commit": "6c9aad705df1dade7e2e6a506d97070b5af83c21",
+      "source_empty": false,
+      "source_visibility": "public"
+    }
+  ]
+}

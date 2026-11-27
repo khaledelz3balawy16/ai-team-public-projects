@@ -1,0 +1,465 @@
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { ArrowLeft, CalendarDays, ChevronLeft, ChevronRight, CircleAlert, CircleCheck, Loader2, RefreshCw, ShieldCheck, Users, Video } from 'lucide-react';
+import { Link, useSearchParams } from 'react-router-dom';
+import { loadCoachingCalendar, loadLinkedCoachingMeeting, COACHING_CALENDAR_REQUEST_TIMEOUT, type LinkedCoachingMeeting, type CoachingCalendar, type CoachingCalendarQuery } from '@/api/coachingRecordings';
+import { WorkspaceShell } from '@/components/feature/WorkspaceShell';
+import { SkeletonBlock } from '@/components/feature/Skeletons';
+import { DatePickerField } from '@/components/feature/DatePickerField';
+import RecordingSelect from './RecordingSelect';
+import { coachNavItems, curriculumNavItems } from '@/mocks/navigation';
+import { addDays, CALENDAR_TIME_ZONES, formatFullDate, parseIsoDate, todayIso } from '@/pages/curriculum/recordings/utils';
+import { periodBounds, type Period } from '@/pages/curriculum/recordings/filters';
+import { filterMeetings, hasPlayableRecording, hiddenReadyReasons, initialChecksPending, meetingDate, meetingKey, meetingCategory, recordingLabel, categoryLabels, type MatchFilter, type MeetingFilter } from './model';
+import MeetingDetailsDrawer from './MeetingDetailsDrawer';
+import CoachMiniCalendar from './CoachMiniCalendar';
+import CoachingCalendarSkeleton from './CoachingCalendarSkeleton';
+import MeetingCalendar from './MeetingCalendar';
+import CoachLearnersDialog from './CoachLearnersDialog';
+import SyncReviewDrawer from './SyncReviewDrawer';
+import QAWorkCalendar from './QAWorkCalendar';
+import { readLocation, writeLocation, type CoachingLocation } from './location';
+import styles from './CurriculumRecordings.module.css';
+import { RecordingsPageHelp } from '@/pages/curriculum/recordings/help/RecordingsPageHelp';
+
+const control = 'max-w-full min-w-0 rounded-lg border border-background-200 bg-white px-3 py-2 text-sm text-foreground-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary-500';
+const phaseLabels = { ended: 'Ended', upcoming: 'Upcoming', 'in-progress': 'Within scheduled time', cancelled: 'Cancelled' };
+const filterLabels = { ...phaseLabels, ready: 'Ready to action', attention: 'Needs attention', all: 'All meetings' };
+const meetingStatusOptions = [
+  { value: 'ready', label: filterLabels.ready, icon: 'ri-checkbox-circle-line' },
+  { value: 'attention', label: filterLabels.attention, icon: 'ri-error-warning-line' },
+  { value: 'ended', label: filterLabels.ended, icon: 'ri-check-double-line' },
+  { value: 'upcoming', label: filterLabels.upcoming, icon: 'ri-calendar-line' },
+  { value: 'in-progress', label: filterLabels['in-progress'], icon: 'ri-time-line' },
+  { value: 'cancelled', label: filterLabels.cancelled, icon: 'ri-close-circle-line' },
+  { value: 'all', label: filterLabels.all, icon: 'ri-list-check' },
+];
+
+function coachPreference(value?: string): string {
+  try {
+    const account = window.localStorage.getItem('kbc_auth_email');
+    if (!account) return '';
+    const key = `coaching-calendar:coach:${account}`;
+    if (value !== undefined) window.localStorage.setItem(key, value);
+    return window.localStorage.getItem(key) || '';
+  } catch { return ''; } // Storage can be disabled; calendar selection still works.
+}
+
+export default function CoachingRecordingsPage({ workspace = 'curriculum' }: { workspace?: 'curriculum' | 'coach' }) {
+  const [params, setParams] = useSearchParams();
+  const setParamsRef = useRef(setParams); setParamsRef.current = setParams;
+  const location = useMemo(() => readLocation(params), [params]);
+  const { date, period, zone, coach, learner, phase, match, family, lectures: showLectures, meeting: linkedId, occurrenceDate, tab } = location;
+  const locationRef = useRef(location); locationRef.current = location;
+  const navigate = (patch: Partial<CoachingLocation>, closeMeeting = true) => {
+    const next = { ...locationRef.current, ...(closeMeeting ? { meeting: '', tab: 'recordings' as const } : {}), ...patch };
+    locationRef.current = next;
+    setParams(writeLocation(next));
+  };
+  const setDate = (value: string) => navigate({ date: value });
+  const setPeriod = (value: Period) => navigate({ period: value });
+  const setPhase = (value: MeetingFilter) => navigate({ phase: value });
+  const setMatch = (value: MatchFilter) => navigate({ match: value });
+  const setFamily = (value: string) => navigate({ family: value });
+  const [linked, setLinked] = useState<LinkedCoachingMeeting | null>(null), [linkError, setLinkError] = useState('');
+  const [linkLoading, setLinkLoading] = useState(false), [linkAttempt, setLinkAttempt] = useState(0);
+  const [CHANGE_MESession, setSelectedSession] = useState<string | null>(null);
+  const CHANGE_MEReference = useRef<string | undefined>(undefined);
+  const [showLearners, setShowLearners] = useState(false);
+  const [showSyncDetails, setShowSyncDetails] = useState(false);
+  const [moreFilters, setMoreFilters] = useState(false);
+  const [coachSearch, setCoachSearch] = useState('');
+  const [data, setData] = useState<CoachingCalendar | null>(null);
+  const [directory, setDirectory] = useState<Pick<CoachingCalendar, 'coaches' | 'learners' | 'scope'> | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [updatesPaused, setUpdatesPaused] = useState(false);
+  const [error, setError] = useState('');
+  const [revision, setRevision] = useState(0);
+  const [pollEpoch, setPollEpoch] = useState(0);
+  const [now, setNow] = useState(Date.now);
+  const [slow, setSlow] = useState(false);
+  const [agendaLimit, setAgendaLimit] = useState(30);
+  const lastRequest = useRef('');
+  const lastRevision = useRef(0);
+  const snapshot = useRef<{ query: CoachingCalendarQuery; data: CoachingCalendar } | undefined>(undefined);
+  const loadAttempt = useRef(0);
+  const polling = useRef({ attempt: 0, key: '', checks: 0, deadline: 0, dueAt: 0 });
+  const bounds = periodBounds(date, period);
+  const month = parseIsoDate(date);
+  const monthBounds = periodBounds(date, 'month');
+  const requested = period === 'month' ? monthBounds : bounds;
+
+  useEffect(() => {
+    const controller = new AbortController();
+    if (!coach) {
+      setData(null); snapshot.current = undefined; lastRequest.current = '';
+      setLoading(true); setRefreshing(false); setError(''); setSelectedSession(null);
+      void loadCoachingCalendar({ start: requested.start, end: requested.end, timeZone: zone }, controller.signal, { directoryOnly: true })
+        .then(value => {
+          if (controller.signal.aborted) return;
+          setDirectory(value);
+          const remembered = coachPreference();
+          const chosen = value.scope === 'own' ? value.coaches[0]?.email
+            : value.coaches.find(row => row.email === remembered)?.email;
+          if (chosen) {
+            const next = { ...locationRef.current, coach: chosen, learner: '' };
+            locationRef.current = next; setParamsRef.current(writeLocation(next), { replace: true });
+          }
+        }).catch(reason => {
+          if (!controller.signal.aborted) {
+            setDirectory(null);
+            setError(reason instanceof Error ? reason.message : 'The coach list could not be loaded.');
+          }
+        }).finally(() => { if (!controller.signal.aborted) setLoading(false); });
+      return () => controller.abort();
+    }
+    loadAttempt.current += 1;
+    const key = JSON.stringify([requested.start, requested.end, zone, coach]);
+    const refresh = lastRevision.current !== revision;
+    const cycleKey = JSON.stringify([key, revision]);
+    if (polling.current.key !== cycleKey) {
+      polling.current = { attempt: 0, key: cycleKey, checks: 0, deadline: Date.now() + 90_000, dueAt: 0 };
+      setUpdatesPaused(false);
+    }
+    lastRevision.current = revision;
+    let active = true, timedOut = false;
+    setLoading(lastRequest.current !== key || !snapshot.current); setRefreshing(true); setSlow(false); setError('');
+    if (lastRequest.current !== key) setData(null);
+    if (lastRequest.current !== key || refresh) setSelectedSession(null);
+    lastRequest.current = key;
+    const query = { start: requested.start, end: requested.end, timeZone: zone, coachEmail: coach };
+    const publish = (value: CoachingCalendar) => {
+      if (active && !timedOut) {
+        snapshot.current = { query, data: value }; setData(value); setDirectory(value);
+        if (value.coaches.some(row => row.email === coach)) coachPreference(coach);
+      }
+    };
+    const slowTimer = window.setTimeout(() => setSlow(true), 12000);
+    let requestTimer: number;
+    const deadline = new Promise<never>((_resolve, reject) => {
+      requestTimer = window.setTimeout(() => {
+        timedOut = true; controller.abort();
+        reject(new Error('Calendar update timed out. Saved meetings remain available. Use Refresh calendars to try again.'));
+      }, Math.max(0, Math.min(COACHING_CALENDAR_REQUEST_TIMEOUT, polling.current.deadline - Date.now())));
+    });
+    void Promise.race([loadCoachingCalendar(query, controller.signal, {
+      background: true, refresh, previous: snapshot.current, onProgress: publish, onDirectory: value => {
+        if (active && !timedOut) {
+          setData(current => current && current.scope !== value.scope ? null : current);
+          setDirectory(value);
+        }
+      },
+    }), deadline])
+      .then(publish)
+      .catch(reason => {
+        if (active) {
+          if (reason instanceof Error && reason.message.startsWith('You do not have access')) {
+            snapshot.current = undefined; setData(null); setDirectory(null);
+          }
+          setUpdatesPaused(true);
+          setError(timedOut ? 'Calendar update timed out. Use Refresh calendars to try again.' : reason instanceof Error ? reason.message : 'Coaching calendars could not be loaded.');
+        }
+      })
+      .finally(() => { window.clearTimeout(slowTimer); window.clearTimeout(requestTimer); if (active) { setLoading(false); setRefreshing(false); } });
+    return () => { active = false; controller.abort(); window.clearTimeout(slowTimer); window.clearTimeout(requestTimer); };
+  }, [requested.start, requested.end, zone, coach, revision, pollEpoch]);
+
+  useEffect(() => {
+    // A finite browser read cycle; worker progress never renews its budget.
+    if (loading || refreshing || CHANGE_MESession || linkedId || error || !initialChecksPending(data?.sync)) return;
+    const cycle = polling.current;
+    if (cycle.checks >= 3 || Date.now() >= cycle.deadline) { setUpdatesPaused(true); return; }
+    if (cycle.attempt !== loadAttempt.current) {
+      cycle.attempt = loadAttempt.current;
+      cycle.dueAt = Date.now() + (cycle.checks + 1) * 10_000;
+    }
+    let timer: number | undefined;
+    let fired = false;
+    const schedule = () => {
+      window.clearTimeout(timer);
+      if (fired) return;
+      if (Date.now() >= cycle.deadline) { setUpdatesPaused(true); return; }
+      if (document.hidden || !navigator.onLine) return;
+      timer = window.setTimeout(() => {
+        if (Date.now() >= cycle.deadline) { setUpdatesPaused(true); return; }
+        fired = true;
+        cycle.checks += 1;
+        setPollEpoch(value => value + 1);
+      }, Math.max(0, Math.min(cycle.dueAt, cycle.deadline) - Date.now()));
+    };
+    schedule();
+    document.addEventListener('visibilitychange', schedule);
+    window.addEventListener('online', schedule);
+    window.addEventListener('offline', schedule);
+    return () => {
+      window.clearTimeout(timer);
+      document.removeEventListener('visibilitychange', schedule);
+      window.removeEventListener('online', schedule);
+      window.removeEventListener('offline', schedule);
+    };
+  }, [loading, refreshing, data, error, CHANGE_MESession, linkedId]);
+
+  useEffect(() => { setAgendaLimit(30); setSelectedSession(null); }, [requested.start, requested.end, zone, coach, learner, phase, match, family, showLectures]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 30000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const catalog = data ?? directory;
+  const preparing = initialChecksPending(data?.sync);
+  const coachNames = useMemo(() => new Map(catalog?.coaches.map(row => [row.email, row.name])), [catalog?.coaches]);
+  const learnerNames = useMemo(() => new Map(catalog?.learners.map(row => [row.id, row.name])), [catalog?.learners]);
+  const clockFormatter = useMemo(() => new Intl.DateTimeFormat('en-GB', { timeZone: zone, hour: '2-digit', minute: '2-digit' }), [zone]);
+  const linkedLearners = new Set((data?.meetings ?? []).filter(row => row.coachEmail === coach).flatMap(row => row.learnerIds));
+  const learners = (catalog?.learners ?? []).filter(row => !coach || row.coachEmail === coach
+    || linkedLearners.has(row.id));
+  const scopedMeetings = (data?.meetings ?? []).filter(row => (!coach || row.coachEmail === coach)
+    && (!learner || row.learnerIds.includes(learner)) && (showLectures || meetingCategory(row) !== 'LECTURE'));
+  const visible = filterMeetings(scopedMeetings, phase, match, family, now);
+  const allMatching = filterMeetings(scopedMeetings, 'all', match, family, now);
+  const hiddenReasons = phase === 'ready' ? hiddenReadyReasons(allMatching, now) : [];
+  const recordingStates = new Map<string, number>();
+  if (phase === 'ready') for (const row of visible) {
+    const label = recordingLabel(row.media);
+    recordingStates.set(label, (recordingStates.get(label) ?? 0) + 1);
+  }
+  const cancellations = (phase === 'cancelled' || phase === 'all') && match !== 'matched'
+    ? (data?.cancelledBookings ?? []).filter(row => (!learner || row.learnerId === learner) && (!coach || row.coachEmail === coach) && (family === 'all' || family === row.family)
+      && !visible.some(meeting => meeting.eventKey === row.eventKey && meeting.cancellationSources?.includes('lms'))) : [];
+  const lmsOnly = (data?.lmsOnly ?? []).filter(row => (!learner || row.learnerId === learner) && (!coach || row.coachEmail === coach));
+  const issues = [...new Map((data?.errors ?? []).map(item => [`${item.coachEmail}:${item.code}`, item])).values()];
+  const listedLink = linkedId ? data?.meetings.find(row => row.meetingId === linkedId) : undefined;
+  const CHANGE_MEMeeting = linkedId ? linked?.meeting.meetingId === linkedId ? linked.meeting : listedLink : visible.find(row => meetingKey(row) === CHANGE_MESession);
+  const activeKey = CHANGE_MEMeeting ? meetingKey(CHANGE_MEMeeting) : null;
+  useEffect(() => {
+    if (!linkedId) { setLinked(null); setLinkError(''); setLinkLoading(false); return; }
+    if (listedLink || linked?.meeting.meetingId === linkedId) { setLinkLoading(false); setLinkError(''); return; }
+    const controller = new AbortController(); setLinked(null); setLinkError(''); setLinkLoading(true);
+    void loadLinkedCoachingMeeting(linkedId, occurrenceDate, zone, controller.signal, linkAttempt > 0)
+      .then(value => { if (!controller.signal.aborted) setLinked(value); })
+      .catch(reason => { if (!controller.signal.aborted) setLinkError(reason instanceof Error ? reason.message : 'This meeting link could not be opened.'); })
+      .finally(() => { if (!controller.signal.aborted) setLinkLoading(false); });
+    return () => controller.abort();
+  }, [linkedId, occurrenceDate, zone, listedLink, linked, linkAttempt]);
+  useEffect(() => {
+    // An in-flight calendar read can remove the CHANGE_ME meeting from the
+    // current filter. Release the review pause when its drawer disappears.
+    if (!linkedId && CHANGE_MESession && !CHANGE_MEMeeting) setSelectedSession(null);
+  }, [CHANGE_MESession, CHANGE_MEMeeting, linkedId]);
+  const meetingDates = new Set<string>();
+  for (const row of allMatching) {
+    const first = meetingDate(row.startsAt, zone), last = meetingDate(new Date(Date.parse(row.endsAt) - 1).toISOString(), zone);
+    for (let day = first > requested.start ? first : requested.start; day <= last && day <= requested.end; day = addDays(day, 1)) meetingDates.add(day);
+  }
+  const coachName = (email: string) => coachNames.get(email) ?? (linked?.coach.email === email ? linked.coach.name : email);
+  const learnerName = (id: string) => learnerNames.get(id) ?? linked?.learners.find(row => row.id === id)?.name ?? 'Learner';
+  const clock = (value: string) => clockFormatter.format(new Date(value));
+  const shift = (direction: number) => {
+    if (period !== 'month') setDate(addDays(date, direction * (period === 'day' ? 1 : 7)));
+    else setDate(new Date(Date.UTC(month.year, month.month - 1 + direction, 1)).toISOString().slice(0, 10));
+  };
+  const selectDay = (value: string) => navigate({ date: value, period: 'day' });
+  const selectMeeting = (row: CoachingCalendar['meetings'][number]) => {
+    CHANGE_MEReference.current = row.recordingsReference; setSelectedSession(row.meetingId ? null : meetingKey(row));
+    if (row.meetingId) navigate({ meeting: row.meetingId, occurrenceDate: meetingDate(row.startsAt, zone) < requested.start ? requested.start : meetingDate(row.startsAt, zone), tab: 'overview' }, false);
+  };
+  const closeMeeting = () => { setSelectedSession(null); navigate({ meeting: '', tab: 'recordings' }, false); };
+  const rosterCoach = coach || (catalog?.scope === 'own' ? catalog.coaches[0]?.email ?? '' : '');
+  const viewLearnerMeetings = (id: string) => {
+    navigate({ coach: rosterCoach, learner: id, phase: 'all', match: 'all', family: 'all' }); setShowLearners(false);
+  };
+
+  return <WorkspaceShell role={workspace} roleLabel={workspace === 'coach' ? 'Coach' : 'Curriculum Designer'}
+    workspaceLabel={workspace === 'coach' ? 'Coach Workspace' : 'Curriculum Studio'}
+    navItems={workspace === 'coach' ? coachNavItems : curriculumNavItems}
+    pageTitle="Coach Meetings & Recordings" pageSubtitle="Coach calendars, learners, meeting recordings and attendance">
+    <main className={`${workspace === 'curriculum' ? styles.page : ''} min-h-full bg-background-100 px-4 py-5 sm:px-6 lg:px-7`}>
+      {workspace === 'curriculum' && <header className={styles.hero}>
+        <nav aria-label="Breadcrumb" className={styles.breadcrumb}>
+          <Link to="/curriculum">Curriculum</Link><ChevronRight size={12} aria-hidden="true" />
+          <Link to="/curriculum/recordings-hub">Recording Quality</Link><ChevronRight size={12} aria-hidden="true" />
+          <span aria-current="page">Coach meetings &amp; recordings</span>
+        </nav>
+        <div className={styles.heroHeading}>
+          <div><h1>Coach Meetings &amp; Recordings</h1><p>See every meeting on a coach's calendar by its original title, with the recording, attendance and quality check attached to it.</p></div>
+          <div className={styles.heroActions}>
+            <Link to="/curriculum/recordings-hub"><ArrowLeft size={14} aria-hidden="true" />Recording Quality</Link>
+            <Link to="/curriculum/coaching-recordings/reviews"><ShieldCheck size={14} aria-hidden="true" />Quality checks</Link>
+            <button type="button" disabled={loading || refreshing} onClick={() => setRevision(value => value + 1)}><RefreshCw size={14} aria-hidden="true" />Refresh calendars</button>
+          </div>
+        </div>
+        <div className={styles.heroBadges}>
+          <span><Users size={13} aria-hidden="true" />Showing: {coach ? coachName(coach) : 'Choose a coach'}</span>
+          <span><Users size={13} aria-hidden="true" />{data?.coverage.checkedCoachEmails.length ?? 0} coach {data?.coverage.checkedCoachEmails.length === 1 ? 'calendar' : 'calendars'} checked</span>
+        </div>
+        <div className={styles.heroStats} aria-label="Loaded meeting totals">
+          {[
+            { label: 'Meetings', count: scopedMeetings.length, icon: CalendarDays },
+            { label: 'Recordings ready', count: scopedMeetings.filter(row => hasPlayableRecording(row, now)).length, icon: CircleCheck },
+            { label: 'Need attention', count: filterMeetings(scopedMeetings, 'attention', 'all', 'all', now).length, icon: CircleAlert },
+          ].map(({ label, count, icon: Icon }) => <div key={label}><i aria-hidden="true"><Icon size={18} /></i><div><strong>{data ? count : '—'}</strong><span>{label}</span></div></div>)}
+        </div>
+      </header>}
+      {workspace === 'coach' && <div className="flex flex-wrap items-start justify-between gap-3">
+        <div><p className="mb-2 text-xs font-bold uppercase tracking-widest text-primary-600">Coaching workspace</p><h1 className="font-heading text-2xl font-extrabold text-foreground-950">Coach Meetings &amp; Recordings</h1>
+          <p className="mt-1 text-sm text-foreground-600">See every meeting on a coach's calendar by its original title. Filter by coach, learner, date or status.</p></div>
+        <div className="flex flex-wrap gap-2">
+          <button type="button" className={`${control} inline-flex items-center gap-2 disabled:opacity-50`} disabled={loading || refreshing} onClick={() => setRevision(value => value + 1)}><RefreshCw aria-hidden="true" size={16} />Refresh calendars</button>
+        </div>
+      </div>}
+      {loading && <div role="status" aria-busy="true" className="mt-4 rounded-xl border border-primary-100 bg-white p-4">
+        <div className="min-w-0">
+          <p className="sr-only">{coach ? 'Loading coach calendar…' : 'Loading coach list…'}</p>
+          <div aria-hidden="true" className="space-y-3">
+            <SkeletonBlock className="h-4 w-40 max-w-full" />
+            <SkeletonBlock className="h-3 w-2/3" />
+          </div>
+          <p className="mt-3 text-xs text-foreground-600">{coach ? 'Checking the CHANGE_ME coach only. Saved meetings appear as soon as they are available.' : 'Choose one coach to load their meetings.'}</p>
+          {data && <progress aria-label="Calendar loading progress" className="mt-3 h-1.5 w-full accent-primary-600" max={Math.max(1, data.coverage.totalCoaches)} value={data.coverage.checkedCoachEmails.length} />}
+          {slow && <p className="mt-2 text-xs text-amber-800">Microsoft is responding slowly. Choose one coach to narrow the request; unavailable calendars will be identified separately.</p>}
+        </div>
+      </div>}
+      <section aria-label="Calendar filters" className={`${styles.calendarFilters} mt-5 flex flex-wrap items-end gap-3 rounded-xl border border-background-200 bg-white p-4`}>
+        {catalog?.scope !== 'own' && <label className="grid gap-1 text-xs font-semibold">Search coaches<input type="search" className={control} value={coachSearch} onChange={event => setCoachSearch(event.target.value)} placeholder="Search by name or email" /></label>}
+        <label className="grid gap-1 text-xs font-semibold">Coach<RecordingSelect ariaLabel="Coach" value={coach} onChange={value => navigate({ coach: value, learner: '' })}
+          options={[
+            { value: '', label: 'Choose a coach', disabled: true },
+            ...(catalog?.coaches.filter(row => row.email === coach || `${row.name} ${row.email}`.toLowerCase().includes(coachSearch.toLowerCase())).map(row => ({ value: row.email, label: row.name })) ?? []),
+            ...(coach && !catalog?.coaches.some(row => row.email === coach) ? [{ value: coach, label: coach }] : []),
+          ]} /></label>
+        <button type="button" className={`${styles.extraControl} ${control} inline-flex items-center gap-2 disabled:opacity-50`} disabled={!rosterCoach} onClick={() => setShowLearners(true)}><Users size={16} aria-hidden="true" />Coach learners</button>
+        {workspace === 'curriculum' && <Link className={`${styles.extraControl} ${control}`} to="/curriculum/quality/forms">Edit quality forms</Link>}
+        <label className="grid gap-1 text-xs font-semibold">Learner<RecordingSelect ariaLabel="Learner" value={learner} onChange={value => navigate({ learner: value })}
+          options={[{ value: '', label: 'All learners' }, ...learners.map(row => ({ value: row.id, label: row.name })),
+            ...(learner && !learners.some(row => row.id === learner) ? [{ value: learner, label: 'Selected learner' }] : [])]} /></label>
+        <button type="button" className={`${control} sm:hidden`} aria-expanded={moreFilters} aria-controls="coaching-extra-filters" onClick={() => setMoreFilters(value => !value)}>More filters</button>
+        <div id="coaching-extra-filters" className={`${moreFilters ? 'flex' : 'hidden'} min-w-0 flex-wrap items-end gap-3 sm:flex`}>
+        <label className="grid min-w-0 max-w-full gap-1 text-xs font-semibold">Meeting type<RecordingSelect ariaLabel="Meeting type" value={family} onChange={setFamily}
+          options={[
+            { value: 'all', label: 'All types' },
+            { value: 'MCM', label: categoryLabels.MCM, group: 'MCM & PR' },
+            { value: 'PR', label: categoryLabels.PR, group: 'MCM & PR' },
+            { value: 'SUPPORT', label: categoryLabels.SUPPORT, group: 'Other meetings' },
+            { value: 'OTHER', label: categoryLabels.OTHER, group: 'Other meetings' },
+            ...(showLectures ? [{ value: 'LECTURE', label: 'Lectures / subjects' }] : []),
+          ]} /></label>
+        {phase === 'ready' ? <p className={`${styles.extraControl} max-w-full rounded-lg bg-primary-50 px-3 py-2 text-xs font-medium text-primary-800`}>Lectures included in Ready to action</p>
+          : <button type="button" aria-pressed={showLectures} className={`${styles.extraControl} ${control} ${showLectures ? 'border-primary-300 bg-primary-50 text-primary-800' : ''}`}
+            onClick={() => navigate({ lectures: !showLectures, family: family === 'LECTURE' ? 'all' : family })}>{showLectures ? 'Hide lectures / subjects' : 'Show lectures / subjects'}</button>}
+        <label className="grid gap-1 text-xs font-semibold">Match<RecordingSelect ariaLabel="LMS match" value={match} onChange={value => setMatch(value as MatchFilter)}
+          options={[{ value: 'all', label: 'All matches' }, { value: 'matched', label: 'Matched to LMS' }, { value: 'review', label: 'Needs matching review' }]} /></label>
+        <label className="grid gap-1 text-xs font-semibold">Time zone<RecordingSelect ariaLabel="Time zone" value={zone} onChange={value => navigate({ zone: value })}
+          options={[...new Set([...(!CALENDAR_TIME_ZONES.includes(zone) ? [zone] : []), ...CALENDAR_TIME_ZONES])].map(value => ({ value, label: value }))} /></label>
+        </div>
+        {!rosterCoach && <p className="w-full text-xs text-foreground-500">Choose one coach to view their learners.</p>}
+      </section>
+      {!coach && !loading && !error && <p role="status" className="mt-4 rounded-xl border border-primary-200 bg-primary-50 p-4 text-sm">Choose a coach to view their meetings. Calendars load only after a coach is CHANGE_ME.</p>}
+      <div className={`${styles.period} mt-4 flex flex-wrap items-center gap-2`}>
+        <div className={styles.periodField}>
+          <span className={styles.periodLabel} aria-hidden="true">Date</span>
+          <div className={styles.periodNavigation}>
+            <button className={control} aria-label="Previous period" onClick={() => shift(-1)}><ChevronLeft size={16} aria-hidden="true" /></button>
+            <button className={control} onClick={() => setDate(todayIso(zone))}>Today</button>
+            <button className={control} aria-label="Next period" onClick={() => shift(1)}><ChevronRight size={16} aria-hidden="true" /></button>
+          </div>
+        </div>
+        <div className={`${styles.periodField} ${styles.dateField}`}>
+          <span className={styles.periodLabel} aria-hidden="true">Pick a date</span>
+          <DatePickerField label="Selected date" value={date} onChange={value => { if (value) setDate(value); }}
+            className={styles.periodDate} panelClassName={styles.datePanel} />
+        </div>
+        <div className={`${styles.periodField} ${styles.viewField}`}>
+          <span className={styles.periodLabel} aria-hidden="true">View</span>
+          <RecordingSelect ariaLabel="Calendar period" value={period} onChange={value => setPeriod(value as Period)}
+            options={[
+              { value: 'day', label: 'Day', icon: 'ri-calendar-line' },
+              { value: 'week', label: 'Week', icon: 'ri-calendar-2-line' },
+              { value: 'month', label: 'Month', icon: 'ri-calendar-event-line' },
+            ]}
+            searchable={false} size="sm" menuMinWidth={160} className={styles.periodView}
+            />
+        </div>
+        <div className={`${styles.statusFilter} grid gap-1`}>
+          <label htmlFor="coaching-status" className={styles.statusLabel}>Meeting status</label>
+          <RecordingSelect id="coaching-status" ariaLabel="Meeting status" value={phase}
+            onChange={value => { setPhase(value as MeetingFilter); setSelectedSession(null); }}
+            options={meetingStatusOptions} searchable={false} size="sm" menuMinWidth={280}
+            />
+        </div>
+      </div>
+      <div className="mt-4 flex flex-wrap gap-2" aria-label="Meeting summary">
+        {[
+          { label: 'Meetings in this period', count: scopedMeetings.length, icon: CalendarDays },
+          { label: 'Meetings with recordings', count: scopedMeetings.filter(row => hasPlayableRecording(row, now)).length, icon: Video },
+          { label: 'Upcoming meetings', count: filterMeetings(scopedMeetings, 'upcoming', 'all', 'all', now).length, icon: CalendarDays },
+          { label: 'Coach calendars checked', count: data?.coverage.checkedCoachEmails.length ?? 0, icon: Users },
+        ].map(({ label, count, icon: Icon }) => <div key={label} className="flex items-center gap-2 rounded-full border border-background-200 bg-white px-3 py-2 text-xs">
+          <Icon aria-hidden="true" size={14} className="text-primary-500" /><span className="font-bold text-foreground-950">{data ? count : '—'}</span>
+          <span className="text-foreground-600">{label}{loading && data ? ' · loading' : ''}</span>
+        </div>)}
+      </div>
+      {loading && !data && <CoachingCalendarSkeleton className={styles.calendarLayout} />}
+      {error && <div role="alert" className="mt-4 rounded-lg border border-rose-200 bg-rose-50 p-4 text-sm text-rose-900">{error} <button className="font-semibold underline" onClick={() => setRevision(value => value + 1)}>Retry</button></div>}
+      {data && <>
+        <section aria-label="Calendar data status" className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-background-200 bg-white px-4 py-3">
+          <div role="status" className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-foreground-600">
+            <span className="inline-flex items-center gap-2"><span aria-hidden="true" className={`h-2 w-2 rounded-full ${data.partial ? 'bg-amber-500' : preparing ? 'bg-primary-500' : 'bg-emerald-500'}`} />{data.coverage.checkedCoachEmails.length} of {data.coverage.totalCoaches} calendars loaded</span>
+            {refreshing ? <span className="inline-flex items-center gap-1.5"><Loader2 size={12} aria-hidden="true" className="animate-spin motion-reduce:animate-none" />Checking for updates</span>
+              : updatesPaused ? <span>Automatic updates stopped · Use Refresh calendars to check again</span> : preparing ? <span>Remaining checks pending</span> : data.sync?.pending && <span>Saved results available</span>}
+            {data.sync?.lastSuccessfulAt && <span>Last calendar check: {clock(data.sync.lastSuccessfulAt)}</span>}
+            {data.partial && <span className="font-medium text-amber-800">{issues.length ? `${issues.length} ${issues.length === 1 ? 'check needs' : 'checks need'} attention` : 'Some results are incomplete'}</span>}
+            {lmsOnly.length > 0 && <span>{lmsOnly.length} {lmsOnly.length === 1 ? 'booking' : 'bookings'} to compare</span>}
+          </div>
+          <button type="button" className="text-xs font-semibold text-primary-700 underline-offset-4 hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary-500" onClick={() => { setSelectedSession(null); setShowSyncDetails(true); }}>Sync & booking details</button>
+        </section>
+        {!loading && phase === 'ready' && <section aria-label="Ready to action summary" className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-primary-200 bg-primary-50 p-4 text-sm">
+          <div className="min-w-0">
+            <p className="font-semibold">{visible.length} {visible.length === 1 ? 'meeting' : 'meetings'} ready to review · {visible.filter(row => hasPlayableRecording(row, now)).length} with playable recordings</p>
+            <p className="mt-1 text-xs text-foreground-600">Ready to action includes meetings past their scheduled end and started meetings with playable recordings, including lectures. Published evidence can be reviewed before the scheduled end; a recording does not confirm that the call has ended.</p>
+            <ul className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-foreground-700">{[...recordingStates].map(([label, count]) => <li key={label} data-recording-label={label}>{count} · {label}</li>)}</ul>
+            {hiddenReasons.length > 0 && <p className="mt-2 text-xs text-foreground-600">Outside Ready to action: {hiddenReasons.map(([label, count]) => `${count} ${label.toLowerCase()}`).join(' · ')}.</p>}
+            {preparing && <p className="mt-1 text-xs">{updatesPaused ? 'Some recording checks are still pending.' : 'Initial recording checks are still pending.'}</p>}
+            {data.partial && <p className="mt-1 text-xs text-amber-900">Some calendar or recording checks failed. Loaded counts may be incomplete; see Sync & booking details.</p>}
+          </div>
+          {hiddenReasons.length > 0 && <button className={control} onClick={() => setPhase('all')}>Show all loaded meetings</button>}
+        </section>}
+        <div className={`${styles.calendarLayout} mt-4 grid min-w-0 gap-4 lg:grid-cols-[260px_minmax(0,1fr)]`}>
+          <div className="hidden lg:block"><CoachMiniCalendar date={date} timeZone={zone} meetingDates={meetingDates} onSelectDay={selectDay} /></div>
+          <section aria-label="Coaching meetings" className="min-w-0 space-y-4">
+            {!loading && !preparing && !visible.length && !cancellations.length && <p className="rounded-xl border border-background-200 bg-white p-6 text-sm text-foreground-600">{data.partial ? 'No meetings loaded for these filters. Some calendars or recordings could not be checked.' : phase === 'ready' ? 'No meetings ready to review match these filters in the CHANGE_ME period.' : 'No meetings match these filters in the CHANGE_ME period.'}</p>}
+            <MeetingCalendar date={date} period={period} timeZone={zone} meetings={period === 'day' ? visible : visible.slice(0, agendaLimit)} totalMeetings={visible.length} now={now}
+              CHANGE_ME={activeKey} coachName={coachName} learnerName={learnerName} onSelectDay={selectDay} onSelectMeeting={selectMeeting} />
+            <QAWorkCalendar date={date} period={period} />
+            {period !== 'day' && visible.length > agendaLimit && <button className={control} onClick={() => setAgendaLimit(value => value + 30)}>Show more meetings ({visible.length - agendaLimit} remaining)</button>}
+            {cancellations.length > 0 && <section aria-label="Saved LMS cancellations" className="rounded-xl border border-rose-200 bg-rose-50 p-4">
+              <h2 className="text-sm font-bold text-rose-950">Saved LMS cancellations</h2>
+              <p className="mt-1 text-xs text-rose-900">Source: LMS. Where the original meeting time was removed, the CHANGE_ME period uses the record update date. That date is not the original meeting or cancellation time.</p>
+              <ul className="mt-3 space-y-3 text-sm">{cancellations.map(row => <li key={`${row.coachEmail}:${row.eventKey}`}>
+                <p className="font-semibold">{learnerName(row.learnerId)} · {coachName(row.coachEmail)} · {categoryLabels[row.family]}</p>
+                <p className="mt-1 text-xs">Cancelled · Source: LMS · {row.startsAt ? `Session: ${formatFullDate(meetingDate(row.startsAt, zone))} ${clock(row.startsAt)}` : `Original session time not retained. Record updated: ${row.recordUpdatedAt ? formatFullDate(meetingDate(row.recordUpdatedAt, zone)) : 'Unknown'}`}</p>
+              </li>)}</ul>
+            </section>}
+          </section>
+        </div>
+      </>}
+      {linkedId && linkLoading && !CHANGE_MEMeeting && <p role="status" className="mt-4 rounded-xl border border-primary-100 bg-white p-4 text-sm">Opening the saved meeting…</p>}
+      {linkedId && linkError && !CHANGE_MEMeeting && <div role="alert" className="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm">{linkError}
+        <button className={`${control} ml-2`} onClick={() => setLinkAttempt(value => value + 1)}>Retry meeting link</button>
+        <button className={`${control} ml-2`} onClick={closeMeeting}>Close meeting link</button></div>}
+      {CHANGE_MEMeeting && <MeetingDetailsDrawer key={activeKey} meeting={CHANGE_MEMeeting} reference={linkedId ? CHANGE_MEMeeting.recordingsReference : CHANGE_MEReference.current}
+        qualityEnabled={workspace === 'curriculum'}
+        activeTab={linkedId ? tab : undefined} onTabChange={linkedId ? value => navigate({ tab: value }, false) : undefined}
+        timeZone={zone} now={now} coachName={coachName(CHANGE_MEMeeting.coachEmail)} learnerNames={CHANGE_MEMeeting.learnerIds.map(learnerName)} onClose={closeMeeting} />}
+      {showSyncDetails && data && <SyncReviewDrawer data={data} issues={issues} bookings={lmsOnly} pending={loading} busy={refreshing}
+        updatesPaused={updatesPaused}
+        coachName={coachName} learnerName={learnerName} onClose={() => setShowSyncDetails(false)} onRefresh={() => setRevision(value => value + 1)}
+        onViewCoach={email => { setShowSyncDetails(false); navigate({ coach: email, learner: '' }); }} />}
+      {showLearners && rosterCoach && <CoachLearnersDialog key={`${rosterCoach}:${requested.start}:${requested.end}:${zone}`}
+        coachEmail={rosterCoach} coachName={coachName(rosterCoach)} start={requested.start} end={requested.end} timeZone={zone}
+        meetings={(data?.meetings ?? []).filter(row => row.coachEmail === rosterCoach)} calendarPartial={loading || !data || data.partial}
+        onClose={() => setShowLearners(false)} onViewMeetings={viewLearnerMeetings} />}
+    </main>
+    {workspace === 'curriculum' && <RecordingsPageHelp guideId="coach-meetings" />}
+  </WorkspaceShell>;
+}

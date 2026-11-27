@@ -1,0 +1,215 @@
+import os
+import sys
+from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+# The coded lecture platform (`app/`) lives one level above the Django
+# project. The Operations API reads every pipeline answer from it, so it has to
+# be importable however Django was started - from `backend/`, from the repo
+# root, by manage.py or by a WSGI server. Setting it here rather than relying
+# on PYTHONPATH means "it works on my machine" cannot be the difference.
+REPO_ROOT = BASE_DIR.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+# backend/.env is the one runtime env file. It fills only names the process environment
+# (systemd EnvironmentFile on the VPS) does not already set - see app/config/environment.py.
+from app.config.environment import load_canonical_env  # noqa: E402
+
+load_canonical_env()
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    return os.getenv(name, str(default)).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def postgres_config(url: str) -> dict:
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query)
+    config = {
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": unquote(parsed.path.lstrip("/")),
+        "USER": unquote(parsed.username or ""),
+        "PASSWORD": unquote(parsed.password or ""),
+        "HOST": parsed.hostname or "",
+        "PORT": parsed.port or 5432,
+        "CONN_MAX_AGE": 60,
+        "OPTIONS": {},
+    }
+    if query.get("sslmode"):
+        config["OPTIONS"]["sslmode"] = query["sslmode"][0]
+    return config
+
+
+SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", 'CHANGE_ME')
+DEBUG = env_bool("DJANGO_DEBUG", True)
+ALLOWED_HOSTS = [value.strip() for value in os.getenv(
+    "DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1"
+).split(",") if value.strip()]
+DASHBOARD_USERNAME = os.getenv("DASHBOARD_USERNAME", "").strip()
+DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")
+
+# "Clip" on a positive moment: the n8n flow that cuts one clip on demand.
+CLIP_ON_DEMAND_WEBHOOK_URL = os.getenv(
+    "CLIP_ON_DEMAND_WEBHOOK_URL",
+    "https://n8n.srv943390.hstgr.cloud/webhook/qa-clip-on-demand").strip()
+
+# Social Media management (positive_mentions/social_operations.py).
+# The secret n8n sends (Authorization: Bearer ...) to report run status and
+# OpenAI usage. Unset or shorter than 32 characters = those routes refuse.
+SOCIAL_MEDIA_SERVICE_TOKEN = os.getenv("SOCIAL_MEDIA_SERVICE_TOKEN", "").strip()
+
+# Continuous Bunny Publisher -> LMS backend delivery API (operations/lms_api.py, /api/publisher/v1/).
+# Service tokens: comma-separated so a rotation can overlap (old + new); each must be at least 32
+# characters. No token configured = every route answers 401. The library is the ONE Bunny library
+# recordings are delivered from (786045). Playback stays unavailable to every caller until
+# PUBLISHER_LMS_PLAYBACK_ENABLED is explicitly true, whatever has been released.
+PUBLISHER_LMS_SERVICE_TOKENS = [value.strip() for value in os.getenv(
+    "PUBLISHER_LMS_SERVICE_TOKENS", "").split(",") if value.strip()]
+_publisher_lms_library = os.getenv("PUBLISHER_LMS_LIBRARY_ID", "").strip()
+PUBLISHER_LMS_LIBRARY_ID = int(_publisher_lms_library) if _publisher_lms_library.isdigit() else None
+PUBLISHER_LMS_PLAYBACK_ENABLED = env_bool("PUBLISHER_LMS_PLAYBACK_ENABLED", False)
+PUBLISHER_LMS_RATE = os.getenv("PUBLISHER_LMS_RATE", "600/min").strip() or "600/min"
+PUBLISHER_LMS_CAPTION_LANGUAGE = os.getenv("PUBLISHER_LMS_CAPTION_LANGUAGE", "en").strip() or "en"
+# Swagger UI for the API above at /api/docs/ (+ /api/schema/), Django staff accounts only
+# (operations/api_docs.py). Off = every docs route answers 404.
+PUBLISHER_API_DOCS_ENABLED = env_bool("PUBLISHER_API_DOCS_ENABLED", False)
+# Origins whose form posts Django accepts, e.g. https://positive-moments.kentbusinesscollege.net.
+# Behind the TLS-terminating proxy Django sees plain HTTP, so an HTTPS sign-in form (the API docs)
+# fails the CSRF origin check unless its origin is listed here. Empty = Django's default.
+CSRF_TRUSTED_ORIGINS = [value.strip() for value in os.getenv(
+    "DJANGO_CSRF_TRUSTED_ORIGINS", "").split(",") if value.strip()]
+# Historical Backfill in the Publishing Monitor (operations/publisher_backfill_views.py): the longest
+# inclusive range one run may cover. Every signed-in user of the Publishing page may preview, start,
+# cancel and retry a run (the default IsAuthenticated policy below); no extra role.
+_backfill_days = os.getenv("PUBLISHER_BACKFILL_MAX_DAYS", "").strip()
+PUBLISHER_BACKFILL_MAX_DAYS = int(_backfill_days) if _backfill_days.isdigit() and 1 <= int(_backfill_days) <= 366 else 31
+
+# Access log of the LMS delivery API (one JSON line per request; never a token or a URL).
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "handlers": {"publisher_lms_console": {"class": "logging.StreamHandler"}},
+    "loggers": {"publisher.lms_api": {"handlers": ["publisher_lms_console"], "level": "INFO",
+                                      "propagate": False}},
+}
+# USD prices per million tokens, by exact model name, as JSON:
+#   {"gpt-5.2": {"input": "...", "cached_input": "...", "output": "...",
+#                "source": "where and when the price was read"}}
+# A model without a complete price records its usage with cost "unknown".
+SOCIAL_MEDIA_MODEL_PRICES = os.getenv("SOCIAL_MEDIA_MODEL_PRICES", "").strip()
+# "Reanalyse Lecture": the n8n Social Media webhook (production /webhook/ URL,
+# no authentication on the n8n side). Server-side only, never sent to the
+# browser. Missing or not https = reanalysis is refused and no run is created.
+SOCIAL_MEDIA_REANALYSIS_WEBHOOK_URL = os.getenv("SOCIAL_MEDIA_REANALYSIS_WEBHOOK_URL", "").strip()
+
+# Sign in with Microsoft (positive_mentions/sso.py). By default it reuses the
+# app registration the platform already has for Graph; the redirect URI must
+# be registered on that app exactly as written here. Empty = SSO switched off.
+MICROSOFT_SSO_TENANT_ID = (os.getenv("MICROSOFT_SSO_TENANT_ID")
+                           or os.getenv("MICROSOFT_GRAPH_TENANT_ID", "")).strip()
+MICROSOFT_SSO_CLIENT_ID = (os.getenv("MICROSOFT_SSO_CLIENT_ID")
+                           or os.getenv("MICROSOFT_GRAPH_CLIENT_ID", "")).strip()
+MICROSOFT_SSO_CLIENT_SECRET = (os.getenv("MICROSOFT_SSO_CLIENT_SECRET")
+                               or os.getenv("MICROSOFT_GRAPH_CLIENT_SECRET", "")).strip()
+MICROSOFT_SSO_REDIRECT_URI = os.getenv("MICROSOFT_SSO_REDIRECT_URI", "").strip()
+# Only sign-in names on these domains are matched to accounts.
+MICROSOFT_SSO_EMAIL_DOMAINS = [value.strip().lower() for value in os.getenv(
+    "MICROSOFT_SSO_EMAIL_DOMAINS", "kentbusinesscollege.com,kentbusinesscollege.org"
+).split(",") if value.strip()]
+# The sign-in round trip keeps its state in the Django session cookie.
+SESSION_COOKIE_SECURE = env_bool("SESSION_COOKIE_SECURE",
+                                 MICROSOFT_SSO_REDIRECT_URI.startswith("https://"))
+SESSION_COOKIE_SAMESITE = "Lax"
+
+INSTALLED_APPS = [
+    "django.contrib.admin",
+    "django.contrib.auth",
+    "django.contrib.contenttypes",
+    "django.contrib.sessions",
+    "django.contrib.messages",
+    "django.contrib.staticfiles",
+    "corsheaders",
+    "rest_framework",
+    "rest_framework.authtoken",
+    "positive_mentions",
+    # Phase 5A: the Operations Console API. It owns no models - the lecture
+    # platform owns its schema through psycopg - so it has no migrations.
+    "operations",
+]
+
+MIDDLEWARE = [
+    "django.middleware.security.SecurityMiddleware",
+    "corsheaders.middleware.CorsMiddleware",
+    "django.contrib.sessions.middleware.SessionMiddleware",
+    "django.middleware.common.CommonMiddleware",
+    "django.middleware.csrf.CsrfViewMiddleware",
+    "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "django.contrib.messages.middleware.MessageMiddleware",
+    "django.middleware.clickjacking.XFrameOptionsMiddleware",
+]
+
+ROOT_URLCONF = "config.urls"
+TEMPLATES = [{
+    "BACKEND": "django.template.backends.django.DjangoTemplates",
+    "DIRS": [],
+    "APP_DIRS": True,
+    "OPTIONS": {"context_processors": [
+        "django.template.context_processors.request",
+        "django.contrib.auth.context_processors.auth",
+        "django.contrib.messages.context_processors.messages",
+    ]},
+}]
+WSGI_APPLICATION = "config.wsgi.application"
+
+# A test command NEVER derives its database from DATABASE_URL. Django creates
+# and drops `test_<NAME>` on whatever server DATABASES points at, so pointing it
+# at production means creating and dropping a database on the production server
+# - which is exactly what `manage.py test` used to do here. The `test_` prefix
+# is no protection: it is the SERVER that must not be production.
+from config.test_database import is_test_command, test_database_config  # noqa: E402
+
+TEST_RUNNER = "config.test_runner.SafeDatabaseTestRunner"
+
+database_url = os.getenv("DATABASE_URL", "").strip()
+if is_test_command():
+    # Fails closed: no TEST_DATABASE_URL, a production URL, a production server
+    # or a database name without a test marker all raise here, before Django
+    # opens a connection.
+    DATABASES = {"default": test_database_config(postgres_config)}
+else:
+    DATABASES = {
+        "default": postgres_config(database_url) if database_url else {
+            "ENGINE": "django.db.backends.sqlite3",
+            "NAME": BASE_DIR / "db.sqlite3",
+        }
+    }
+
+AUTH_PASSWORD_VALIDATORS = [
+    {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
+    {"NAME": "django.contrib.auth.password_validation.MinimumLengthValidator"},
+    {"NAME": "django.contrib.auth.password_validation.CommonPasswordValidator"},
+    {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
+]
+LANGUAGE_CODE = "en-us"
+TIME_ZONE = "UTC"
+USE_I18N = True
+USE_TZ = True
+STATIC_URL = "static/"
+DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+CORS_ALLOWED_ORIGINS = [value.strip() for value in os.getenv(
+    "CORS_ALLOWED_ORIGINS", "http://localhost:5173"
+).split(",") if value.strip()]
+REST_FRAMEWORK = {
+    "DEFAULT_AUTHENTICATION_CLASSES": [
+        "rest_framework.authentication.TokenAuthentication",
+    ],
+    "DEFAULT_PERMISSION_CLASSES": [
+        "rest_framework.permissions.IsAuthenticated",
+    ],
+    "DEFAULT_PAGINATION_CLASS": "positive_mentions.pagination.LecturePagination",
+    "PAGE_SIZE": 20,
+}

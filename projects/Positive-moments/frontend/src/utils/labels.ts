@@ -1,0 +1,422 @@
+/**
+ * The platform's vocabulary, rendered for people.
+ *
+ * WHAT THIS IS ALLOWED TO DO
+ * --------------------------
+ * Translate one backend token into one English phrase, and pick the badge
+ * colour that phrase deserves. That is presentation.
+ *
+ * WHAT IT MUST NEVER DO
+ * ---------------------
+ * Decide anything. There is no rule here that reads several fields and
+ * concludes a lecture is complete, eligible, attended or synced - every one of
+ * those answers arrives from `app.orchestration` already made. A lookup table
+ * that started inferring would be a second pipeline, written in TypeScript,
+ * with no tests.
+ *
+ * Unknown tokens fall through to a readable version of the token itself rather
+ * than to "Unknown", so a new backend state shows up as itself instead of
+ * disappearing.
+ */
+
+export type Tone = 'ok' | 'waiting' | 'review' | 'error' | 'info' | 'brand' | 'neutral' | 'quiet'
+
+export const TONE_CLASS: Record<Tone, string> = {
+  ok: 'badge-ok',
+  waiting: 'badge-waiting',
+  review: 'badge-review',
+  error: 'badge-error',
+  info: 'badge-info',
+  brand: 'badge-brand',
+  neutral: 'badge-neutral',
+  quiet: 'badge-quiet',
+}
+
+/** SCREAMING_SNAKE -> "Screaming snake". The fallback for anything unmapped. */
+export function humanise(value?: string | null, fallback = '—') {
+  if (!value) return fallback
+  return value.replace(/_/g, ' ').toLowerCase().replace(/^./, (c) => c.toUpperCase())
+}
+
+// --- pipeline stages --------------------------------------------------------
+
+export const STAGE_LABELS: Record<string, string> = {
+  DISCOVERY: 'Calendar discovery',
+  MEETING: 'Teams meeting match',
+  TRANSCRIPT: 'Transcript retrieval',
+  SELECTION: 'Transcript selection',
+  CANONICAL_CUES: 'Canonical transcript',
+  SPEAKERS: 'Speaker attribution',
+  ATTENDANCE: 'Attendance',
+  ENGAGEMENT: 'Engagement',
+  QA_EVALUATION: 'Quality evaluation',
+  QA_RENDER: 'Quality report',
+  PERFECT_ELIGIBILITY: 'Perfect eligibility',
+  LEGACY_QA_SYNC: 'QA sync to legacy',
+  PERFECT_SYNC: 'Perfect sync to legacy',
+  RECORDING_LINK: 'Recording link',
+  EXCEL_SYNC: 'Excel sync',
+}
+
+/** One line saying what the stage is for, shown under its name. */
+export const STAGE_NOTES: Record<string, string> = {
+  DISCOVERY: 'The lecture was found on the teaching calendar.',
+  MEETING: 'The calendar event was matched to a real Teams meeting.',
+  TRANSCRIPT: 'Microsoft Graph returned the transcript content.',
+  SELECTION: 'One transcript was chosen as the lecture of record.',
+  CANONICAL_CUES: 'The selected transcript was parsed into timed cues.',
+  SPEAKERS: 'Cues were attributed to named speakers.',
+  ATTENDANCE: 'The attendance source was read and resolved.',
+  ENGAGEMENT: 'Participation was measured from the canonical transcript.',
+  QA_EVALUATION: 'The lecture was assessed against the QA checklist.',
+  QA_RENDER: 'The assessment was rendered into the report format.',
+  PERFECT_ELIGIBILITY: 'Perfect-lecture policy was applied to the result.',
+  LEGACY_QA_SYNC: 'The report was written to the legacy QA record.',
+  PERFECT_SYNC: 'The perfect outcome was written to the legacy record.',
+  RECORDING_LINK: 'A durable recording link was stored for the exact Teams recording.',
+  EXCEL_SYNC: 'The outcome was stamped into the reporting workbook. Owned by the legacy workflows.',
+}
+
+export function stageLabel(name?: string | null) {
+  return (name && STAGE_LABELS[name]) || humanise(name)
+}
+
+// --- stage states -----------------------------------------------------------
+
+/**
+ * WAITING is amber, never red. A lecture waiting on an external source is not
+ * broken - its next move belongs to somebody else - and colouring it like a
+ * failure sends an operator chasing a problem that does not exist.
+ *
+ * NOT_APPLICABLE is the quietest tone on the page: it is settled, so it should
+ * recede rather than compete with the stages that still need something.
+ */
+export const STAGE_STATE: Record<string, { label: string; short: string; tone: Tone }> = {
+  COMPLETE: { label: 'Complete', short: 'Done', tone: 'ok' },
+  MISSING: { label: 'Not started', short: 'To do', tone: 'neutral' },
+  STALE: { label: 'Needs refresh', short: 'Stale', tone: 'info' },
+  FAILED: { label: 'Failed', short: 'Failed', tone: 'error' },
+  REVIEW_REQUIRED: { label: 'Review required', short: 'Review', tone: 'review' },
+  WAITING: { label: 'Waiting', short: 'Waiting', tone: 'waiting' },
+  NOT_APPLICABLE: { label: 'Not applicable', short: 'n/a', tone: 'quiet' },
+}
+
+export function stageState(state?: string | null) {
+  return STAGE_STATE[state ?? ''] ?? { label: humanise(state), short: humanise(state), tone: 'neutral' as Tone }
+}
+
+// --- day buckets ------------------------------------------------------------
+
+export const BUCKET: Record<string, { label: string; tone: Tone }> = {
+  complete: { label: 'Complete', tone: 'ok' },
+  waiting: { label: 'Waiting', tone: 'waiting' },
+  review: { label: 'Needs review', tone: 'review' },
+  failed: { label: 'Failed', tone: 'error' },
+  in_progress: { label: 'In progress', tone: 'info' },
+  suppressed_duplicate: { label: 'Duplicate calendar event suppressed', tone: 'quiet' },
+}
+
+export function bucketLabel(bucket?: string | null) {
+  return BUCKET[bucket ?? '']?.label ?? humanise(bucket)
+}
+
+export function bucketTone(bucket?: string | null): Tone {
+  return BUCKET[bucket ?? '']?.tone ?? 'neutral'
+}
+
+// --- next actions -----------------------------------------------------------
+
+export const ACTION_LABELS: Record<string, string> = {
+  RUN_DISCOVERY: 'Discover the lecture',
+  RESOLVE_MEETING: 'Match the Teams meeting',
+  ACQUIRE_TRANSCRIPT: 'Fetch the transcript',
+  SELECT_TRANSCRIPT: 'Select the transcript',
+  BUILD_CANONICAL_CUES: 'Build the canonical transcript',
+  RESOLVE_SPEAKERS: 'Attribute speakers',
+  RESOLVE_ATTENDANCE: 'Resolve attendance',
+  CALCULATE_ENGAGEMENT: 'Measure engagement',
+  RUN_QA: 'Run the quality evaluation',
+  REFRESH_DETERMINISTIC_QA: 'Refresh the deterministic checks',
+  REVALIDATE_EVIDENCE: 'Revalidate the evidence',
+  RENDER_QA: 'Render the quality report',
+  SUPPRESS_DUPLICATE_EVENT: 'Suppress the duplicate calendar event',
+  SYNC_LEGACY_QA: 'Sync QA to the legacy record',
+  WAIT_FOR_ATTENDANCE_SOURCE: 'Waiting for the attendance source',
+  RECOVER_ATTENDANCE: 'Recover attendance',
+  EVALUATE_PERFECT: 'Apply the Perfect policy',
+  SYNC_PERFECT: 'Sync Perfect to the legacy record',
+  WAIT_FOR_RECORDING: 'Waiting for the recording link',
+  LINK_RECORDING: 'Link the exact recording',
+  WAIT_FOR_EXCEL_SYNC: 'Waiting for the Excel sync',
+  NOTHING_TO_DO: 'Nothing to do',
+  MANUAL_REVIEW_REQUIRED: 'Needs a human decision',
+}
+
+export function actionLabel(action?: string | null) {
+  return (action && ACTION_LABELS[action]) || humanise(action)
+}
+
+/** Actions that describe somebody else's turn, so they read calmly. */
+export function actionTone(action?: string | null): Tone {
+  if (!action) return 'neutral'
+  if (action === 'NOTHING_TO_DO') return 'quiet'
+  if (action === 'MANUAL_REVIEW_REQUIRED') return 'review'
+  if (action.startsWith('WAIT_FOR')) return 'waiting'
+  return 'brand'
+}
+
+// --- attendance -------------------------------------------------------------
+
+export const ATTENDANCE_COVERAGE: Record<string, string> = {
+  SOURCE_AVAILABLE_WITH_MEMBERS: 'Attendance source available',
+  SOURCE_MISSING: 'No attendance record has arrived',
+  SOURCE_PARTIAL_OR_INVALID: 'Attendance record is partial or invalid',
+}
+
+// --- Perfect ----------------------------------------------------------------
+
+export const PERFECT_REASONS: Record<string, { label: string; tone: Tone }> = {
+  ELIGIBLE: { label: 'Eligible', tone: 'ok' },
+  PENDING_ATTENDANCE_DATA: { label: 'Pending attendance', tone: 'waiting' },
+  NOT_ELIGIBLE_CANCELLED: { label: 'Not eligible — cancelled', tone: 'quiet' },
+  NOT_ELIGIBLE_CHECKLIST_ROW_COUNT: { label: 'Not eligible — checklist incomplete', tone: 'neutral' },
+  NOT_ELIGIBLE_DUPLICATE_ORDER: { label: 'Not eligible — duplicate checklist order', tone: 'neutral' },
+  NOT_ELIGIBLE_STATUS_NOT_ALL_MET: { label: 'Not eligible — not every item met', tone: 'neutral' },
+  NOT_ELIGIBLE_MET_COUNT: { label: 'Not eligible — met count', tone: 'neutral' },
+  NOT_ELIGIBLE_PARTIAL_COUNT: { label: 'Not eligible — partial items', tone: 'neutral' },
+  NOT_ELIGIBLE_NOT_MET_COUNT: { label: 'Not eligible — unmet items', tone: 'neutral' },
+  NOT_ELIGIBLE_MISSING_IDENTIFIERS: { label: 'Not eligible — missing identifiers', tone: 'neutral' },
+}
+
+export function perfectReason(reason?: string | null) {
+  // No reason at all means the policy has not been applied yet, which is not
+  // the same as "not eligible" and must not be rendered as an em dash.
+  if (!reason) return { label: 'Not yet decided', tone: 'quiet' as Tone }
+  return PERFECT_REASONS[reason] ?? { label: humanise(reason), tone: 'neutral' as Tone }
+}
+
+// --- pipeline runs ----------------------------------------------------------
+
+export const RUN_TYPES: Record<string, string> = {
+  MANUAL: 'Manual pipeline run',
+  SCHEDULED: 'Scheduled pipeline run',
+}
+
+export const RUN_STATUS: Record<string, { label: string; tone: Tone }> = {
+  RUNNING: { label: 'Running', tone: 'info' },
+  COMPLETED: { label: 'Completed', tone: 'ok' },
+  COMPLETED_WITH_FAILURES: { label: 'Completed with failures', tone: 'review' },
+  FAILED: { label: 'Failed', tone: 'error' },
+  BLOCKED_LEGACY_QA_ACTIVE: { label: 'Blocked — legacy QA active', tone: 'waiting' },
+  BLOCKED_WRITER_INTEGRITY: { label: 'Blocked — writer integrity', tone: 'error' },
+  ABORTED: { label: 'Aborted', tone: 'neutral' },
+}
+
+export function runTypeLabel(value?: string | null) {
+  return (value && RUN_TYPES[value]) || `${humanise(value)} pipeline run`
+}
+
+export function runStatus(value?: string | null) {
+  return RUN_STATUS[value ?? ''] ?? { label: humanise(value), tone: 'neutral' as Tone }
+}
+
+// --- retry / guarded actions ------------------------------------------------
+
+export const RETRY_REASONS: Record<string, string> = {
+  NOTHING_TO_RETRY: 'Everything the platform owns is already done.',
+  WAITING_ON_EXTERNAL_SOURCE: 'The next step belongs to an external source, not to a retry.',
+  MANUAL_REVIEW_REQUIRED: 'A human decision is needed before this can resume.',
+  SUPPRESSED_DUPLICATE: 'This is a suppressed duplicate calendar event.',
+}
+
+export function retryReason(value?: string | null) {
+  return (value && RETRY_REASONS[value]) || humanise(value, '')
+}
+
+// --- recording --------------------------------------------------------------
+
+export function recordingLabel(available: boolean) {
+  return available ? 'Recording available' : 'Recording link pending'
+}
+
+/** One phrase per backend outcome (app/recordings/coverage.py). */
+export const RECORDING_OUTCOMES: Record<string, { label: string; tone: Tone }> = {
+  ALREADY_LINKED: { label: 'Already linked', tone: 'ok' },
+  WRITTEN: { label: 'Linked by this run', tone: 'ok' },
+  EXACT_MATCH: { label: 'Exact match — would link', tone: 'info' },
+  AMBIGUOUS: { label: 'Ambiguous — not linked', tone: 'review' },
+  BLOCKED_BY_EARLIER_STAGE: { label: 'Waiting on an earlier step', tone: 'waiting' },
+  REVIEW_REQUIRED: { label: 'Needs review', tone: 'review' },
+  NOT_APPLICABLE: { label: 'Not applicable — cancelled', tone: 'quiet' },
+  NOT_FOUND: { label: 'No recording file found', tone: 'waiting' },
+  GRAPH_LOOKUP_FAILED: { label: 'Microsoft lookup failed', tone: 'error' },
+  DISCOVERY_FAILED: { label: 'File search failed', tone: 'error' },
+  NO_CODED_LECTURE: { label: 'Not in the lecture registry', tone: 'neutral' },
+  NO_LEGACY_TARGET: { label: 'No QA record to link', tone: 'neutral' },
+  WAITING: { label: 'Retry scheduled', tone: 'waiting' },
+  NOT_EVALUATED: { label: 'Not evaluated (observe mode)', tone: 'quiet' },
+  OTHER: { label: 'Other', tone: 'neutral' },
+}
+
+export function recordingOutcome(value?: string | null) {
+  return RECORDING_OUTCOMES[value ?? ''] ?? { label: humanise(value), tone: 'neutral' as Tone }
+}
+
+export const RECORDING_SOURCES: Record<string, string> = {
+  channel_recordings: 'Channel recordings folder',
+  onedrive_recordings: 'Organizer OneDrive recordings',
+  tenant_search: 'Tenant search',
+}
+
+export function recordingSource(value?: string | null) {
+  return (value && RECORDING_SOURCES[value]) || humanise(value)
+}
+
+export const RECORDING_OWNERS: Record<string, string> = {
+  CODED_RECORDING_LINK: 'Linked by this platform',
+  LEGACY_RECORDING_BRANCH: 'Legacy n8n recording workflow',
+}
+
+export function recordingOwner(value?: string | null) {
+  return (value && RECORDING_OWNERS[value]) || humanise(value)
+}
+
+/* ---------------------------------------------------------------------------
+ * QA Core RC2: Operations Backfill vocabulary.
+ * ------------------------------------------------------------------------- */
+
+export const BACKFILL_STATUS: Record<string, { label: string; tone: Tone }> = {
+  PENDING: { label: 'Queued', tone: 'waiting' },
+  RUNNING: { label: 'Running', tone: 'info' },
+  COMPLETED: { label: 'Completed', tone: 'ok' },
+  CANCEL_REQUESTED: { label: 'Stopping', tone: 'waiting' },
+  CANCELLED: { label: 'Cancelled', tone: 'neutral' },
+  FAILED: { label: 'Failed', tone: 'error' },
+  BLOCKED_LEGACY_QA_ACTIVE: { label: 'Blocked — legacy QA active', tone: 'error' },
+}
+
+export function backfillStatus(value?: string | null) {
+  return BACKFILL_STATUS[value || ''] || { label: humanise(value), tone: 'neutral' as Tone }
+}
+
+export const BACKFILL_DAY_STATUS: Record<string, { label: string; tone: Tone }> = {
+  PENDING: { label: 'Not started', tone: 'quiet' },
+  COMPLETED: { label: 'Done', tone: 'ok' },
+  FAILED: { label: 'Failed', tone: 'error' },
+  SKIPPED_CANCELLED: { label: 'Skipped', tone: 'neutral' },
+  DEFERRED_CYCLE_BUSY: { label: 'Deferred', tone: 'waiting' },
+}
+
+export function backfillDayStatus(value?: string | null) {
+  return BACKFILL_DAY_STATUS[value || ''] || { label: humanise(value), tone: 'neutral' as Tone }
+}
+
+export const BACKFILL_MODE: Record<string, string> = {
+  PREVIEW: 'Preview',
+  EXECUTE: 'Backfill',
+}
+
+// --- Positive Moments Media -------------------------------------------------
+
+export const MEDIA_STATUS: Record<string, { label: string; tone: Tone }> = {
+  PLANNED: { label: 'Planned', tone: 'neutral' },
+  WAITING_FOR_RECORDING: { label: 'Waiting for recording', tone: 'waiting' },
+  WAITING_FOR_ALIGNMENT: { label: 'Waiting for alignment', tone: 'waiting' },
+  REVIEW_REQUIRED_ALIGNMENT: { label: 'Alignment needs review', tone: 'review' },
+  READY_TO_RENDER: { label: 'Ready to render', tone: 'info' },
+  QUEUED: { label: 'Queued', tone: 'info' },
+  RENDERING: { label: 'Rendering', tone: 'info' },
+  RENDER_SUCCEEDED: { label: 'Rendered', tone: 'info' },
+  UPLOAD_PENDING: { label: 'Upload pending', tone: 'info' },
+  UPLOADING: { label: 'Uploading', tone: 'info' },
+  COMPLETED: { label: 'Ready', tone: 'ok' },
+  FAILED_RETRYABLE: { label: 'Failed — will retry', tone: 'waiting' },
+  FAILED_FINAL: { label: 'Failed', tone: 'error' },
+  NO_MEDIA: { label: 'No clips', tone: 'quiet' },
+  NEEDS_REVIEW: { label: 'Needs review', tone: 'review' },
+  FAILED: { label: 'Failed', tone: 'error' },
+}
+
+export function mediaStatus(value?: string | null) {
+  return (value && MEDIA_STATUS[value]) || { label: humanise(value), tone: 'neutral' as Tone }
+}
+
+export const ANALYSIS_STATE: Record<string, { label: string; tone: Tone }> = {
+  NOT_ANALYZED: { label: 'Not analyzed', tone: 'neutral' },
+  ANALYZING: { label: 'Analyzing', tone: 'info' },
+  NO_POSITIVE_MOMENTS: { label: 'No positive moments', tone: 'quiet' },
+  MOMENTS_FOUND: { label: 'Moments found', tone: 'ok' },
+  REVIEW_REQUIRED: { label: 'Needs review', tone: 'review' },
+  STALE: { label: 'Out of date', tone: 'waiting' },
+  FAILED: { label: 'Analysis failed', tone: 'error' },
+}
+
+export function analysisState(value?: string | null) {
+  if (!value) return { label: 'Not previewed', tone: 'quiet' as Tone }
+  return ANALYSIS_STATE[value] || { label: humanise(value), tone: 'neutral' as Tone }
+}
+
+export function transcriptState(value?: string | null) {
+  if (value === 'READY') return { label: 'Ready', tone: 'ok' as Tone }
+  if (value === 'NOT_APPLICABLE') return { label: 'Not applicable', tone: 'quiet' as Tone }
+  if (!value) return { label: 'Not previewed', tone: 'quiet' as Tone }
+  return { label: 'Not ready', tone: 'waiting' as Tone }
+}
+
+export function mediaRecordingState(value?: string | null) {
+  if (value === 'READY') return { label: 'Ready', tone: 'ok' as Tone }
+  if (value === 'NOT_APPLICABLE') return { label: 'Not applicable', tone: 'quiet' as Tone }
+  if (!value) return { label: 'Not previewed', tone: 'quiet' as Tone }
+  return { label: 'Waiting', tone: 'waiting' as Tone }
+}
+
+export const MOMENT_CATEGORIES: Record<string, string> = {
+  trainer: 'Trainer',
+  teaching_method: 'Teaching method',
+  content: 'Content',
+  support: 'Support',
+  learning_experience: 'Learning experience',
+}
+
+/** Positive clip evidence. The type itself is decided by the API, never here. */
+export const EVIDENCE_TYPES: Record<string, { label: string; tone: Tone }> = {
+  POSITIVE_MOMENT: { label: 'Positive Moment', tone: 'brand' },
+  OFSTED_CASE_STUDY: { label: 'OFSTED Case Study', tone: 'info' },
+  REJECT: { label: 'Rejected as evidence', tone: 'review' },
+}
+
+export function evidenceType(value?: string | null) {
+  return value ? EVIDENCE_TYPES[value] ?? { label: humanise(value), tone: 'neutral' as Tone }
+    : { label: 'Type not recorded', tone: 'quiet' as Tone }
+}
+
+/** The semantic verifier is advisory: its verdict is shown, never treated as approval. */
+export const SEMANTIC_STATUS: Record<string, { label: string; tone: Tone }> = {
+  accepted: { label: 'AI accepted', tone: 'ok' },
+  rejected: { label: 'AI rejected', tone: 'review' },
+  not_verified: { label: 'Not verified', tone: 'quiet' },
+  unrecognised: { label: 'AI verdict unrecognised', tone: 'neutral' },
+}
+
+export const SOCIAL_FORMATS: Record<string, string> = {
+  quote_post: 'Quote post',
+  reel: 'Reel',
+  carousel: 'Carousel',
+}
+
+export const RUN_MODE: Record<string, string> = {
+  PREVIEW: 'Preview',
+  ANALYZE: 'Analysis',
+  RENDER: 'Render',
+  RETRY_FAILED: 'Retry failed',
+}
+
+/** Seconds -> h:mm:ss (media positions) */
+export function clock(seconds?: number | null) {
+  if (seconds === null || seconds === undefined || Number.isNaN(seconds)) return '—'
+  const whole = Math.max(0, Math.round(seconds))
+  const h = Math.floor(whole / 3600)
+  const m = Math.floor((whole % 3600) / 60)
+  const s = whole % 60
+  return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+}

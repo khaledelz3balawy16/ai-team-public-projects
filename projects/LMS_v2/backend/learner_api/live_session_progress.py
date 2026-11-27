@@ -1,0 +1,336 @@
+"""Read-only activity credit from attendance or a saved lecture completion.
+
+No progress submission, reflection, KSB achievement or audit ledger is written.
+The lecture register owns attendance eligibility and staff corrections.
+"""
+from collections import defaultdict
+from datetime import timezone as utc
+
+from django.db import connections
+from django.utils import timezone
+
+from .attendance_rules import attendance_outcome
+from .projection_performance import projection_call
+from .live_session_policy import LIVE_SESSION_CREDIT_MINUTES
+
+
+# Verified attendance earns the full activity credit.
+# Learner-entered completion time is counted by the normal progress calculation.
+# This is intentionally separate from the scheduled/session display duration
+# used by the attendance register.
+
+
+def _live(component):
+    return str(component.get('type') or '').strip().lower().replace('-', '_') == 'live_session'
+
+
+def project_live_credits(components, register, *, now=None):
+    now = now or timezone.now()
+    components = {str(c['componentId']): c for c in components if c.get('componentId') and _live(c)}
+    register_by_module = defaultdict(list)
+    for row in register:
+        if row.get('source') == 'microsoft-teams':
+            register_by_module[row.get('module_catalogue_id')].append(row)
+    candidates = defaultdict(list)
+    for component_id, component in components.items():
+        matches = []
+        for row in register_by_module.get(component.get('moduleId'), []):
+            occurrence = str(row.get('attendance_source_occurrence_id') or row.get('occurrence_id') or row.get('session_id') or '')
+            if component.get('teamsOccurrenceId'):
+                matched = str(component['teamsOccurrenceId']) in {occurrence, str(row.get('session_id') or '')}
+            elif component.get('teamsLiveSessionId') and component.get('teamsSessionNumber'):
+                matched = (component['teamsLiveSessionId'] == row.get('live_session_id')
+                           and str(component['teamsSessionNumber']) == str(row.get('session_number')))
+            else:
+                # Imported/shared cards may only have their authored date.
+                # Both directions must be unique; never guess among two sessions.
+                matched = (bool(component.get('sessionDate'))
+                           and str(component['sessionDate'])[:10] == str(row.get('session_date'))
+                           and (not component.get('teamsLiveSessionId')
+                                or component['teamsLiveSessionId'] == row.get('live_session_id')))
+            if matched:
+                matches.append((occurrence, row))
+        if len(matches) == 1:
+            occurrence, row = matches[0]
+            candidates[occurrence].append((component_id, component, row))
+    result = []
+    for occurrence, matches in candidates.items():
+        if not occurrence or len(matches) != 1:
+            continue
+        component_id, component, row = matches[0]
+        status, counted = attendance_outcome(row, now)
+        raw = row.get('raw_attendance_status') or row.get('attendance_status')
+        seconds = max(0, float(row.get('attended_seconds') or 0))
+        resolved = row.get('resolved_attendance_status') == 'present'
+        provider_verified = bool(row.get('attendance_report_id')) and (seconds > 180 or row.get('attended') is True)
+        if not counted or status != 'present' or raw != 'present' or not (resolved or provider_verified):
+            continue
+        start, end = row.get('scheduled_start'), row.get('scheduled_end')
+        if start is None or end is None:
+            continue
+        if timezone.is_naive(start):
+            start = timezone.make_aware(start, utc.utc)
+        if timezone.is_naive(end):
+            end = timezone.make_aware(end, utc.utc)
+        if end <= start:
+            continue
+        result.append({'componentId': component_id, 'moduleId': component['moduleId'],
+                       'title': component.get('title') or row.get('session_title') or 'Live session',
+                       'occurrenceId': occurrence, 'hours': LIVE_SESSION_CREDIT_MINUTES / 60,
+                       'verifiedSeconds': seconds, 'submittedAt': end.isoformat()})
+    return result
+
+
+def read_live_credits(source, *, components=None, module_ids=None, register=None):
+    from .attendance_lectures import lecture_register
+    if components is None:
+        module_ids = sorted(set(module_ids or []))
+        if not module_ids:
+            return []
+        from curriculum_api.week_visibility import visible_child_sql, visible_week_sql
+        from curriculum_api.learning_storage import read_sql
+        with connections['enrolment'].cursor() as cur:
+            cur.execute(read_sql(f'''SELECT c.id,c.module_catalogue_id,c.title,
+                c.settings_json->>'teamsOccurrenceId',c.settings_json->>'teamsLiveSessionId',
+                c.settings_json->>'teamsSessionNumber',c.settings_json->>'sessionDate'
+                FROM curriculum.components c JOIN curriculum.weeks w ON w.id=c.week_id
+                AND w.module_catalogue_id=c.module_catalogue_id
+                WHERE c.module_catalogue_id=ANY(%s) AND lower(replace(btrim(c.type),'-','_'))='live_session'
+                AND {visible_child_sql('c')} AND {visible_week_sql('w')}
+                ORDER BY c.id''', cur.db), [module_ids])
+            components = [dict(zip(('componentId', 'moduleId', 'title', 'teamsOccurrenceId',
+                                    'teamsLiveSessionId', 'teamsSessionNumber', 'sessionDate'), row),
+                               type='live_session') for row in cur.fetchall()]
+    components = list(components)
+    scope = sorted({c['moduleId'] for c in components if c.get('moduleId')
+                    and str(c.get('type') or '').replace('-', '_') in {'live_session', 'recording_placeholder'}})
+    if scope:
+        from .recorded_attendance import saved_delivery_mode
+        if saved_delivery_mode(getattr(source, 'pk', None) or source.id) == 'lazy':
+            from .recorded_session_progress import read_recorded_credits
+            credits = read_recorded_credits(source, scope, register=register)
+            return _with_completed_live_credits(source, components, credits)
+    live = [c for c in components if _live(c) and c.get('componentId') and c.get('moduleId')]
+    if not live:
+        return []
+    if register is None:
+        register = lecture_register(source, module_ids=sorted({c['moduleId'] for c in live}), credit_projection=True)
+    verified = projection_call('credit_projection', project_live_credits, live, register)
+    states, manual = read_manual_live_credits(source, live)
+    # A staff decision replaces the provider credit for the same component;
+    # it must not add 2.5 hours on top of the existing two-hour Teams credit.
+    credits = [credit for credit in verified
+               if (str(credit['componentId']), str(credit['moduleId'])) not in states] + manual
+    return _with_completed_live_credits(source, live, credits)
+
+
+def _with_completed_live_credits(source, components, credits):
+    # Linked delivery cards share one allocation. Never grant a second credit
+    # when the recorded-delivery projection already owns this session.
+    live_ids = {str(c['componentId']) for c in components if _live(c) and c.get('componentId')}
+    credits = [{**credit, 'hours': 0} if credit.get('timeTrackingSource') == 'verified_recording_watch'
+               else {**credit, 'hours': LIVE_SESSION_CREDIT_MINUTES / 60}
+               if str(credit['componentId']) in live_ids and credit['hours'] > 0 else credit
+               for credit in credits]
+    # Watching establishes completion. Its duration comes from the learner's
+    # saved input, never the authored estimate or the fixed live credit.
+    covered = {str(cid) for credit in credits
+               for cid in credit.get('creditComponentIds', [credit['componentId']])}
+    missing = [c for c in components if _live(c) and str(c.get('componentId')) not in covered]
+    result = credits + (read_completed_live_credits(source, missing) if missing else [])
+    return protect_credit_hours(source, result)
+
+
+def protect_credit_hours(source, credits):
+    """Completion may update; closed-month OTJ allocations must stay unchanged."""
+    if not credits:
+        return credits
+    profile = _credit_profile(source)
+    if profile is None:
+        return credits
+    from old_otjh.repository import query
+    from .attendance_otjh import protected_months
+    months = protected_months([profile.pk], query).get(int(profile.pk), {})
+    candidates = {str(cid) for credit in credits
+                  if str(credit.get('sessionDate') or credit.get('submittedAt') or '')[:7] not in months
+                  for cid in credit.get('creditComponentIds', [credit['componentId']])} if months else set()
+    frozen_components = set()
+    if candidates:
+        from .canonical_learning import allocations
+        slots = ','.join(['%s'] * len(candidates))
+        saved = query(f'''SELECT component_ref,reporting_month,submitted_at,declared_completed_at
+            FROM "Learner".learner_progress_entries WHERE learner_id=%s
+            AND component_ref IN ({slots}) AND deleted_at IS NULL''', [profile.pk, *sorted(candidates)])
+        frozen_components = {str(record['component_ref']) for record in saved
+            if record.get('reporting_month') in months or any(part.get('reporting_month') in months for part in allocations(record))}
+    return [{**credit, 'otjhFrozen': True} if str(credit.get('sessionDate') or credit.get('submittedAt') or '')[:7] in months
+            or frozen_components.intersection(str(cid) for cid in credit.get('creditComponentIds', [credit['componentId']]))
+            else credit for credit in credits]
+
+
+def project_completed_live_credits(components, progress):
+    """Keep legacy completion; only recorded time or presence can supply hours."""
+    from .progress_rules import progress_record_counts_as_achieved
+    by_id = {str(c['componentId']): c for c in components
+             if _live(c) and c.get('componentId') and c.get('moduleId')}
+    result = {}
+    input_components = set()
+    for row in progress:
+        cid = str(row.get('componentId') or '')
+        component = by_id.get(cid)
+        if (not component or row.get('kind') != 'component'
+                or not progress_record_counts_as_achieved(row) or row.get('deletedAt')
+                or not row.get('submittedAt')
+                or (row.get('moduleId') and str(row['moduleId']) != str(component['moduleId']))):
+            continue
+        if str(row.get('timeTrackingSource') or '').endswith(':input'):
+            # The saved input and any retake decisions already own actual hours.
+            # An older completion must not top that same activity up to 150m.
+            input_components.add(cid)
+            continue
+        result.setdefault(cid, {'componentId': cid, 'moduleId': component['moduleId'],
+            'componentType': 'live_session', 'title': component.get('title') or 'Live session',
+            'hours': 0, 'submittedAt': row['submittedAt'],
+            'timeTrackingSource': 'completed_live_session'})
+    return [credit for cid, credit in result.items() if cid not in input_components]
+
+
+def read_completed_live_credits(source, components):
+    from .models import LearnerProgressEntry
+    profile = _credit_profile(source)
+    if profile is None:
+        return []
+    rows = LearnerProgressEntry.objects.using('enrolment').filter(
+        learner_id=profile.pk, component_ref__in=[str(c['componentId']) for c in components],
+        kind='component', deleted_at__isnull=True,
+    ).order_by('submitted_at', 'id').values(
+        'component_ref', 'module_ref', 'kind', 'passed', 'submitted_at', 'time_tracking_source')
+    return project_completed_live_credits(components, [
+        {'componentId': row['component_ref'], 'moduleId': row['module_ref'],
+         'kind': row['kind'], 'passed': row['passed'],
+         'timeTrackingSource': row['time_tracking_source'],
+         'submittedAt': row['submitted_at'].isoformat() if row['submitted_at'] else None}
+        for row in rows])
+
+
+def read_manual_live_credits(source, components):
+    from .manual_attendance_completion import read_manual_credit_evidence
+    profile = _credit_profile(source)
+    return read_manual_credit_evidence(components, profile) if profile is not None else ({}, [])
+
+
+def _credit_profile(source):
+    from .models import LearnerProfile
+
+    enrolment_id = getattr(source, 'pk', None) or getattr(source, 'id', None)
+    if enrolment_id is None:
+        return None
+    profile = getattr(source, '_case_file_profile', None)
+    owner = getattr(source, '_canonical_profile', None)
+    if (profile is None or str(profile.enrolment_id) != str(enrolment_id)
+            or (owner is not None and str(owner['id']) != str(profile.pk))):
+        profiles = list(LearnerProfile.objects.filter(enrolment_id=enrolment_id).only('id', 'enrolment_id', 'email')[:2])
+        if len(profiles) != 1:
+            return None
+        profile = profiles[0]
+    return profile
+
+
+def supplement_component_progress(progress, credits):
+    from .progress_rules import progress_record_counts_as_achieved
+    completed = {str(row.get('componentId')) for row in progress if progress_record_counts_as_achieved(row)}
+    credit_by_component = {
+        str(credit.get('componentId')): credit
+        for credit in credits
+        if credit.get('componentId') and float(credit.get('hours') or 0) > 0 and not credit.get('otjhFrozen')
+    }
+    result = []
+    for row in progress:
+        credit = credit_by_component.get(str(row.get('componentId')))
+        # A saved learner completion may still carry the old fixed duration.
+        # The current lecture credit is authoritative for this activity, so
+        # project its current 150-minute value without rewriting reflections,
+        # KSBs, or the historical source row.
+        row_type = str(row.get('componentType') or '').replace('-', '_').replace(' ', '_').lower()
+        is_live_credit_row = bool(credit) and progress_record_counts_as_achieved(row) and (
+            row_type == 'live_session' or credit.get('componentType') == 'live_session' or (
+                not row_type and not credit.get('componentType') and 'verifiedSeconds' in credit
+                and str(credit.get('timeTrackingSource') or 'verified_teams_attendance').startswith('verified_teams')
+            ))
+        if is_live_credit_row:
+            result.append({
+                **row,
+                **({'completionEligible': credit['liveSessionLearning']['status'] == 'completed'}
+                   if credit.get('liveSessionLearning') else {}),
+                'reportedTime': f"{credit['hours'] * 60:g} minutes",
+                'timeTaken': None,
+                'timeTrackingSource': credit.get('timeTrackingSource', 'verified_teams_attendance'),
+                'claimedSeconds': None,
+                # Old attempts must not add the fixed lecture allocation twice.
+                **({'retakeTimeChoice': 'correct', 'retakePreviousSeconds': 0}
+                   if credit.get('timeTrackingSource') == 'completed_live_session' else {}),
+                **({'verifiedSeconds': credit['verifiedSeconds']} if 'verifiedSeconds' in credit else {}),
+            })
+        else:
+            result.append(row)
+    for credit in credits:
+        if credit['componentId'] in completed:
+            continue
+        completed.add(credit['componentId'])
+        result.append({'kind': 'component', 'componentType': credit.get('componentType', 'live_session'),
+                       **({'completionEligible': credit['liveSessionLearning']['status'] == 'completed'}
+                          if credit.get('liveSessionLearning') else {}),
+                       'componentId': credit['componentId'], 'componentTitle': credit['title'],
+                       'startedAt': None, 'submittedAt': credit['submittedAt'], 'timeTaken': None,
+                       'timeTrackingSource': credit.get('timeTrackingSource', 'verified_teams_attendance'),
+                       'reportedTime': f"{0 if credit.get('otjhFrozen') else credit['hours'] * 60:g} minutes",
+                       'claimedSeconds': None,
+                       **({'retakeTimeChoice': 'correct', 'retakePreviousSeconds': 0}
+                          if credit.get('timeTrackingSource') == 'completed_live_session' else {}),
+                       **({'verifiedSeconds': credit['verifiedSeconds']} if 'verifiedSeconds' in credit else {}),
+                       'ksbs': []})
+    return result
+
+
+def supplement_module_hours(metrics, records, credits):
+    """Use the same live credit as the ledger; never add it twice or reopen hours."""
+    from . import canonical_learning as canonical
+    result = {key: {**value, 'hours': dict(value['hours'])} for key, value in metrics.items()}
+    credits = credits if isinstance(credits,(list,tuple)) else list(credits)
+    identities = {credit['componentId']: set(credit.get('creditComponentIds') or [credit['componentId']])
+                  for credit in credits if credit['moduleId'] in result}
+    component_ids = set().union(*identities.values()) if identities else set()
+    if not component_ids:
+        return result
+    seconds_by_component = defaultdict(float)
+    corrected = set()
+    projected_occurrences = set()
+    for record in records:
+        if record.get('attendance_occurrence_id'):
+            projected_occurrences.add((str(record['attendance_occurrence_id']), str(record.get('module_ref'))))
+        component_id = str(record.get('component_ref') or '')
+        if component_id not in component_ids:
+            continue
+        if record.get('actual_basis') == 'staff:module-progress':
+            corrected.add(component_id)
+        if canonical.counts_as_actual(record):
+            seconds_by_component[component_id] += canonical.number(record.get('actual_seconds'))
+    seen = set()
+    for credit in credits:
+        component_id, module_id = credit['componentId'], credit['moduleId']
+        if component_id in seen or module_id not in result or credit.get('otjhFrozen') or credit['hours'] <= 0:
+            continue
+        seen.add(component_id)
+        credit_ids = identities[component_id]
+        presence = 'verifiedSeconds' in credit or credit.get('timeTrackingSource') == 'manual_attendance'
+        if credit_ids & corrected and not presence:
+            continue
+        seconds = sum(seconds_by_component[identity] for identity in credit_ids)
+        if (str(credit.get('occurrenceId')), str(module_id)) in projected_occurrences:
+            # The shared ledger has already applied this occurrence, including
+            # when its saved allocation used another linked component card.
+            continue
+        difference = credit['hours'] - seconds / 3600
+        result[module_id]['hours']['actual'] = round(
+            result[module_id]['hours']['actual'] + (difference if presence else max(0, difference)), 4)
+    return result

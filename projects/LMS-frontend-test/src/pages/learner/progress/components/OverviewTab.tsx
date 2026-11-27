@@ -1,0 +1,182 @@
+import { useNavigate } from 'react-router-dom';
+import { AppIcon } from '@/components/feature/AppIcon';
+import type { LearnerDetail } from '@/api/learnerDetail';
+import { parseHours, formatHoursMinutes } from '@/utils/learnerJourney';
+import { useKsbProgress } from '@/hooks/useKsbProgress';
+import { Panel } from '@/components/ui/Panel';
+import { SectionHeader } from '@/components/ui/SectionHeader';
+import { ProgressBar } from '@/components/ui/ProgressMetric';
+import { ActionRow, RowAction } from '@/components/ui/ActionRow';
+import { EmptyState } from '@/components/ui/EmptyState';
+import { RowsSkeleton } from '@/components/feature/Skeletons';
+import { toneStyle, type StatusTone } from '@/lib/statusTone';
+import type { LearnerMetrics } from '@/api/learnerMetrics';
+
+export type ProgressTabKey = 'overview' | 'otjh' | 'ksbs';
+
+interface AttentionItem {
+  tone: 'critical' | 'caution';
+  title: string;
+  subtitle: string;
+  tab: ProgressTabKey;
+  cta: string;
+}
+
+type MetricAccent = 'purple' | 'green' | 'orange';
+
+function ProgressStat({
+  icon, label, value, percent, caption, tone = 'neutral', accent = 'purple', onClick,
+}: {
+  icon: string; label: string; value: string; percent: number | null; caption?: string; tone?: StatusTone; accent?: MetricAccent; onClick: () => void;
+}) {
+  const style = toneStyle(tone);
+  const accentClasses = {
+    purple: 'bg-gradient-to-br from-secondary-200 via-secondary-400 to-secondary-500 text-white shadow-md shadow-primary-500/25',
+    green: 'bg-gradient-to-br from-emerald-200 via-emerald-400 to-emerald-500 text-white shadow-md shadow-emerald-500/25',
+    orange: 'bg-gradient-to-br from-amber-300 via-amber-500 to-amber-700 text-white shadow-md shadow-amber-500/30',
+  }[accent];
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="coach-metric-card flex min-w-0 items-center gap-3 text-left transition hover:border-primary-200 hover:shadow-md"
+    >
+      <span className={`flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl ring-1 ring-black/5 ${accentClasses}`}>
+        <AppIcon className={`${icon} text-xl`} />
+      </span>
+      <div className="min-w-0 flex-1">
+        <p className="truncate text-[12px] font-semibold text-foreground-500">{label}</p>
+        <p className={`mt-1 text-[22px] font-semibold leading-none tabular-nums ${tone === 'neutral' ? 'text-foreground-900' : style.text}`}>{value}</p>
+        <ProgressBar percent={percent} tone={percent == null || tone === 'neutral' ? undefined : style.dot} className="mt-2.5" />
+        {caption ? <p className="mt-1.5 truncate text-[12px] leading-snug text-foreground-500">{caption}</p> : null}
+      </div>
+    </button>
+  );
+}
+
+export function OverviewTab({
+  real,
+  realLoading,
+  metrics,
+  recordedOtjhTotal,
+  auditOtjhActual,
+  auditOtjhPlanned,
+  subjectCount,
+  onNavigateTab,
+}: {
+  real: LearnerDetail | null;
+  realLoading: boolean;
+  metrics?: LearnerMetrics | null;
+  recordedOtjhTotal?: number | null;
+  auditOtjhActual?: number | null;
+  auditOtjhPlanned?: number | null;
+  subjectCount?: number | null;
+  onNavigateTab: (tab: ProgressTabKey) => void;
+}) {
+  const navigate = useNavigate();
+  const loading = realLoading;
+  const hasMetrics = metrics !== undefined;
+
+  const usesAuditTotals = auditOtjhActual != null || auditOtjhPlanned != null;
+  const usesCombinedSubjects = !usesAuditTotals && recordedOtjhTotal != null;
+  const completedHours = hasMetrics ? metrics?.otjh.actual ?? 0 : usesAuditTotals ? (auditOtjhActual ?? 0) : usesCombinedSubjects ? (recordedOtjhTotal ?? 0) : parseHours(real?.completedHours);
+  const targetHours = hasMetrics ? metrics?.otjh.planned ?? 0 : usesAuditTotals ? (auditOtjhPlanned ?? 0) : usesCombinedSubjects ? 0 : parseHours(real?.targetHours);
+  const otjhPct = targetHours > 0 ? Math.min(100, Math.round((completedHours / targetHours) * 100)) : null;
+  const otjhStatus = hasMetrics ? (metrics?.otjh.actual == null || metrics?.otjh.planned == null ? null : completedHours < targetHours ? 'Needs attention' : 'On track') : usesAuditTotals
+    ? (targetHours > 0 && completedHours < targetHours ? 'Needs attention' : 'On track')
+    : usesCombinedSubjects ? null : real?.otjhStatus || null;
+  const otjhAtRisk = /at risk|attention/i.test(otjhStatus || '');
+  const otjhBehind = Math.max(0, targetHours - completedHours);
+
+  const ksbProgress = useKsbProgress(real);
+  const ksbTotal = ksbProgress.length;
+  const ksbComplete = ksbProgress.filter(k => k.status === 'complete').length;
+  const ksbNotStarted = hasMetrics ? (metrics?.ksb.codes || []).filter(k => k.completed === 0).length : ksbProgress.filter(k => k.status === 'not-started').length;
+  const ksbPct = ksbTotal > 0 ? Math.round((ksbComplete / ksbTotal) * 100) : null;
+
+  const candidateItems: (AttentionItem | false)[] = [
+    otjhAtRisk && {
+      tone: 'caution',
+      title: `OTJH hours ${(otjhStatus || 'need attention').toLowerCase()}`,
+      subtitle: `${formatHoursMinutes(otjhBehind)} behind the current target.`,
+      tab: 'otjh', cta: 'View hours',
+    },
+    ksbNotStarted > 0 && {
+      tone: 'caution',
+      title: `${ksbNotStarted} KSB${ksbNotStarted === 1 ? '' : 's'} not started yet`,
+      subtitle: 'No evidence linked to these Knowledge, Skills & Behaviours yet.',
+      tab: 'ksbs', cta: 'View KSBs',
+    },
+  ];
+  const attentionItems = candidateItems.filter((item): item is AttentionItem => item !== false);
+  const hasKsbData = hasMetrics ? (metrics?.ksb.total || 0) > 0 : ksbTotal > 0;
+
+  if (loading) {
+    return <Panel><RowsSkeleton rows={4} /></Panel>;
+  }
+
+  return (
+    <div className="space-y-4">
+      {/* Compact summary tiles */}
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+        <ProgressStat
+          icon="ri-calendar-check-line" label="OTJ Hours" tone={otjhStatus ? (otjhAtRisk ? 'caution' : 'positive') : 'brand'} accent="green"
+          value={hasMetrics && metrics?.otjh.actual == null ? '—' : formatHoursMinutes(completedHours)}
+          percent={otjhPct}
+          caption={hasMetrics ? metrics?.otjh.planned == null ? 'Training plan hours unavailable' : `TP Planned ${formatHoursMinutes(targetHours)}` : usesAuditTotals
+            ? `Target ${formatHoursMinutes(targetHours)}`
+            : usesCombinedSubjects
+            ? `Across ${subjectCount || 0} subjects`
+            : targetHours > 0
+              ? `Target ${formatHoursMinutes(targetHours)}${otjhStatus ? ` · ${otjhStatus}` : ''}`
+              : 'No target set yet'}
+          onClick={() => onNavigateTab('otjh')}
+        />
+        <ProgressStat
+          icon="ri-time-line" label="KSB Progress" tone="brand" accent="orange"
+          value={hasMetrics ? metrics?.ksb.percent == null ? '—' : `${metrics.ksb.percent}%` : ksbTotal ? `${ksbPct}%` : '—'}
+          percent={hasMetrics ? metrics?.ksb.percent ?? null : ksbPct}
+          caption={hasMetrics ? metrics?.ksb.total == null ? 'KSB details unavailable' : `${metrics.ksb.completed} of ${metrics.ksb.total} points achieved` : ksbTotal ? `${ksbComplete} of ${ksbTotal} fully evidenced` : 'No KSBs defined yet'}
+          onClick={() => onNavigateTab('ksbs')}
+        />
+      </div>
+
+      {/* Evidence lives on its own page — this is the way across to it. */}
+      <ActionRow
+        title="Evidence library"
+        subtitle="Upload new evidence and track what your tutor has validated."
+        actions={<RowAction label="Open evidence" icon="ri-arrow-right-line" onClick={() => navigate('/learner/evidence')} />}
+      />
+
+      {/* Needs your attention */}
+      <Panel>
+        <SectionHeader
+          title="Needs your attention"
+          count={attentionItems.length || undefined}
+          icon="ri-flag-2-line"
+        />
+        <div className="mt-3 space-y-2">
+          {attentionItems.length === 0 ? (
+            <EmptyState
+              size="sm"
+              variant="empty"
+              icon="ri-checkbox-circle-line"
+              title={hasKsbData ? "You're all caught up" : 'No KSBs defined yet'}
+              description={hasKsbData ? 'Hours and KSBs both look on track.' : 'Your programme has not defined any KSBs yet.'}
+            />
+          ) : (
+            attentionItems.map((item, i) => (
+              <ActionRow
+                key={i}
+                tone={item.tone}
+                title={item.title}
+                subtitle={item.subtitle}
+                actions={<RowAction label={item.cta} icon="ri-arrow-right-line" onClick={() => onNavigateTab(item.tab)} />}
+              />
+            ))
+          )}
+        </div>
+      </Panel>
+    </div>
+  );
+}

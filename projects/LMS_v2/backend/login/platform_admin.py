@@ -1,0 +1,1876 @@
+"""Read models for the Super Admin console — /login_api/admin/*.
+
+Why this module exists
+----------------------
+The admin workspace used to render entirely from fixtures in the SPA: invented
+tenants, invented integrations, invented delivery counts. Nothing on those
+screens could be acted on, because nothing on them came from a table. These
+endpoints replace the fixtures with the platform's own records, so every number
+the console shows is one somebody can go and verify.
+
+Scope is deliberately narrow: **counts and lists that already exist**. Where the
+platform has no concept — there is one provider, not a tenant estate; there is no
+rules engine behind "automations" — the answer is to delete the screen, not to
+invent an endpoint. So the surface here is small on purpose:
+
+    GET  /login_api/admin/overview/    headline counts across login + enrolment
+    GET  /login_api/admin/accounts/    sign-in accounts, filterable, paginated
+    POST /login_api/admin/accounts/<id>/   suspend / restore / unlock /
+                                           resend-invitation / send-password-reset /
+                                           delete (staff accounts only)
+    GET  /login_api/admin/audit/       login."Login_audit", filterable, paginated
+    GET  /login_api/admin/roles/       the four real roles + live member counts
+    GET  /login_api/admin/email-log/   invitation + reset delivery attempts
+    GET  /login_api/admin/system/      subsystem readiness (no secret values)
+    GET  /login_api/admin/documents/   enrolment."Enrolment_Documents", paginated
+    GET  /login_api/admin/curriculum/  programmes and cohorts with enrolment counts
+
+Everything is ``require_role("admin")``: these read across every learner, every
+employer and the whole auth audit, which is a strictly wider blast radius than
+``staff_only`` is meant to cover.
+
+Aggregates use raw SQL on the ``enrolment`` connection rather than the ORM. The
+counts span four schemas (``login``, ``enrolment``, ``curriculum``, ``Learner``)
+whose tables are all ``managed = False`` and have no FKs between them, so there
+is no join for the ORM to express. One round trip of scalar subqueries also beats
+a dozen ``.count()`` calls over a Neon connection with real latency.
+
+Statements use a savepoint when the caller is already inside a transaction —
+see ``_isolated_database_call``. In normal autocommit requests a failed
+statement is already isolated, so avoiding a redundant ``BEGIN``/``COMMIT``
+removes two Neon round trips per dashboard section.
+"""
+from __future__ import annotations
+
+import json
+
+from django.db import DatabaseError, IntegrityError, connections, transaction
+from django.http import JsonResponse
+from django.utils import timezone
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_GET, require_POST
+
+from . import email_azure
+from .identity import permissions_for
+from .models import (
+    EVENT_LOGIN,
+    ROLE_ADMIN,
+    ROLE_EMPLOYER,
+    ROLE_LEARNER,
+    ROLE_STAFF,
+    Invitation,
+    LoginAccount,
+    LoginAudit,
+    PasswordReset,
+)
+from .permissions import require_role
+from .security import client_ip, user_agent
+from .services import sync_account
+
+#: Page size ceiling for the list endpoints. A console table is read by a human;
+#: CHANGE_ME past this is an export job, not a page view.
+MAX_PAGE_SIZE = 200
+DEFAULT_PAGE_SIZE = 50
+
+
+def _sanitized_layout_config(value):
+    """Guard against a client accidentally spreading a JSON string into an
+    object (`{...jsonText}`), which turns each character into its own
+    "0", "1", "2"... key. A real layout config never has more than a
+    handful of fields, so a dict that's mostly numeric-string keys is that
+    corruption, not intentional data — drop it rather than storing and
+    compounding a multi-megabyte blob on every future save.
+    """
+    if not isinstance(value, dict):
+        return {}
+    numeric_keys = sum(1 for key in value if isinstance(key, str) and key.isdigit())
+    if numeric_keys > 20 and numeric_keys >= len(value) - 5:
+        return {}
+    return value
+
+
+@csrf_exempt
+@require_role(ROLE_ADMIN)
+def certificate_template(request):
+    """Read or save the global learner progress-certificate template."""
+    if request.method not in {"GET", "POST"}:
+        return _error("Method not allowed.", 405)
+    if request.method == "POST":
+        rejected = _reject_cross_site(request)
+        if rejected:
+            return rejected
+        try:
+            payload = json.loads(request.body or b"{}")
+        except (TypeError, ValueError):
+            return _error("Invalid JSON.", 400)
+        title = str(payload.get("title") or "").strip()[:200]
+        body = str(payload.get("bodyText") or "").strip()[:2000]
+        try:
+            threshold = float(payload.get("minimumProgress", 85))
+        except (TypeError, ValueError):
+            return _error("Minimum progress must be a number.", 400)
+        if not title or not body or not 0 <= threshold <= 100:
+            return _error("Title, body text and a progress value from 0 to 100 are required.", 400)
+        publish = bool(payload.get("publish"))
+        actor = request.login_account.email
+        layout = _sanitized_layout_config(payload.get("layoutConfig"))
+        try:
+            with transaction.atomic(using="enrolment"), connections["enrolment"].cursor() as cursor:
+                cursor.execute('SELECT COALESCE(MAX(version),0)+1 FROM "Learner".certificate_templates WHERE certificate_type=%s', ["progress-achievement"])
+                version = cursor.fetchone()[0]
+                superseded_count = 0
+                if publish:
+                    cursor.execute('UPDATE "Learner".certificate_templates SET status=%s, updated_at=now() WHERE certificate_type=%s AND status=%s', ["archived", "progress-achievement", "published"])
+                    # Existing awards keep their identity and status. Their display
+                    # reads the published template, with per-certificate corrections.
+                cursor.execute('''INSERT INTO "Learner".certificate_templates
+                    (name,certificate_type,version,status,title,body_text,minimum_progress,require_final_test,layout_config,created_by,published_by,published_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,CASE WHEN %s THEN now() END)
+                    RETURNING id,published_at''',
+                    [str(payload.get("name") or "Progress certificate")[:160], "progress-achievement", version,
+                     "published" if publish else "draft", title, body, threshold, False,
+                     json.dumps(layout), actor, actor if publish else "", publish])
+                template_id, published_at = cursor.fetchone()
+                cursor.execute('INSERT INTO "Learner".certificate_audit_logs (actor_email,action,template_id,details) VALUES (%s,%s,%s,%s::jsonb)', [actor, "published" if publish else "draft-saved", template_id, json.dumps({"version": version, "supersededCertificates": superseded_count})])
+                return JsonResponse({"template": {
+                    "id": template_id,
+                    "name": str(payload.get("name") or "Progress certificate")[:160],
+                    "version": version,
+                    "status": "published" if publish else "draft",
+                    "title": title,
+                    "bodyText": body,
+                    "minimumProgress": threshold,
+                    "requireFinalTest": False,
+                    "layoutConfig": layout,
+                    "publishedAt": published_at.isoformat() if published_at else None,
+                }})
+        except DatabaseError:
+            return _error("Certificate tables are not installed. Run learner_api/sql/certificate_management.sql in Neon.", 503)
+    try:
+        with connections["enrolment"].cursor() as cursor:
+            cursor.execute('''SELECT id,name,version,status,title,body_text,minimum_progress,require_final_test,layout_config,published_at
+                FROM "Learner".certificate_templates
+                ORDER BY CASE status WHEN 'published' THEN 0 WHEN 'draft' THEN 1 ELSE 2 END, version DESC
+                LIMIT 1''')
+            row = cursor.fetchone()
+            cursor.execute('''SELECT id,name,version,status,title,body_text,minimum_progress,require_final_test,layout_config,published_at
+                FROM "Learner".certificate_templates
+                WHERE certificate_type=%s
+                ORDER BY version DESC
+                LIMIT 100''', ["progress-achievement"])
+            rows = cursor.fetchall()
+    except DatabaseError:
+        return _error("Certificate tables are not installed. Run learner_api/sql/certificate_management.sql in Neon.", 503)
+    templates = [
+        {"id": item[0], "name": item[1], "version": item[2], "status": item[3], "title": item[4], "bodyText": item[5], "minimumProgress": float(item[6]), "requireFinalTest": False, "layoutConfig": _json_dict(item[8]), "publishedAt": item[9].isoformat() if item[9] else None}
+        for item in rows
+    ]
+    if not row:
+        return JsonResponse({"template": None, "templates": templates})
+    return JsonResponse({"template": {"id": row[0], "name": row[1], "version": row[2], "status": row[3], "title": row[4], "bodyText": row[5], "minimumProgress": float(row[6]), "requireFinalTest": False, "layoutConfig": _json_dict(row[8]), "publishedAt": row[9].isoformat() if row[9] else None}, "templates": templates})
+
+
+def _error(message, status, code=None):
+    payload = {"error": message}
+    if code:
+        payload["code"] = code
+    return JsonResponse(payload, status=status)
+
+
+def _json_dict(value):
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except ValueError:
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
+    return {}
+
+
+def _reject_cross_site(request):
+    """Same CSRF stance as ``login.views`` — a custom header no cross-origin
+    form post can set. Kept identical so the SPA client speaks one dialect."""
+    if request.headers.get("X-Requested-With") != "XMLHttpRequest":
+        return _error("Missing X-Requested-With header.", 403, code="csrf")
+    return None
+
+
+def _paging(request):
+    """Read ``page``/``pageSize``, clamped. Bad input pages from the top rather
+    than 400-ing: a console table should not blank out over a stray query string."""
+    try:
+        page = max(1, int(request.GET.get("page", 1)))
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        size = int(request.GET.get("pageSize", DEFAULT_PAGE_SIZE))
+    except (TypeError, ValueError):
+        size = DEFAULT_PAGE_SIZE
+    size = max(1, min(size, MAX_PAGE_SIZE))
+    return page, size
+
+
+def _iso(value):
+    return value.isoformat() if value else None
+
+
+def _scalars(sql, params=None):
+    """Run one statement of scalar subqueries and return it as a dict."""
+    with connections["enrolment"].cursor() as cur:
+        cur.execute(sql, params or [])
+        cols = [c[0] for c in cur.description]
+        row = cur.fetchone()
+    return dict(zip(cols, row)) if row else {}
+
+
+def _rows(sql, params=None):
+    with connections["enrolment"].cursor() as cur:
+        cur.execute(sql, params or [])
+        cols = [c[0] for c in cur.description]
+        return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def _isolated_database_call(callback):
+    "Run ``callback`` without letting one failed optional query poison others.\n\n    PostgreSQL only leaves the connection in an aborted state when the failed\n    statement belongs to an open transaction. Django's normal request path is\n    autocommit, where adding ``atomic`` would create a redundant BEGIN/COMMIT\n    pair (two remote round trips) for every small dashboard query. Tests and\n    any CHANGE_MEly atomic caller still need a savepoint, so retain it there.\n    "
+    if connections["enrolment"].in_atomic_block:
+        with transaction.atomic(using="enrolment"):
+            return callback()
+    return callback()
+
+
+def _scalars_or_raise(sql, params=None):
+    """Run ``_scalars`` in an existing transaction's savepoint when required.
+
+    Used where a failure is worth surfacing (the login schema is this app's own —
+    if it is missing, saying so beats showing zeros) but must still leave the
+    connection usable for the rest of the request.
+    """
+    return _isolated_database_call(lambda: _scalars(sql, params))
+
+
+def _optional_scalars(sql, params=None):
+    """``_scalars`` that yields {} instead of raising when the tables are missing.
+
+    The curriculum and Learner schemas are populated by separate provisioning
+    steps. A console that 500s because a cohort table has not been created yet
+    is worse than one that shows the counts it does have, so a failure here
+    degrades to "unavailable" and the caller omits those cards.
+
+    If the caller already has a transaction (notably Django ``TestCase``),
+    ``_isolated_database_call`` opens a savepoint so one missing table cannot
+    abort every later query. Normal autocommit requests need no extra wrapper.
+    """
+    try:
+        return _isolated_database_call(lambda: _scalars(sql, params))
+    except DatabaseError:
+        return {}
+
+
+def _optional_rows(sql, params=None):
+    """Run ``_rows`` safely, degrading to ``(error, [])`` on failure.
+
+    Returns ``(error, rows)``. Same reasoning as ``_optional_scalars``: a table
+    that has not been provisioned is a deployment fact, not a request failure,
+    and answering 200-with-nothing lets the console say "this deployment has no
+    document store" instead of showing the operator a generic 502.
+    """
+    try:
+        return None, _isolated_database_call(lambda: _rows(sql, params))
+    except DatabaseError as exc:
+        return str(exc), []
+
+
+# ---------------------------------------------------------------------------
+# Overview — the dashboard's numbers
+# ---------------------------------------------------------------------------
+
+@require_GET
+@require_role(ROLE_ADMIN)
+def overview(request):
+    """Headline platform counts, all from real tables.
+
+    Grouped by the schema each number comes from so the SPA can drop a whole
+    section when its source is unavailable rather than rendering zeros — a zero
+    and an unknown mean very different things on a control console.
+    """
+    now = timezone.now()
+
+    # --- login schema: accounts, sessions, invitations -------------------
+    # Savepointed like the rest: if this fails, the connection must survive for
+    # the sections below (and for the session lookup on the way out).
+    try:
+        accounts = _scalars_or_raise(
+            """
+            SELECT
+              (SELECT count(*) FROM login."Login_accounts")                                   AS total,
+              (SELECT count(*) FROM login."Login_accounts" WHERE "Is_active")                 AS active,
+              (SELECT count(*) FROM login."Login_accounts" WHERE NOT "Is_active")             AS suspended,
+              (SELECT count(*) FROM login."Login_accounts" WHERE "Password_hash" <> '')       AS with_password,
+              (SELECT count(*) FROM login."Login_accounts"
+                 WHERE "Locked_until" IS NOT NULL AND "Locked_until" > now())                 AS locked,
+              (SELECT count(*) FROM login."Login_accounts" WHERE "Role" = 'admin')            AS admins,
+              (SELECT count(*) FROM login."Login_accounts" WHERE "Role" = 'staff')            AS staff,
+              (SELECT count(*) FROM login."Login_accounts" WHERE "Role" = 'employer')         AS employers,
+              (SELECT count(*) FROM login."Login_accounts" WHERE "Role" = 'learner')          AS learners,
+              (SELECT count(*) FROM login."Login_accounts"
+                 WHERE "Last_login_at" IS NOT NULL AND "Last_login_at" > now() - interval '30 days')
+                                                                                              AS active_30d,
+              (SELECT count(*) FROM login."Login_sessions"
+                 WHERE "Revoked_at" IS NULL AND "Expires_at" > now())                         AS live_sessions,
+              (SELECT count(*) FROM login."Invitations"
+                 WHERE "Used_at" IS NULL AND "Expires_at" > now())                            AS pending_invites,
+              (SELECT count(*) FROM login."Invitations"
+                 WHERE "Used_at" IS NULL AND "Expires_at" <= now())                           AS expired_invites,
+              -- Acknowledged failures are excluded on purpose: this figure drives
+              -- the dashboard's attention strip, and an administrator who has
+              -- dealt with a bounce should not be told about it for ever. The
+              -- row keeps its Send_error; only the alert goes away.
+              (SELECT count(*) FROM login."Invitations"
+                 WHERE "Send_error" IS NOT NULL AND "Acknowledged_at" IS NULL)               AS failed_invites
+            """
+        )
+        login_ok = True
+        login_error = None
+    except DatabaseError as exc:
+        accounts, login_ok, login_error = {}, False, str(exc)
+
+    # --- login audit: 24h authentication activity ------------------------
+    audit = _optional_scalars(
+        """
+        SELECT
+          (SELECT count(*) FROM login."Login_audit" WHERE "Created_at" > now() - interval '24 hours')
+                                                                                    AS events_24h,
+          (SELECT count(*) FROM login."Login_audit"
+             WHERE "Event" = %s AND "Succeeded" AND "Created_at" > now() - interval '24 hours')
+                                                                                    AS signins_24h,
+          (SELECT count(*) FROM login."Login_audit"
+             WHERE "Event" = %s AND NOT "Succeeded" AND "Created_at" > now() - interval '24 hours')
+                                                                                    AS failed_signins_24h,
+          (SELECT count(DISTINCT "Account_id") FROM login."Login_audit"
+             WHERE "Event" = %s AND "Succeeded" AND "Created_at" > now() - interval '7 days')
+                                                                                    AS distinct_signins_7d
+        """,
+        [EVENT_LOGIN, EVENT_LOGIN, EVENT_LOGIN],
+    )
+
+    # --- enrolment schema: the people themselves -------------------------
+    # NOTE: Created_users." Status" genuinely has a leading space in the column
+    # name (see learner_api.models.EnrolmentUser). Quoted exactly, not trimmed.
+    people = _optional_scalars(
+        """
+        SELECT
+          (SELECT count(*) FROM enrolment."Created_users")                                    AS learners_total,
+          (SELECT count(*) FROM enrolment."Created_users" WHERE "Learner_type" = 'apprenticeship')
+                                                                                              AS apprenticeship,
+          (SELECT count(*) FROM enrolment."Created_users" WHERE "Learner_type" = 'commercial')
+                                                                                              AS commercial,
+          (SELECT count(*) FROM enrolment."Created_users" WHERE lower(coalesce(" Status", '')) = 'active')
+                                                                                              AS learners_active,
+          (SELECT count(*) FROM enrolment."Staff_users")                                      AS staff_total,
+          (SELECT count(*) FROM enrolment."Employers")                                        AS employers_total,
+          (SELECT count(*) FROM enrolment."Organisations")                                    AS organisations_total
+        """
+    )
+
+    documents = _optional_scalars(
+        """
+        SELECT
+          (SELECT count(*) FROM enrolment."Enrolment_Documents")                              AS total,
+          (SELECT count(DISTINCT "Doc_type") FROM enrolment."Enrolment_Documents")            AS doc_types,
+          (SELECT count(*) FROM enrolment."Enrolment_Documents" WHERE "Signed")               AS signed,
+          (SELECT count(*) FROM enrolment."Enrolment_Documents"
+             WHERE "Generated_at" > now() - interval '30 days')                               AS last_30d
+        """
+    )
+
+    curriculum_counts = _optional_scalars(
+        """
+        SELECT
+          (SELECT count(DISTINCT name) FROM curriculum.programmes
+             WHERE coalesce(is_archived, false) = false)                                      AS programmes,
+          (SELECT count(DISTINCT cohort_name) FROM curriculum.cohorts
+             WHERE cohort_name IS NOT NULL AND cohort_name <> '')                             AS cohorts,
+          (SELECT count(*) FROM curriculum.modules)                                           AS modules
+        """
+    )
+
+    delivery = _optional_scalars(
+        """
+        SELECT
+          (SELECT count(*) FROM "Learner"."Active_users")                                     AS active_learners,
+          (SELECT count(*) FROM "Learner"."Unactive_users")                                   AS inactive_learners
+        """
+    )
+
+    return JsonResponse({
+        "generatedAt": _iso(now),
+        "accounts": {
+            "available": login_ok,
+            "error": login_error,
+            "total": accounts.get("total", 0),
+            "active": accounts.get("active", 0),
+            "suspended": accounts.get("suspended", 0),
+            "withPassword": accounts.get("with_password", 0),
+            # An account that exists but has never set a password is an
+            # invitation that was never completed — worth surfacing separately
+            # from "suspended", because the fix is different.
+            "neverSignedIn": max(accounts.get("total", 0) - accounts.get("with_password", 0), 0),
+            "locked": accounts.get("locked", 0),
+            "activeLast30d": accounts.get("active_30d", 0),
+            "liveSessions": accounts.get("live_sessions", 0),
+            "byRole": {
+                ROLE_ADMIN: accounts.get("admins", 0),
+                ROLE_STAFF: accounts.get("staff", 0),
+                ROLE_EMPLOYER: accounts.get("employers", 0),
+                ROLE_LEARNER: accounts.get("learners", 0),
+            },
+        },
+        "invitations": {
+            "pending": accounts.get("pending_invites", 0),
+            "expired": accounts.get("expired_invites", 0),
+            "failed": accounts.get("failed_invites", 0),
+        },
+        "authActivity": {
+            "available": bool(audit),
+            "events24h": audit.get("events_24h", 0),
+            "signIns24h": audit.get("signins_24h", 0),
+            "failedSignIns24h": audit.get("failed_signins_24h", 0),
+            "distinctSignIns7d": audit.get("distinct_signins_7d", 0),
+        },
+        "people": {
+            "available": bool(people),
+            "learners": people.get("learners_total", 0),
+            "apprenticeship": people.get("apprenticeship", 0),
+            "commercial": people.get("commercial", 0),
+            "learnersActive": people.get("learners_active", 0),
+            "staff": people.get("staff_total", 0),
+            "employers": people.get("employers_total", 0),
+            "organisations": people.get("organisations_total", 0),
+        },
+        "documents": {
+            "available": bool(documents),
+            "total": documents.get("total", 0),
+            "docTypes": documents.get("doc_types", 0),
+            "signed": documents.get("signed", 0),
+            "last30d": documents.get("last_30d", 0),
+        },
+        "curriculum": {
+            "available": bool(curriculum_counts),
+            "programmes": curriculum_counts.get("programmes", 0),
+            "cohorts": curriculum_counts.get("cohorts", 0),
+            "modules": curriculum_counts.get("modules", 0),
+        },
+        "delivery": {
+            "available": bool(delivery),
+            "activeLearners": delivery.get("active_learners", 0),
+            "inactiveLearners": delivery.get("inactive_learners", 0),
+        },
+    })
+
+
+# ---------------------------------------------------------------------------
+# Accounts
+# ---------------------------------------------------------------------------
+
+def _staff_access_map(accounts):
+    """{subject_id: {"access": primary, "accesses": [...]}} for this page.
+
+    One query for the page rather than one per row: the accounts list is the
+    console's busiest table and an N+1 here is felt immediately.
+
+    Both are carried because they answer different questions: ``access`` is
+    where the account lands at sign-in, ``accesses`` is everything it may reach.
+    A row showing only the primary would hide the second grant a person holds.
+    """
+    ids = [a.subject_id for a in accounts if a.subject_type == "staff"]
+    if not ids:
+        return {}
+    from learner_api.constants import ACCESS_CHOICES
+    from learner_api.models import StaffUser
+
+    from .identity import accesses_for_staff
+
+    try:
+        with transaction.atomic(using="enrolment"):
+            rows = list(
+                StaffUser.objects.filter(pk__in=ids).only(
+                    "pk", "access", "access_extra"
+                )
+            )
+        return {
+            row.pk: {
+                "access": (row.access or "").strip().lower(),
+                "accesses": [
+                    value for value in ACCESS_CHOICES if value in accesses_for_staff(row)
+                ],
+            }
+            for row in rows
+        }
+    except DatabaseError:
+        # The list is still worth showing without the grants.
+        return {}
+
+
+def _learner_type_map(accounts):
+    """{subject_id: "apprenticeship"|"commercial"} for the learner accounts here.
+
+    The console links a learner's name to their record board, and that board
+    reads its documents by kind — so the kind has to travel with the row. Read
+    through ``all_learners`` because the default manager hides commercial rows,
+    which are precisely the ones this answers differently.
+    """
+    ids = [a.subject_id for a in accounts if a.subject_type == "learner"]
+    if not ids:
+        return {}
+    from learner_api.models import EnrolmentUser
+
+    try:
+        with transaction.atomic(using="enrolment"):
+            rows = (
+                EnrolmentUser.all_learners.filter(pk__in=ids)
+                .values_list("pk", "learner_type")
+            )
+        # Blank means apprenticeship: the column was backfilled and the model
+        # defaults it on save, so only commercial is ever stated CHANGE_MEly.
+        return {
+            pk: ("commercial" if (kind or "").strip().lower() == "commercial" else "apprenticeship")
+            for pk, kind in rows
+        }
+    except DatabaseError:
+        return {}
+
+
+def _row_extras(accounts):
+    """The per-page lookups ``_account_json`` needs, in one object.
+
+    Two queries for a page of rows, gathered here so every caller — the list
+    and the three single-account actions — hands the serializer the same shape
+    and no row comes back missing a field the table reads.
+    """
+    return {
+        "access": _staff_access_map(accounts),
+        "learner_type": _learner_type_map(accounts),
+    }
+
+
+def _account_json(account, now, extras=None):
+    locked = bool(account.locked_until and account.locked_until > now)
+    extras = extras or {}
+    return {
+        # The staff access grant, so the console can show and edit it without a
+        # second request per row. "" for non-staff subjects and for staff whose
+        # access has not been set yet.
+        "access": (extras.get("access", {}).get(account.subject_id) or {}).get("access", "")
+        if account.subject_type == "staff" else "",
+        # Every grant the account holds, so a row can show more than one badge
+        # for somebody who both coaches and teaches.
+        "accesses": (extras.get("access", {}).get(account.subject_id) or {}).get("accesses", [])
+        if account.subject_type == "staff" else [],
+        # Which of the two learner kinds this is, so the console can link to the
+        # right record board. "" for staff and employers, who have no kind.
+        "learnerType": extras.get("learner_type", {}).get(account.subject_id, "")
+        if account.subject_type == "learner" else "",
+        "id": account.id,
+        "email": account.email,
+        "displayName": account.display_name or "",
+        "role": account.role,
+        "subjectType": account.subject_type,
+        "subjectId": account.subject_id,
+        "isActive": account.is_active,
+        "hasPassword": bool(account.password_hash),
+        "locked": locked,
+        "lockedUntil": _iso(account.locked_until),
+        "failedAttempts": account.failed_attempts,
+        "lastLoginAt": _iso(account.last_login_at),
+        "lastLoginIp": account.last_login_ip,
+        "passwordSetAt": _iso(account.password_set_at),
+        "createdAt": _iso(account.created_at),
+        # Derived so the table can badge a row without four client-side rules.
+        "status": (
+            "suspended" if not account.is_active
+            else "locked" if locked
+            else "invited" if not account.password_hash
+            else "active"
+        ),
+    }
+
+
+@require_GET
+@require_role(ROLE_ADMIN)
+def accounts(request):
+    """List sign-in accounts.
+
+    Filters: ``role``, ``status`` (active|suspended|locked|invited), ``q`` over
+    email and display name. This is the only place in the product that shows who
+    can actually sign in — the user directory elsewhere lists *people*, which is
+    a different set: a learner with no invitation has a row there and none here.
+    """
+    page, size = _paging(request)
+    qs = LoginAccount.objects.all()
+
+    role = (request.GET.get("role") or "").strip().lower()
+    if role:
+        qs = qs.filter(role=role)
+
+    term = (request.GET.get("q") or "").strip()
+    if term:
+        from django.db.models import Q
+        qs = qs.filter(Q(email__icontains=term) | Q(display_name__icontains=term))
+
+    now = timezone.now()
+    status = (request.GET.get("status") or "").strip().lower()
+    if status == "active":
+        qs = qs.filter(is_active=True).exclude(password_hash="")
+    elif status == "suspended":
+        qs = qs.filter(is_active=False)
+    elif status == "invited":
+        qs = qs.filter(password_hash="")
+    elif status == "locked":
+        qs = qs.filter(locked_until__gt=now)
+
+    try:
+        with transaction.atomic(using="enrolment"):
+            total = qs.count()
+            rows = list(qs.order_by("-id")[(page - 1) * size: page * size])
+    except DatabaseError as exc:
+        return _error(f"Database error: {exc}", 502)
+
+    extras = _row_extras(rows)
+    return JsonResponse({
+        "count": total,
+        "page": page,
+        "pageSize": size,
+        "results": [_account_json(a, now, extras) for a in rows],
+    })
+
+
+@csrf_exempt
+@require_POST
+@require_role(ROLE_ADMIN)
+def account_action(request, pk):
+    """Suspend, restore, unlock, delete, or re-send an account's onboarding mail.
+
+    The writes the console legitimately owns. Deliberately *not* here:
+    changing an account's role. Role is recomputed from the person's enrolment
+    row by ``identity.ensure_account`` on every request, so a value written here
+    would be silently reverted — the honest place to change it is the staff form.
+    """
+    blocked = _reject_cross_site(request)
+    if blocked:
+        return blocked
+
+    try:
+        payload = json.loads(request.body.decode("utf-8")) if request.body else {}
+    except (ValueError, UnicodeDecodeError) as exc:
+        return _error(f"Invalid JSON body: {exc}", 400)
+    if not isinstance(payload, dict):
+        return _error("Request body must be a JSON object.", 400)
+
+    action = (payload.get("action") or "").strip().lower()
+    if action not in {
+        "suspend",
+        "restore",
+        "unlock",
+        "resend-invitation",
+        "send-password-reset",
+        "add-learner-record",
+        "delete",
+    }:
+        return _error(
+            "action must be one of: suspend, restore, unlock, resend-invitation, "
+            "send-password-reset, add-learner-record, delete.",
+            400,
+        )
+
+    try:
+        account = LoginAccount.objects.filter(pk=pk).first()
+    except DatabaseError as exc:
+        return _error(f"Database error: {exc}", 502)
+    if account is None:
+        return _error("Account not found.", 404)
+
+    actor = getattr(request, "login_account", None)
+
+    if action == "resend-invitation":
+        # Re-issue and re-send. `send_invitation` supersedes any earlier unused
+        # invitation, so the previous link dies rather than leaving two live —
+        # the same guarantee the original send made.
+        #
+        # Offered from the access log because that is where a failed send is
+        # actually noticed: a transient DNS or mail outage leaves an
+        # "Invitation sent — failed" row and an account nobody can reach, and
+        # re-running the creation form would be the wrong fix.
+        if account.password_set_at:
+            return _error(
+                "That account has already set a password — send a password reset instead.",
+                400,
+                code="already_onboarded",
+            )
+        # Re-read the address from the person's own record first. The account
+        # holds a copy, and a copy taken before somebody's email was corrected
+        # is exactly the address a re-send must not use. Best-effort: a record
+        # that cannot be resolved leaves the account as it stands.
+        refreshed = sync_account(account.subject_type, account.subject_id)
+        if refreshed is not None:
+            account = refreshed
+
+        try:
+            from .invitations import send_invitation
+
+            _, sent, detail = send_invitation(
+                account,
+                invited_by=actor.email if actor else "admin",
+                ip=client_ip(request),
+                user_agent=user_agent(request),
+            )
+        except DatabaseError as exc:
+            return _error(f"Database error: {exc}", 502)
+
+        if not sent:
+            # Reported as a failure so the console can say so plainly; the
+            # invitation row exists either way and can be re-sent again.
+            return _error(
+                f"Could not send the invitation: {detail}", 502, code="send_failed"
+            )
+        return JsonResponse({
+            "ok": True,
+            "resent": True,
+            "sentTo": account.email,
+            "account": _account_json(account, timezone.now(), _row_extras([account])),
+        })
+    if action == "add-learner-record":
+        # Also a learner. Creates the enrolment record and nothing else: the
+        # account they already have is reused, so there is one password and one
+        # identity, and the Learner workspace appears beside their existing one.
+        #
+        # A SECOND login account on the same address would look tidier and would
+        # break sign-in: identity.account_for_email returns None once an address
+        # has two active accounts, and password login, SSO and password reset
+        # all depend on it. See login.learner_enrolment.
+        from .learner_enrolment import EnrolmentError, add_learner_record
+
+        try:
+            learner = add_learner_record(
+                account,
+                programme=payload.get("programme") or "",
+                cohort=payload.get("cohort") or "",
+                group=payload.get("group") or "",
+                learner_type=payload.get("learnerType") or "",
+                created_by=actor.email if actor else "admin",
+            )
+        except EnrolmentError as exc:
+            return _error(str(exc), 400, code="cannot_add_learner")
+        except DatabaseError as exc:
+            return _error(f"Database error: {exc}", 502)
+
+        # The same trail the other administrative actions leave: this one
+        # creates a person's enrolment record, so who did it is worth keeping.
+        try:
+            with transaction.atomic(using="enrolment"):
+                LoginAudit.objects.create(
+                    event="admin_add_learner_record",
+                    email=account.email,
+                    account_id=account.id,
+                    succeeded=True,
+                    reason=f"enrolment id {learner.pk}"
+                           + (f" by {actor.email}" if actor else " by admin"),
+                    ip_address=client_ip(request),
+                    user_agent=user_agent(request),
+                )
+        except DatabaseError:
+            pass
+
+        return JsonResponse({
+            "account": _account_json(account, timezone.now(), _row_extras([account])),
+            "learnerRecordId": learner.pk,
+        })
+
+    if action == "send-password-reset":
+        # The counterpart to resend-invitation, and the two are mutually
+        # exclusive: an invitation sets the first password, a reset replaces one
+        # that already exists. The console shows whichever applies, and this
+        # guard is what makes that more than a UI convention.
+        #
+        # Not routed through the public forgot-password endpoint on purpose.
+        # That one answers with a deliberately uniform 200 so it cannot be used
+        # to discover which addresses have accounts, and it is throttled per
+        # address — both right for an anonymous caller, both wrong here, where an
+        # authenticated admin has already been shown the account and needs to
+        # know whether the mail actually went out.
+        if not account.password_set_at:
+            return _error(
+                "That account has not set a password yet — resend the invitation "
+                "instead.",
+                400,
+                code="not_onboarded",
+            )
+        try:
+            from .invitations import send_reset
+
+            _, sent, detail = send_reset(
+                account,
+                ip=client_ip(request),
+                user_agent=user_agent(request),
+            )
+        except DatabaseError as exc:
+            return _error(f"Database error: {exc}", 502)
+
+        if not sent:
+            return _error(
+                f"Could not send the password reset: {detail}", 502, code="send_failed"
+            )
+        return JsonResponse({
+            "ok": True,
+            "resetSent": True,
+            "sentTo": account.email,
+            "account": _account_json(account, timezone.now(), _row_extras([account])),
+        })
+
+    if action == "delete":
+        return _delete_staff_account(request, account, actor)
+
+    # An admin suspending themselves would lock the console's own door with no
+    # way back through the UI. Cheap guard, and the failure mode is expensive.
+    if action == "suspend" and actor is not None and actor.id == account.id:
+        return _error("You cannot suspend your own account.", 400, code="self_suspend")
+
+    if action == "suspend":
+        account.is_active = False
+        fields = ["is_active"]
+        # Sessions outlive the flag otherwise: authenticate_request checks the
+        # account, but revoking here makes the effect immediate and auditable.
+        try:
+            with transaction.atomic(using="enrolment"):
+                account.sessions.filter(revoked_at__isnull=True).update(revoked_at=timezone.now())
+        except DatabaseError:
+            pass
+    elif action == "restore":
+        account.is_active = True
+        account.failed_attempts = 0
+        account.locked_until = None
+        fields = ["is_active", "failed_attempts", "locked_until"]
+    else:  # unlock
+        account.failed_attempts = 0
+        account.locked_until = None
+        fields = ["failed_attempts", "locked_until"]
+
+    try:
+        account.save(update_fields=fields)
+    except DatabaseError as exc:
+        return _error(f"Database error: {exc}", 502)
+
+    # Recorded in the same trail as sign-ins, so an admin action and its effect
+    # sit next to each other when somebody asks why an account stopped working.
+    try:
+        with transaction.atomic(using="enrolment"):
+            LoginAudit.objects.create(
+                event=f"admin_{action}",
+                email=account.email,
+                account_id=account.id,
+                succeeded=True,
+                reason=f"by {actor.email}" if actor else "by admin",
+                ip_address=client_ip(request),
+                user_agent=user_agent(request),
+            )
+    except DatabaseError:
+        pass
+
+    return JsonResponse({"account": _account_json(account, timezone.now(), _row_extras([account]))})
+
+
+def _delete_staff_account(request, account, actor):
+    """Remove a staff member: their sign-in account and their Staff_users row.
+
+    Both go, in one transaction. Deleting only the login account would leave the
+    person in the directory, one "Send invitation" away from coming back; deleting
+    only the staff row would leave an account that resolves to nobody.
+
+    Staff only. A learner's account sits on an enrolment record with a compliance
+    trail, and an employer's on the employer record — neither is removed from a
+    sign-in console. Sessions, invitations and password resets go with the
+    account (ON DELETE CASCADE). Anything else that still points at it — personal
+    study records, for one — makes the delete fail, and the answer is to suspend.
+    """
+    from learner_api.models import StaffUser
+
+    if account.subject_type != "staff":
+        return _error("Only staff accounts can be deleted here.", 400, code="not_staff")
+    # Same reasoning as the self-suspend guard, and this one cannot be undone.
+    if actor is not None and actor.id == account.id:
+        return _error("You cannot delete your own account.", 400, code="self_delete")
+
+    account_id, email, staff_id = account.id, account.email, account.subject_id
+    try:
+        with transaction.atomic(using="enrolment"):
+            StaffUser.objects.filter(pk=staff_id).delete()
+            account.delete()
+    except IntegrityError:
+        return _error(
+            "This account still has records linked to it, so it cannot be deleted. "
+            "Suspend it instead.",
+            409,
+            code="has_linked_records",
+        )
+    except DatabaseError as exc:
+        return _error(f"Database error: {exc}", 502)
+
+    # The row the audit entry describes is gone, so the entry carries the email
+    # and the staff id — enough to say who was removed and by whom.
+    try:
+        with transaction.atomic(using="enrolment"):
+            LoginAudit.objects.create(
+                event="admin_delete",
+                email=email,
+                account_id=account_id,
+                succeeded=True,
+                reason=f"staff id {staff_id}"
+                       + (f" by {actor.email}" if actor else " by admin"),
+                ip_address=client_ip(request),
+                user_agent=user_agent(request),
+            )
+    except DatabaseError:
+        pass
+
+    return JsonResponse({"deleted": True, "id": account_id})
+
+
+# ---------------------------------------------------------------------------
+# Audit trail
+# ---------------------------------------------------------------------------
+
+#: Events that describe something a human should look at twice. Used only to
+#: colour the row; the audit table itself records no severity.
+_ELEVATED_EVENTS = {"admin_suspend", "admin_restore", "admin_unlock", 'CHANGE_ME'}
+
+
+@require_GET
+@require_role(ROLE_ADMIN)
+def audit(request):
+    """The authentication audit trail — login."Login_audit", newest first.
+
+    Filters: ``event``, ``outcome`` (success|failure), ``q`` over email, ``days``.
+    This is a real append-only log: failed attempts against addresses with no
+    account are in here too, which is exactly what makes it worth reading.
+    """
+    page, size = _paging(request)
+    qs = LoginAudit.objects.all()
+
+    event = (request.GET.get("event") or "").strip()
+    if event:
+        qs = qs.filter(event=event)
+
+    outcome = (request.GET.get("outcome") or "").strip().lower()
+    if outcome == "success":
+        qs = qs.filter(succeeded=True)
+    elif outcome == "failure":
+        qs = qs.filter(succeeded=False)
+
+    term = (request.GET.get("q") or "").strip()
+    if term:
+        qs = qs.filter(email__icontains=term)
+
+    try:
+        days = int(request.GET.get("days", 0))
+    except (TypeError, ValueError):
+        days = 0
+    if days > 0:
+        qs = qs.filter(created_at__gt=timezone.now() - timezone.timedelta(days=days))
+
+    try:
+        with transaction.atomic(using="enrolment"):
+            total = qs.count()
+            rows = list(qs.order_by("-id")[(page - 1) * size: page * size])
+            # Drives the filter dropdown from what the log actually contains, so
+            # a new event name never needs a matching change in the SPA.
+            events = sorted(LoginAudit.objects.values_list("event", flat=True).distinct())
+    except DatabaseError as exc:
+        return _error(f"Database error: {exc}", 502)
+
+    return JsonResponse({
+        "count": total,
+        "page": page,
+        "pageSize": size,
+        "eventTypes": events,
+        "results": [{
+            "id": r.id,
+            "event": r.event,
+            "email": r.email,
+            "accountId": r.account_id,
+            "succeeded": r.succeeded,
+            "reason": r.reason,
+            "ipAddress": r.ip_address,
+            "userAgent": r.user_agent,
+            "createdAt": _iso(r.created_at),
+            "severity": (
+                "critical" if not r.succeeded and r.event == EVENT_LOGIN
+                else "warning" if r.event in _ELEVATED_EVENTS or not r.succeeded
+                else "info"
+            ),
+        } for r in rows],
+    })
+
+
+# ---------------------------------------------------------------------------
+# Roles
+# ---------------------------------------------------------------------------
+
+#: The four roles the platform actually authorises on, with what each is for.
+#: Sourced from models.ROLE_CHOICES — this is a description of the real gate in
+#: permissions.require_role, not a configurable RBAC store.
+_ROLE_DESCRIPTIONS = {
+    ROLE_ADMIN: "Full platform access, including account management and this console.",
+    ROLE_STAFF: "Delivery and enrolment staff — learner and employer records, no account management.",
+    ROLE_EMPLOYER: "Employer portal only — their own learners and documents to sign.",
+    ROLE_LEARNER: "The learner's own record, plan, evidence and documents.",
+}
+
+#: Which staff positions collapse into which role, mirroring identity.py.
+_ROLE_SOURCES = {
+    ROLE_ADMIN: 'enrolment."Staff_users" with Position = Admin',
+    ROLE_STAFF: 'enrolment."Staff_users" — every other position',
+    ROLE_EMPLOYER: 'enrolment."Employers"',
+    ROLE_LEARNER: 'enrolment."Created_users"',
+}
+
+_ROLE_ORDER = (ROLE_ADMIN, ROLE_STAFF, ROLE_EMPLOYER, ROLE_LEARNER)
+
+
+@require_GET
+@require_role(ROLE_ADMIN)
+def roles(request):
+    """The real roles, their permissions and live member counts.
+
+    There is no role editor because there is no role table: ``require_role`` and
+    ``_PERMISSIONS`` in ``identity.py`` are the authority, and a screen that let
+    an admin "create a role" would produce a value nothing in the codebase
+    checks. So this endpoint reports; it does not configure.
+    """
+    counts = {}
+    try:
+        with transaction.atomic(using="enrolment"):
+            for role in _ROLE_ORDER:
+                base = LoginAccount.objects.filter(role=role)
+                counts[role] = {
+                    "total": base.count(),
+                    "active": base.filter(is_active=True).exclude(password_hash="").count(),
+                    "invited": base.filter(password_hash="").count(),
+                    "suspended": base.filter(is_active=False).count(),
+                }
+    except DatabaseError as exc:
+        return _error(f"Database error: {exc}", 502)
+
+    # Every permission any role holds — the columns of the console's matrix.
+    all_permissions = sorted({p for role in _ROLE_ORDER for p in permissions_for(role)})
+
+    return JsonResponse({
+        "generatedAt": _iso(timezone.now()),
+        "permissions": all_permissions,
+        "results": [{
+            "id": role,
+            "name": role.capitalize(),
+            "description": _ROLE_DESCRIPTIONS[role],
+            "source": _ROLE_SOURCES[role],
+            "permissions": permissions_for(role),
+            "counts": counts.get(role, {}),
+        } for role in _ROLE_ORDER],
+    })
+
+
+# ---------------------------------------------------------------------------
+# Email delivery
+# ---------------------------------------------------------------------------
+
+@require_GET
+@require_role(ROLE_ADMIN)
+def email_log(request):
+    """Every transactional email this platform sends, and whether it landed.
+
+    The platform sends exactly two kinds of mail — invitations and password
+    resets — and both tables record ``Sent_at`` and ``Send_error``. That is the
+    whole delivery story, so this endpoint is the honest version of the old
+    "notification delivery" panel with its invented SMS and WhatsApp channels.
+    """
+    page, size = _paging(request)
+    status = (request.GET.get("status") or "").strip().lower()
+    kind = (request.GET.get("kind") or "").strip().lower()
+
+    def collect(model, label):
+        if kind and kind != label:
+            return []
+        qs = model.objects.all()
+        if status == "failed":
+            # "Failed" means "still needs attention". Acknowledged failures have
+            # their own filter rather than sitting in this one.
+            qs = qs.filter(send_error__isnull=False, acknowledged_at__isnull=True)
+        elif status == "acknowledged":
+            qs = qs.filter(send_error__isnull=False, acknowledged_at__isnull=False)
+        elif status == "delivered":
+            qs = qs.filter(send_error__isnull=True, sent_at__isnull=False)
+        elif status == "pending":
+            qs = qs.filter(used_at__isnull=True)
+        # Over-read to the end of the requested page so the merged, re-sorted
+        # list below is still correct at the boundary without a UNION.
+        return [{
+            "id": f"{label}-{r.id}",
+            "kind": label,
+            "email": r.email,
+            "accountId": r.account_id,
+            "sentAt": _iso(r.sent_at),
+            "usedAt": _iso(r.used_at),
+            "expiresAt": _iso(r.expires_at),
+            "createdAt": _iso(r.created_at),
+            "error": r.send_error,
+            "acknowledgedAt": _iso(r.acknowledged_at),
+            "acknowledgedBy": r.acknowledged_by,
+            # Acknowledged is checked before failed: it is a failure that has
+            # been dealt with, and the badge should say the later thing.
+            "status": (
+                "acknowledged" if r.send_error and r.acknowledged_at
+                else "failed" if r.send_error
+                else "accepted" if r.used_at
+                else "delivered" if r.sent_at
+                else "queued"
+            ),
+            "_sort": r.created_at,
+        } for r in qs.order_by("-id")[: page * size]]
+
+    try:
+        with transaction.atomic(using="enrolment"):
+            merged = collect(Invitation, "invitation") + collect(PasswordReset, "reset")
+    except DatabaseError as exc:
+        return _error(f"Database error: {exc}", 502)
+
+    stats = _optional_scalars(
+        """
+        SELECT
+          (SELECT count(*) FROM login."Invitations" WHERE "Sent_at" IS NOT NULL)     AS invites_sent,
+          (SELECT count(*) FROM login."Invitations" WHERE "Send_error" IS NOT NULL)  AS invites_failed,
+          (SELECT count(*) FROM login."Password_resets" WHERE "Sent_at" IS NOT NULL) AS resets_sent,
+          (SELECT count(*) FROM login."Password_resets" WHERE "Send_error" IS NOT NULL)
+                                                                                     AS resets_failed,
+          (SELECT count(*) FROM login."Invitations"
+             WHERE "Send_error" IS NOT NULL AND "Acknowledged_at" IS NOT NULL)        AS invites_acked,
+          (SELECT count(*) FROM login."Password_resets"
+             WHERE "Send_error" IS NOT NULL AND "Acknowledged_at" IS NOT NULL)        AS resets_acked,
+          (SELECT count(*) FROM login."Invitations"
+             WHERE "Created_at" > now() - interval '30 days')                        AS invites_30d,
+          (SELECT count(*) FROM login."Password_resets"
+             WHERE "Created_at" > now() - interval '30 days')                        AS resets_30d
+        """
+    )
+
+    merged.sort(key=lambda r: r["_sort"] or timezone.now(), reverse=True)
+    window = merged[(page - 1) * size: page * size]
+    for row in window:
+        row.pop("_sort", None)
+
+    sent = stats.get("invites_sent", 0) + stats.get("resets_sent", 0)
+    # Two different questions, and conflating them would let one click rewrite
+    # history: `failed` is everything that ever failed to send, which is what the
+    # delivery rate is a statement about, while `outstanding` is what still needs
+    # somebody's attention. Acknowledging moves a row between those, not out of
+    # the first one.
+    failed = stats.get("invites_failed", 0) + stats.get("resets_failed", 0)
+    acknowledged = stats.get("invites_acked", 0) + stats.get("resets_acked", 0)
+
+    return JsonResponse({
+        "count": len(merged),
+        "page": page,
+        "pageSize": size,
+        "stats": {
+            "sent": sent,
+            "failed": failed,
+            "outstanding": max(failed - acknowledged, 0),
+            "acknowledged": acknowledged,
+            "last30d": stats.get("invites_30d", 0) + stats.get("resets_30d", 0),
+            "invitations": stats.get("invites_sent", 0),
+            "resets": stats.get("resets_sent", 0),
+            # Null rather than a misleading 100% when nothing has been sent.
+            "deliveryRate": round((sent - failed) / sent * 100, 1) if sent else None,
+        },
+        "transport": {
+            "configured": email_azure.is_configured(),
+            "missing": email_azure.missing_settings(),
+        },
+        "results": window,
+    })
+
+
+@csrf_exempt
+@require_POST
+@require_role(ROLE_ADMIN)
+def email_acknowledge(request, kind, pk):
+    """Mark one failed email as dealt with, or put it back.
+
+    Body: ``{"acknowledged": true}`` (or false to undo).
+
+    An invitation that could not be sent keeps its ``Send_error`` for ever, so
+    until now the Super Admin dashboard raised an alert about it that nothing
+    could clear — the administrator re-sent the invitation by hand and the banner
+    stayed. This is how that alert is closed: the row is marked, not deleted,
+    because the send really was attempted and this table is the record of what
+    the platform tried to do. The delivery-rate figures still count it.
+
+    Undo exists for the same reason the dashboard's dismissal can be undone: a
+    misclick here would otherwise silence a real failure permanently, and there
+    would be nowhere to see that it had happened.
+    """
+    blocked = _reject_cross_site(request)
+    if blocked:
+        return blocked
+
+    model = {"invitation": Invitation, "reset": PasswordReset}.get(kind)
+    if model is None:
+        return _error(f"Unknown email kind: {kind!r}", 400)
+
+    try:
+        payload = json.loads(request.body or b"{}")
+    except ValueError:
+        return _error("Request body must be valid JSON.", 400)
+    if not isinstance(payload, dict):
+        return _error("Request body must be a JSON object.", 400)
+    acknowledged = payload.get("acknowledged", True) is not False
+
+    actor = getattr(request, "login_account", None)
+    try:
+        with transaction.atomic(using="enrolment"):
+            row = model.objects.filter(pk=pk).first()
+            if row is None:
+                return _error("That email is no longer in the log.", 404)
+            # Only a failure can be acknowledged. Acknowledging a delivered email
+            # would record a decision about a problem that never existed.
+            if not row.send_error:
+                return _error("That email did not fail to send.", 400)
+
+            row.acknowledged_at = timezone.now() if acknowledged else None
+            row.acknowledged_by = (actor.email if actor else "admin") if acknowledged else None
+            row.save(update_fields=["acknowledged_at", "acknowledged_by"])
+
+            # Same trail as the other administrative actions: this one suppresses
+            # a platform alert, so who did it is worth keeping.
+            LoginAudit.objects.create(
+                event="admin_email_ack" if acknowledged else "admin_email_unack",
+                email=row.email,
+                account_id=row.account_id,
+                succeeded=True,
+                reason=f"{kind} #{pk} by {actor.email if actor else 'admin'}",
+                ip_address=client_ip(request),
+                user_agent=user_agent(request),
+            )
+    except DatabaseError as exc:
+        return _error(f"Database error: {exc}", 502)
+
+    return JsonResponse({
+        "id": f"{kind}-{pk}",
+        "acknowledged": acknowledged,
+        "acknowledgedAt": _iso(row.acknowledged_at),
+        "acknowledgedBy": row.acknowledged_by,
+        "status": "acknowledged" if acknowledged else "failed",
+    })
+
+
+# ---------------------------------------------------------------------------
+# Documents
+# ---------------------------------------------------------------------------
+
+@require_GET
+@require_role(ROLE_ADMIN)
+def documents(request):
+    """Every generated compliance document, newest first.
+
+    The per-learner document API (``enrolment_api.documents``) answers "what does
+    this learner have"; the console needs the opposite view — what exists across
+    the platform, and how much of it is still unsigned. Filters: ``docType``,
+    ``signed`` (yes|no), ``q`` over learner name and document name.
+    """
+    page, size = _paging(request)
+
+    where, params = [], []
+    doc_type = (request.GET.get("docType") or "").strip()
+    if doc_type:
+        where.append('"Doc_type" = %s')
+        params.append(doc_type)
+
+    signed = (request.GET.get("signed") or "").strip().lower()
+    if signed == "yes":
+        where.append('COALESCE("Signed", false) = true')
+    elif signed == "no":
+        where.append('COALESCE("Signed", false) = false')
+
+    term = (request.GET.get("q") or "").strip()
+    if term:
+        where.append('("Learner_name" ILIKE %s OR "Doc_name" ILIKE %s)')
+        params += [f"%{term}%", f"%{term}%"]
+
+    clause = f"WHERE {' AND '.join(where)}" if where else ""
+
+    error, counted = _optional_rows(
+        f'SELECT count(*) AS n FROM enrolment."Enrolment_Documents" {clause}', params
+    )
+    total = counted[0]["n"] if counted else 0
+
+    _, rows = _optional_rows(
+        f'''SELECT id, "Learner_kind", "Learner_id", "Learner_name", "Doc_type",
+                   "Doc_name", "Container", "Size_bytes", "Signed",
+                   "Generated_at", "Learner_signed_at", "Employer_signed_at"
+            FROM enrolment."Enrolment_Documents" {clause}
+            ORDER BY "Generated_at" DESC NULLS LAST
+            LIMIT %s OFFSET %s''',
+        params + [size, (page - 1) * size],
+    )
+    _, type_rows = _optional_rows(
+        'SELECT DISTINCT "Doc_type" FROM enrolment."Enrolment_Documents" '
+        'WHERE "Doc_type" IS NOT NULL ORDER BY "Doc_type"'
+    )
+
+    return JsonResponse({
+        "available": error is None,
+        "error": error,
+        "count": total,
+        "page": page,
+        "pageSize": size,
+        "docTypes": [r["Doc_type"] for r in type_rows],
+        "results": [{
+            "id": str(r["id"]),
+            "learnerKind": r["Learner_kind"],
+            "learnerId": r["Learner_id"],
+            "learnerName": r["Learner_name"],
+            "docType": r["Doc_type"],
+            "docName": r["Doc_name"],
+            "container": r["Container"],
+            "sizeBytes": r["Size_bytes"],
+            "signed": bool(r["Signed"]),
+            "generatedAt": _iso(r["Generated_at"]),
+            "learnerSignedAt": _iso(r["Learner_signed_at"]),
+            "employerSignedAt": _iso(r["Employer_signed_at"]),
+        } for r in rows],
+    })
+
+
+# ---------------------------------------------------------------------------
+# Curriculum
+# ---------------------------------------------------------------------------
+
+@require_GET
+@require_role(ROLE_ADMIN)
+def curriculum(request):
+    """Programmes and cohorts, each with how many learners are actually on it.
+
+    The counts come from ``enrolment."Created_users"`` rather than the curriculum
+    tables, because a programme existing and a programme being used are different
+    facts and the console should show both — an authored programme with no
+    learners is exactly the thing worth noticing.
+    """
+    error, programmes = _optional_rows(
+        '''SELECT p.name AS name,
+                  (SELECT count(*) FROM curriculum.cohorts c
+                     WHERE c.programme_name = p.name OR c.programme_id = p.programme_id)
+                                                                    AS cohort_count,
+                  (SELECT count(*) FROM curriculum.modules m
+                     WHERE m.programme_id = p.programme_id)         AS module_count,
+                  (SELECT count(*) FROM enrolment."Created_users" u
+                     WHERE u."Programme" = p.name)                  AS learner_count
+           FROM (SELECT DISTINCT COALESCE(NULLIF(name,''), programme_id) AS name, programme_id
+                 FROM curriculum.programmes
+                 WHERE COALESCE(is_archived, false) = false) p
+           WHERE p.name IS NOT NULL
+           ORDER BY p.name'''
+    )
+
+    programme_filter = (request.GET.get("programme") or "").strip()
+    cohort_sql = '''
+        SELECT c.cohort_name AS name,
+               COALESCE(NULLIF(c.programme_name,''), c.programme_id) AS programme,
+               (SELECT count(*) FROM enrolment."Created_users" u
+                  WHERE u."Cohort" = c.cohort_name)                  AS learner_count,
+               min(c.start_date) AS start_date, max(c.end_date) AS end_date
+        FROM curriculum.cohorts c
+        WHERE c.cohort_name IS NOT NULL AND c.cohort_name <> ''
+    '''
+    params = []
+    if programme_filter:
+        cohort_sql += " AND (c.programme_name = %s OR c.programme_id = %s)"
+        params += [programme_filter, programme_filter]
+    cohort_sql += " GROUP BY c.cohort_name, c.programme_name, c.programme_id ORDER BY c.cohort_name"
+    # Cohort dates are optional columns on some deployments; the programme list
+    # is still worth returning without them.
+    _, cohorts = _optional_rows(cohort_sql, params)
+
+    return JsonResponse({
+        "available": error is None,
+        "error": error,
+        "programmes": [{
+            "name": r["name"],
+            "cohorts": r["cohort_count"],
+            "modules": r["module_count"],
+            "learners": r["learner_count"],
+        } for r in programmes],
+        "cohorts": [{
+            "name": r["name"],
+            "programme": r["programme"],
+            "learners": r["learner_count"],
+            "startDate": _iso(r["start_date"]) if r.get("start_date") else None,
+            "endDate": _iso(r["end_date"]) if r.get("end_date") else None,
+        } for r in cohorts],
+    })
+
+
+# ---------------------------------------------------------------------------
+# System status
+# ---------------------------------------------------------------------------
+
+#: Subsystems this deployment genuinely has, and the env var(s) that switch each
+#: on. Reports whether a name is set — never the value. The alternates mirror the
+#: fallbacks the consuming modules themselves accept (e.g. coach_api reads either
+#: MICROSOFT_CLIENT_ID or CLIENTID), so this agrees with what actually runs.
+_SUBSYSTEMS = [
+    ("database", "Enrolment database (Neon)", "Learner, enrolment and auth records", ()),
+    ("email", "Azure email", "Invitations and password resets", ()),
+    ("blob", "Azure Blob Storage", "Generated compliance documents",
+     ("AZURE_STORAGE_CONNECTION_STRING", "AZURE_STORAGE_ACCOUNT")),
+    ("graph", "Microsoft Graph", "Teams meetings and Outlook calendar sync",
+     ("MICROSOFT_GRAPH_CLIENT_ID", "MICROSOFT_CLIENT_ID", "CLIENTID")),
+    ("openai", "AI provider", "Reflection proofreading and transcription",
+     ("AZURE_OPENAI_API_KEY", "OPENAI_API_KEY")),
+]
+
+
+@require_GET
+@require_role(ROLE_ADMIN)
+def system(request):
+    """Readiness of each subsystem this deployment actually depends on.
+
+    Replaces the old integrations screen's invented Aptem / Power BI / DocuSign /
+    CRM tiles. A subsystem is "configured" when its settings are present — that
+    is a fact this process can establish without making a call to anyone; it is
+    not a claim that the remote end is healthy, and the SPA labels it as such.
+    """
+    import os
+
+    checks = []
+    for key, name, purpose, env_vars in _SUBSYSTEMS:
+        if key == "database":
+            try:
+                with transaction.atomic(using="enrolment"):
+                    with connections["enrolment"].cursor() as cur:
+                        cur.execute("SELECT 1")
+                        cur.fetchone()
+                configured, detail = True, "Connected"
+            except DatabaseError as exc:
+                configured, detail = False, str(exc)[:200]
+        elif key == "email":
+            configured = email_azure.is_configured()
+            detail = "Configured" if configured else f"Missing: {', '.join(email_azure.missing_settings())}"
+        else:
+            configured = any(os.environ.get(v, "").strip() for v in env_vars)
+            detail = "Configured" if configured else f"Not set: {' or '.join(env_vars)}"
+
+        checks.append({
+            "id": key,
+            "name": name,
+            "purpose": purpose,
+            "configured": configured,
+            "detail": detail,
+        })
+
+    return JsonResponse({
+        "generatedAt": _iso(timezone.now()),
+        "checks": checks,
+        "configuredCount": sum(1 for c in checks if c["configured"]),
+        "totalCount": len(checks),
+    })
+
+
+# ---------------------------------------------------------------------------
+# Platform report drill-down
+#
+# Every figure on the platform report is a count. This registry is what turns
+# one back into the records behind it: for each metric it names the schema and
+# table the count reads, the predicate that narrows it, and the columns worth
+# showing. The report's own counts are computed in `overview` above as scalar
+# subqueries; the predicates here are kept identical to those, because a
+# drill-down that disagrees with the number it was opened from is worse than no
+# drill-down at all.
+# ---------------------------------------------------------------------------
+
+#: Rows returned for a single metric. Deliberately small: this answers "where
+#: does this number come from", not "export the table".
+DRILL_LIMIT = 100
+
+#: metric key -> how to explain and reproduce it.
+#:   table      the schema-qualified relation the count reads
+#:   predicate  the WHERE clause, exactly as `overview` counts it ('' = all rows)
+#:   columns    what to select for the sample, in display order
+#:   order      ORDER BY for the sample (most useful first, not table order)
+#:   label      human name, matching the report row
+#:   note       CHANGE_ME a reader needs to know to trust the number
+DRILL_METRICS = {
+    # -- login."Login_accounts" ------------------------------------------
+    "accounts.total": {
+        "label": "Total accounts",
+        "table": 'login."Login_accounts"',
+        "predicate": "",
+        "columns": '"id", "Email", "Display_name", "Role", "Is_active", "Last_login_at", "Created_at"',
+        "order": '"Created_at" DESC NULLS LAST',
+    },
+    "accounts.active": {
+        "label": "Able to sign in",
+        "table": 'login."Login_accounts"',
+        "predicate": '"Is_active"',
+        "columns": '"id", "Email", "Display_name", "Role", "Is_active", "Last_login_at"',
+        "order": '"Last_login_at" DESC NULLS LAST',
+        "note": (
+            "The report's wording pairs this with a password check, but the count "
+            "itself is Is_active alone -- which is what is reproduced here."
+        ),
+    },
+    "accounts.neverSignedIn": {
+        "label": "Awaiting first sign-in",
+        "table": 'login."Login_accounts"',
+        "predicate": "\"Password_hash\" = ''",
+        "columns": '"id", "Email", "Display_name", "Role", "Is_active", "Created_at"',
+        "order": '"Created_at" DESC NULLS LAST',
+        "note": (
+            "The report derives this as total minus accounts holding a password, "
+            "so it is the same set as the empty-password rows listed here."
+        ),
+    },
+    "accounts.suspended": {
+        "label": "Suspended",
+        "table": 'login."Login_accounts"',
+        "predicate": 'NOT "Is_active"',
+        "columns": '"id", "Email", "Display_name", "Role", "Is_active", "Last_login_at"',
+        "order": '"Email"',
+    },
+    "accounts.locked": {
+        "label": "Locked out",
+        "table": 'login."Login_accounts"',
+        "predicate": '"Locked_until" IS NOT NULL AND "Locked_until" > now()',
+        "columns": '"id", "Email", "Role", "Locked_until", "Failed_attempts"',
+        "order": '"Locked_until" DESC',
+    },
+    "accounts.activeLast30d": {
+        "label": "Signed in within 30 days",
+        "table": 'login."Login_accounts"',
+        "predicate": "\"Last_login_at\" IS NOT NULL AND \"Last_login_at\" > now() - interval '30 days'",
+        "columns": '"id", "Email", "Display_name", "Role", "Last_login_at"',
+        "order": '"Last_login_at" DESC',
+    },
+    "accounts.byRole.admin": {
+        "label": "Admins",
+        "table": 'login."Login_accounts"',
+        "predicate": "\"Role\" = 'admin'",
+        "columns": '"id", "Email", "Display_name", "Role", "Is_active", "Last_login_at"',
+        "order": '"Email"',
+    },
+    "accounts.byRole.staff": {
+        "label": "Staff",
+        "table": 'login."Login_accounts"',
+        "predicate": "\"Role\" = 'staff'",
+        "columns": '"id", "Email", "Display_name", "Role", "Is_active", "Last_login_at"',
+        "order": '"Email"',
+    },
+    "accounts.byRole.employer": {
+        "label": "Employer accounts",
+        "table": 'login."Login_accounts"',
+        "predicate": "\"Role\" = 'employer'",
+        "columns": '"id", "Email", "Display_name", "Role", "Is_active", "Last_login_at"',
+        "order": '"Email"',
+    },
+    "accounts.byRole.learner": {
+        "label": "Learner accounts",
+        "table": 'login."Login_accounts"',
+        "predicate": "\"Role\" = 'learner'",
+        "columns": '"id", "Email", "Display_name", "Role", "Is_active", "Last_login_at"',
+        "order": '"Email"',
+    },
+    "accounts.liveSessions": {
+        "label": "Live sessions",
+        "table": 'login."Login_sessions"',
+        "predicate": '"Revoked_at" IS NULL AND "Expires_at" > now()',
+        "columns": '"id", "Account_id", "Created_at", "Expires_at", "Ip_address"',
+        "order": '"Created_at" DESC',
+    },
+
+    # -- login."Invitations" ---------------------------------------------
+    "invitations.pending": {
+        "label": "Pending invitations",
+        "table": 'login."Invitations"',
+        "predicate": '"Used_at" IS NULL AND "Expires_at" > now()',
+        "columns": '"id", "Email", "Created_at", "Expires_at", "Sent_at"',
+        "order": '"Created_at" DESC',
+    },
+    "invitations.expired": {
+        "label": "Expired unused",
+        "table": 'login."Invitations"',
+        "predicate": '"Used_at" IS NULL AND "Expires_at" <= now()',
+        "columns": '"id", "Email", "Created_at", "Expires_at", "Sent_at"',
+        "order": '"Expires_at" DESC',
+    },
+    "invitations.failed": {
+        "label": "Failed to send",
+        "table": 'login."Invitations"',
+        "predicate": '"Send_error" IS NOT NULL AND "Acknowledged_at" IS NULL',
+        "columns": '"id", "Email", "Send_error", "Sent_at", "Created_at"',
+        "order": '"Created_at" DESC',
+        "note": (
+            "Acknowledged failures are excluded on purpose: the row keeps its "
+            "Send_error, but an administrator who has dealt with a bounce is not "
+            "told about it for ever."
+        ),
+    },
+
+    # -- login."Login_audit" ---------------------------------------------
+    "authActivity.signIns24h": {
+        "label": "Sign-ins (24h)",
+        "table": 'login."Login_audit"',
+        "predicate": "\"Event\" = 'login' AND \"Succeeded\" AND \"Created_at\" > now() - interval '24 hours'",
+        "columns": '"id", "Account_id", "Email", "Event", "Succeeded", "Reason", "Ip_address", "Created_at"',
+        "order": '"Created_at" DESC',
+    },
+    "authActivity.failedSignIns24h": {
+        "label": "Failed sign-ins (24h)",
+        "table": 'login."Login_audit"',
+        "predicate": "\"Event\" = 'login' AND NOT \"Succeeded\" AND \"Created_at\" > now() - interval '24 hours'",
+        "columns": '"id", "Account_id", "Email", "Event", "Succeeded", "Reason", "Ip_address", "Created_at"',
+        "order": '"Created_at" DESC',
+    },
+    "authActivity.distinctSignIns7d": {
+        "label": "Distinct users (7d)",
+        "table": 'login."Login_audit"',
+        "predicate": "\"Event\" = 'login' AND \"Succeeded\" AND \"Created_at\" > now() - interval '7 days'",
+        "columns": '"Account_id", max("Email") AS "Email", max("Created_at") AS "Last_sign_in", count(*) AS "Sign_ins"',
+        "group": '"Account_id"',
+        "order": '"Last_sign_in" DESC',
+        "note": "The report counts DISTINCT Account_id, so this lists one row per user rather than per sign-in.",
+    },
+    "authActivity.events24h": {
+        "label": "All audit events (24h)",
+        "table": 'login."Login_audit"',
+        "predicate": "\"Created_at\" > now() - interval '24 hours'",
+        "columns": '"id", "Account_id", "Email", "Event", "Succeeded", "Reason", "Ip_address", "Created_at"',
+        "order": '"Created_at" DESC',
+    },
+
+    # -- enrolment: the people themselves --------------------------------
+    "people.learners": {
+        "label": "Learners",
+        "table": 'enrolment."Created_users"',
+        "predicate": "",
+        "columns": '"id", "Username", "Preferred_name", "Email", "Learner_type", " Status", "Programme"',
+        "order": '"id" DESC',
+    },
+    "people.apprenticeship": {
+        "label": "Learners -- apprenticeship",
+        "table": 'enrolment."Created_users"',
+        "predicate": "\"Learner_type\" = 'apprenticeship'",
+        "columns": '"id", "Username", "Preferred_name", "Email", "Learner_type", " Status", "Programme"',
+        "order": '"id" DESC',
+    },
+    "people.commercial": {
+        "label": "Learners -- commercial",
+        "table": 'enrolment."Created_users"',
+        "predicate": "\"Learner_type\" = 'commercial'",
+        "columns": '"id", "Username", "Preferred_name", "Email", "Learner_type", " Status", "Programme"',
+        "order": '"id" DESC',
+    },
+    "people.learnersActive": {
+        "label": "Marked active",
+        "table": 'enrolment."Created_users"',
+        "predicate": "lower(coalesce(\" Status\", '')) = 'active'",
+        "columns": '"id", "Username", "Preferred_name", "Email", "Learner_type", " Status", "Programme"',
+        "order": '"id" DESC',
+        "note": "The Status column genuinely has a leading space in its name; it is quoted exactly, not trimmed.",
+    },
+    "people.staff": {
+        "label": "Staff",
+        "table": 'enrolment."Staff_users"',
+        "predicate": "",
+        "columns": '"id", "Username", "Email", "Type", " Status", "Position"',
+        "order": '"id" DESC',
+    },
+    "people.employers": {
+        "label": "Employers",
+        "table": 'enrolment."Employers"',
+        "predicate": "",
+        "columns": '"id", "First_name", "Surname", "Email", "Town_City", "Created_at"',
+        "order": '"id" DESC',
+    },
+    "people.organisations": {
+        "label": "Organisations",
+        "table": 'enrolment."Organisations"',
+        "predicate": "",
+        "columns": '"id", "Name", "Status", "Category", "City_Town", "Country"',
+        "order": '"id" DESC',
+    },
+
+    # -- curriculum ------------------------------------------------------
+    "curriculum.programmes": {
+        "label": "Programmes",
+        "table": "curriculum.programmes",
+        "predicate": "coalesce(is_archived, false) = false",
+        "columns": "DISTINCT name",
+        "order": "name",
+        "note": "The report counts DISTINCT name, so programmes sharing a name appear once.",
+    },
+    "curriculum.cohorts": {
+        "label": "Cohorts",
+        "table": "curriculum.cohorts",
+        "predicate": "cohort_name IS NOT NULL AND cohort_name <> ''",
+        "columns": "DISTINCT cohort_name",
+        "order": "cohort_name",
+        "note": "The report counts DISTINCT cohort_name, so cohorts sharing a name appear once.",
+    },
+    "curriculum.modules": {
+        "label": "Modules authored",
+        "table": "curriculum.modules",
+        "predicate": "",
+        "columns": "module_catalogue_id, title",
+        "order": "title",
+    },
+
+    # -- documents -------------------------------------------------------
+    "documents.total": {
+        "label": "Stored documents",
+        "table": 'enrolment."Enrolment_Documents"',
+        "predicate": "",
+        "columns": '"id", "Doc_type", "Signed", "Generated_at"',
+        "order": '"Generated_at" DESC NULLS LAST',
+    },
+    "documents.signed": {
+        "label": "Fully signed",
+        "table": 'enrolment."Enrolment_Documents"',
+        "predicate": '"Signed"',
+        "columns": '"id", "Doc_type", "Signed", "Generated_at"',
+        "order": '"Generated_at" DESC NULLS LAST',
+    },
+    "documents.docTypes": {
+        "label": "Distinct types",
+        "table": 'enrolment."Enrolment_Documents"',
+        "predicate": "",
+        "columns": 'DISTINCT "Doc_type"',
+        "order": '"Doc_type"',
+        "note": "The report counts DISTINCT Doc_type, so this lists the types themselves, not the documents.",
+    },
+    "documents.last30d": {
+        "label": "Generated in last 30 days",
+        "table": 'enrolment."Enrolment_Documents"',
+        "predicate": "\"Generated_at\" > now() - interval '30 days'",
+        "columns": '"id", "Doc_type", "Signed", "Generated_at"',
+        "order": '"Generated_at" DESC',
+    },
+
+    # -- delivery --------------------------------------------------------
+    "delivery.activeLearners": {
+        "label": "Active learners",
+        "table": '"Learner"."Active_users"',
+        "predicate": "",
+        "columns": "*",
+        "order": None,
+    },
+    "delivery.inactiveLearners": {
+        "label": "Archived learners",
+        "table": '"Learner"."Unactive_users"',
+        "predicate": "",
+        "columns": "*",
+        "order": None,
+    },
+}
+
+
+def _drill_rows_sql(spec, limit=None):
+    """The SELECT that lists the records behind a metric.
+
+    Also what is shown to the reader: the point of this screen is that the query
+    behind a number is not a secret, so the same text is executed and displayed.
+    """
+    where = "\nWHERE %s" % spec["predicate"] if spec.get("predicate") else ""
+    group = "\nGROUP BY %s" % spec["group"] if spec.get("group") else ""
+    order = "\nORDER BY %s" % spec["order"] if spec.get("order") else ""
+    tail = "\nLIMIT %s" % limit if limit else ""
+    return "SELECT %s\nFROM %s%s%s%s%s" % (
+        spec["columns"], spec["table"], where, group, order, tail,
+    )
+
+
+def _drill_count_sql(spec):
+    """The COUNT the report's own figure comes from."""
+    where = " WHERE %s" % spec["predicate"] if spec.get("predicate") else ""
+    if spec.get("group"):
+        return "SELECT count(DISTINCT %s) FROM %s%s" % (spec["group"], spec["table"], where)
+    columns = str(spec["columns"])
+    if columns.upper().startswith("DISTINCT "):
+        expression = columns[len("DISTINCT "):].split(",")[0].strip()
+        return "SELECT count(DISTINCT %s) FROM %s%s" % (expression, spec["table"], where)
+    return "SELECT count(*) FROM %s%s" % (spec["table"], where)
+
+
+def _drill_value(value):
+    'JSON-safe cell. Dates become ISO strings; CHANGE_ME exotic becomes text.'
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
+@require_GET
+@require_role(ROLE_ADMIN)
+def report_drill(request):
+    """Where one platform-report figure comes from: its query, and its rows.
+
+    The report names a source table against every number. This answers the next
+    question -- which records actually make it up -- by re-running the same
+    predicate and returning a sample, alongside the SQL, so a figure can be
+    checked by hand rather than taken on trust.
+
+    Read-only by construction, and no request input reaches SQL: the metric key
+    selects a fixed entry from DRILL_METRICS and the statement is assembled from
+    that entry alone.
+    """
+    key = (request.GET.get("metric") or "").strip()
+    spec = DRILL_METRICS.get(key)
+    if not spec:
+        return _error("Unknown metric.", 404, code="unknown_metric")
+
+    count_sql = _drill_count_sql(spec)
+    rows_sql = _drill_rows_sql(spec, DRILL_LIMIT)
+
+    try:
+        with transaction.atomic(using="enrolment"):
+            with connections["enrolment"].cursor() as cur:
+                cur.execute(count_sql)
+                row = cur.fetchone()
+                total = int(row[0]) if row and row[0] is not None else 0
+            rows = _rows(rows_sql)
+    except DatabaseError as exc:
+        # The source table is absent on this database -- the same state the
+        # report itself reports by dropping a section, so it is said plainly
+        # rather than shown as an empty result.
+        return JsonResponse({
+            "metric": key,
+            "label": spec["label"],
+            "table": spec["table"],
+            "available": False,
+            "error": str(exc),
+            "countSql": count_sql,
+            "rowsSql": rows_sql,
+        })
+
+    return JsonResponse({
+        "metric": key,
+        "label": spec["label"],
+        "table": spec["table"],
+        "predicate": spec.get("predicate") or None,
+        "note": spec.get("note"),
+        "available": True,
+        "total": total,
+        "shown": len(rows),
+        "limit": DRILL_LIMIT,
+        "countSql": count_sql,
+        "rowsSql": rows_sql,
+        "columns": list(rows[0].keys()) if rows else [],
+        "rows": [{k: _drill_value(v) for k, v in r.items()} for r in rows],
+    })

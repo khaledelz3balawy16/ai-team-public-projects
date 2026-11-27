@@ -1,0 +1,42 @@
+name: Infrastructure scripts
+
+on:
+  pull_request:
+    paths:
+      - infrastructure/scripts/**
+      - infrastructure/*.tf
+      - .github/workflows/infrastructure-scripts.yml
+  push:
+    branches: [main]
+    paths:
+      - infrastructure/scripts/**
+      - infrastructure/*.tf
+      - .github/workflows/infrastructure-scripts.yml
+
+permissions:
+  contents: read
+
+jobs:
+  settings-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify environment export and guarded service updates
+        run: python3 -B -m unittest discover -s infrastructure/scripts -p 'test_*.py' -v
+
+  terraform-validation:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infrastructure
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.17.2
+      - name: Check recording worker formatting
+        run: terraform fmt -check worker.tf
+      - name: Initialize the pinned provider without a backend or AWS credentials
+        run: terraform init -backend=false -input=false -lockfile=readonly
+      - name: Validate infrastructure without planning or applying
+        run: terraform validate -no-color

@@ -1,0 +1,365 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer components {
+  .modal-backdrop {
+    @apply absolute inset-0 backdrop-blur-lg;
+    background: rgba(2, 6, 23, 0.46);
+  }
+
+  .swal2-container,
+  .kbc-swal-container {
+    backdrop-filter: blur(8px) !important;
+    -webkit-backdrop-filter: blur(8px) !important;
+  }
+
+  .kbc-swal-popup {
+    @apply rounded-2xl border border-slate-200 shadow-2xl;
+    width: min(32rem, calc(100vw - 2rem));
+    padding: 1.75rem 1.5rem 1.5rem;
+  }
+
+  .kbc-swal-popup.swal2-show {
+    animation: kbc-swal-soft-enter 0.28s cubic-bezier(0.2, 0.8, 0.2, 1) both !important;
+  }
+
+  .kbc-swal-popup-success {
+    width: min(26rem, calc(100vw - 2rem));
+    padding: 1.5rem 1.25rem 1.25rem;
+  }
+
+  .kbc-swal-title {
+    @apply text-slate-800 font-extrabold;
+    font-size: 1.75rem;
+    line-height: 1.1;
+  }
+
+  .kbc-swal-title-success {
+    font-size: 1rem;
+    line-height: 1.35;
+    text-align: center;
+  }
+
+  .kbc-swal-html {
+    @apply text-slate-600;
+    font-size: 1rem;
+    line-height: 1.5;
+    margin-top: 0.5rem;
+  }
+
+  .kbc-swal-html-success {
+    font-size: 0.92rem;
+    line-height: 1.45;
+    text-align: center;
+  }
+
+  .kbc-swal-confirm,
+  .kbc-swal-deny,
+  .kbc-swal-cancel {
+    @apply inline-flex items-center justify-center rounded-xl font-bold transition-all;
+    min-width: 9.5rem;
+    min-height: 2.75rem;
+    padding: 0.75rem 1.125rem;
+    font-size: 0.95rem;
+    border: 1px solid transparent;
+  }
+
+  .kbc-swal-confirm {
+    background: #dc2626;
+    color: #fff;
+    box-shadow: 0 12px 24px rgba(220, 38, 38, 0.18);
+  }
+
+  .kbc-swal-confirm:hover {
+    background: #b91c1c;
+  }
+
+  .kbc-swal-confirm-save {
+    background: #10264f;
+    color: #fff;
+    box-shadow: 0 12px 24px rgba(16, 38, 79, 0.18);
+  }
+
+  .kbc-swal-confirm-save:hover {
+    background: #0b1b38;
+  }
+
+  .kbc-swal-deny {
+    background: #dc2626;
+    color: #fff;
+    box-shadow: 0 12px 24px rgba(220, 38, 38, 0.16);
+  }
+
+  .kbc-swal-deny:hover {
+    background: #b91c1c;
+  }
+
+  .kbc-swal-confirm-success {
+    min-width: 7.5rem;
+    min-height: 2.5rem;
+    padding: 0.65rem 1rem;
+    background: #1b7f5a;
+    color: #fff;
+    box-shadow: 0 12px 24px rgba(27, 127, 90, 0.18);
+  }
+
+  .kbc-swal-confirm-success:hover {
+    background: #166649;
+  }
+
+  .kbc-swal-cancel {
+    background: #f8fafc;
+    color: #334155;
+    border-color: #cbd5e1;
+  }
+
+  .kbc-swal-cancel:hover {
+    background: #e2e8f0;
+  }
+
+  .swal2-actions {
+    @apply flex items-center justify-center gap-3 flex-wrap;
+    width: 100%;
+    margin-top: 1.5rem;
+  }
+}
+
+@layer utilities {
+  @keyframes kbc-swal-soft-enter {
+    0% {
+      opacity: 0;
+      transform: translate3d(0, 8px, 0) scale(0.985);
+    }
+    62% {
+      opacity: 1;
+      transform: translate3d(0, -2px, 0) scale(1.003);
+    }
+    100% {
+      opacity: 1;
+      transform: translate3d(0, 0, 0) scale(1);
+    }
+  }
+
+  .scrollbar-hidden {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+
+  .scrollbar-hidden::-webkit-scrollbar {
+    display: none;
+  }
+
+  .training-plan-action-row {
+    display: flex;
+    gap: 0.5rem;
+    overflow-x: auto;
+    padding-bottom: 0.25rem;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: thin;
+  }
+
+  .training-plan-action-row > * {
+    flex: 0 0 auto;
+  }
+
+  .training-plan-gantt-shell {
+    max-width: 100%;
+    overflow: visible;
+  }
+
+  .training-plan-gantt-toolbar {
+    overflow-x: auto;
+    overflow-y: visible;
+    flex-wrap: nowrap;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: thin;
+  }
+
+  .training-plan-gantt-scroll {
+    overflow: auto;
+    max-height: min(74vh, 820px);
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain;
+    scrollbar-gutter: stable;
+    will-change: scroll-position;
+    cursor: grab;
+    touch-action: pan-x pan-y;
+  }
+
+  .training-plan-gantt-scroll.is-panning {
+    cursor: grabbing;
+  }
+
+  .training-plan-comparison .training-plan-comparison-heading {
+    min-height: 4rem;
+  }
+
+  .training-plan-comparison [data-training-plan-overview] {
+    display: none;
+  }
+
+  .training-plan-comparison [data-training-plan-overview] + .training-plan-gantt-shell {
+    margin-top: 0;
+  }
+
+  .training-plan-comparison .training-plan-gantt-scroll {
+    max-height: min(62vh, 680px);
+    overflow: auto;
+  }
+
+  .training-plan-comparison .training-plan-gantt-fixed-scrollbar {
+    display: none;
+  }
+
+  .training-plan-comparison .training-plan-gantt-shell {
+    margin-left: 0;
+    margin-right: 0;
+  }
+
+  .training-plan-gantt-fixed-scrollbar {
+    position: fixed;
+    bottom: 0;
+    height: 18px;
+    z-index: 80;
+    padding-top: 2px;
+    border: 1px solid rgba(203, 213, 225, 0.9);
+    border-bottom: 0;
+    border-radius: 8px 8px 0 0;
+    background: rgba(248, 250, 252, 0.96);
+    box-shadow: 0 -8px 20px -18px rgba(15, 23, 42, 0.9);
+  }
+
+  .training-plan-gantt-fixed-scrollbar-track {
+    height: 15px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: thin;
+  }
+
+  .training-plan-gantt-fixed-scrollbar-track::-webkit-scrollbar {
+    height: 12px;
+  }
+
+  .training-plan-gantt-fixed-scrollbar-track::-webkit-scrollbar-track {
+    background: rgba(226, 232, 240, 0.85);
+    border-radius: 999px;
+  }
+
+  .training-plan-gantt-fixed-scrollbar-track::-webkit-scrollbar-thumb {
+    background: rgba(100, 116, 139, 0.78);
+    border: 3px solid rgba(226, 232, 240, 0.85);
+    border-radius: 999px;
+  }
+
+  .training-plan-gantt-fixed-scrollbar-track::-webkit-scrollbar-thumb:hover {
+    background: rgba(71, 85, 105, 0.9);
+  }
+
+  @media (max-width: 1023px) {
+    .training-plan-gantt-scroll {
+      max-height: calc(100vh - 184px);
+    }
+  }
+
+  @media (min-width: 1024px) {
+    .training-plan-gantt-scroll {
+      max-height: none;
+      overflow-x: auto;
+      overflow-y: visible;
+    }
+  }
+
+  @media (max-width: 639px) {
+    .training-plan-action-row {
+      margin-left: -0.25rem;
+      margin-right: -0.25rem;
+      padding-left: 0.25rem;
+      padding-right: 0.25rem;
+    }
+
+    .training-plan-gantt-shell {
+      margin-left: -0.75rem;
+      margin-right: -0.75rem;
+      border-left: 0;
+      border-right: 0;
+      border-radius: 0;
+    }
+
+    .training-plan-gantt-toolbar {
+      padding-left: 0.75rem;
+      padding-right: 0.75rem;
+    }
+
+    .training-plan-gantt-toolbar > * {
+      flex: 0 0 auto;
+    }
+
+    .training-plan-gantt-scroll {
+      max-height: calc(100vh - 152px);
+    }
+  }
+}
+
+@layer utilities {
+  @keyframes soft-card-rise {
+    from {
+      opacity: 0;
+      transform: translate3d(0, 18px, 0);
+    }
+    to {
+      opacity: 1;
+      transform: translate3d(0, 0, 0);
+    }
+  }
+
+  @keyframes footer-fade-up {
+    from {
+      opacity: 0;
+      transform: translateY(18px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  @keyframes footer-float {
+    0%,
+    100% {
+      transform: translate3d(0, 0, 0) scale(1);
+    }
+    50% {
+      transform: translate3d(0, 10px, 0) scale(1.04);
+    }
+  }
+
+  @keyframes footer-glow {
+    0%,
+    100% {
+      opacity: 0.45;
+      transform: scale(1);
+    }
+    50% {
+      opacity: 0.75;
+      transform: scale(1.08);
+    }
+  }
+
+  .animate-footer-fade-up {
+    animation: footer-fade-up 0.65s ease both;
+  }
+
+  .animate-soft-card-rise {
+    animation: soft-card-rise 0.55s ease both;
+  }
+
+  .animate-footer-float {
+    animation: footer-float 9s ease-in-out infinite;
+  }
+
+  .animate-footer-glow {
+    animation: footer-glow 7s ease-in-out infinite;
+  }
+}

@@ -1,0 +1,5 @@
+Django==6.0.10
+djangorestframework>=3.17,<3.19
+channels[daphne]>=4.3.2,<5
+psycopg[binary]>=3.2,<4
+python-dotenv>=1,<2

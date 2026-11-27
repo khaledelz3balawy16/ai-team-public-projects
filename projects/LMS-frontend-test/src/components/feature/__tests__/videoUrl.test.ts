@@ -1,0 +1,57 @@
+/**
+ * Which video URLs the player can actually embed.
+ *
+ * Historical imports can contain Google Drive links in Drive's
+ * share form (".../view"). That URL in an iframe renders Drive's own web page —
+ * a sign-in or "you need permission" notice — rather than a player, which is
+ * exactly what learners saw. They now go through the media proxy, which returns
+ * the file itself, so the real <video> element plays it and can seek.
+ */
+import { describe, expect, it } from 'vitest';
+import { parseVideoUrl } from '../VideoPlayer';
+
+describe('parseVideoUrl', () => {
+  it('sends every shape of Drive link through the media proxy', () => {
+    const id = '1Drhebl7pnUqpuH6wbkcDlr-NakfQ2USW';
+    for (const url of [
+      `https://drive.google.com/file/d/${id}/view`,
+      `https://drive.google.com/file/d/${id}/view?usp=sharing`,
+      `https://drive.google.com/file/d/${id}/preview`,
+      `https://drive.google.com/open?id=${id}`,
+      `https://drive.google.com/uc?export=download&id=${id}`,
+    ]) {
+      // 'file' rather than an iframe: it is played by the real video element,
+      // which is what gives the learner a scrubber.
+      expect(parseVideoUrl(url)).toEqual({
+        kind: 'file', src: `/learner_api/media/google-drive/${id}/`,
+        fallbackSrc: `https://drive.google.com/file/d/${id}/preview`,
+      });
+    }
+  });
+
+  it('retains a Drive resource key on its permitted preview', () => {
+    expect(parseVideoUrl('https://drive.google.com/file/d/1234567890/view?resourcekey=key-123').fallbackSrc)
+      .toBe('https://drive.google.com/file/d/1234567890/preview?resourcekey=key-123');
+  });
+
+  it('still recognises the platforms it always did', () => {
+    expect(parseVideoUrl('https://youtu.be/t5zkilpisI4')).toMatchObject({
+      kind: 'youtube', src: 'https://www.youtube.com/embed/t5zkilpisI4',
+    });
+    expect(parseVideoUrl('https://www.youtube.com/watch?v=t5zkilpisI4').kind).toBe('youtube');
+    expect(parseVideoUrl('https://vimeo.com/123456789').src).toBe('https://player.vimeo.com/video/123456789');
+  });
+
+  it('plays a direct media file with the real player, not an iframe', () => {
+    // Uploaded legacy videos are served from our own uploads route.
+    expect(parseVideoUrl('/curriculum_api/curriculum/uploads/_legacy_files/1/lecture.mp4')).toMatchObject({
+      kind: 'file',
+    });
+  });
+
+  it('falls back to embedding an unknown link as-is', () => {
+    expect(parseVideoUrl('https://example.test/watch/abc')).toMatchObject({
+      kind: 'vimeo', src: 'https://example.test/watch/abc',
+    });
+  });
+});

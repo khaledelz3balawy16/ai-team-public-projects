@@ -1,0 +1,355 @@
+/* =========================
+   Psycho Dashboard - Color map + base styles
+   (UPDATED: Fix RAG colors not showing in Scores bars)
+   ========================= */
+   
+/* Design tokens */
+:root {
+  /* Primary purple from the design */
+  --color-primary: #4f2d7f;
+  --color-primary-600: #3e235f;
+
+  /* Accent / light blue used in legends */
+  --color-accent: #74b9df;
+
+  /* Page background */
+  --page-bg: #f8f9fa;
+
+  --white: #ffffff;
+
+  /* Gray family */
+  --gray-100: #f3f4f6;
+
+  /* Text */
+  --text-900: #111827;
+  --text-600: #6b7280;
+
+  /* Fonts */
+  --font-primary: 'Roboto', system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial;
+  --font-alt: 'Poppins', system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial;
+
+  /* RAG (Red/Amber/Green) */
+  --rag-red: #ef4444;
+  --rag-yellow: #f59e0b;
+  --rag-green: #16a34a;
+}
+
+/* Load Roboto and set as global font */
+@import url('https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap');
+
+/* Page base */
+#psycho-dashboard {
+  font-family: var(--font-primary);
+  background-color: var(--page-bg) ;
+  color: var(--text-900);
+}
+
+/* Font utility classes to avoid theme overrides */
+.font-primary { font-family: var(--font-primary) !important; }
+.font-alt { font-family: var(--font-alt) !important; }
+.font-roboto { font-family: 'Roboto', var(--font-primary) !important; }
+.font-poppins { font-family: 'Poppins', var(--font-alt) !important; }
+
+/* Scoped helper */
+.psycho-dashboard .font-primary { font-family: var(--font-primary) !important; }
+
+/* Header title adjustments */
+.bg-primary h1 {
+  color: var(--white) !important;
+  font-family: 'Roboto', sans-serif;
+  font-weight: 700;
+  font-size: 2rem;
+}
+
+/* Tailwind-like utility mappings used in the markup */
+.bg-primary { background-color: var(--color-primary) !important; }
+.text-primary { color: var(--color-primary) !important; }
+.bg-white { background-color: var(--white) !important; }
+.bg-gray-100 { background-color: var(--gray-100) !important; }
+.text-gray-900 { color: var(--text-900) !important; }
+.text-gray-600 { color: var(--text-600) !important; }
+.shadow-sm { box-shadow: 0 1px 2px rgba(16,24,40,0.05); }
+
+/* small helper for semi-transparent primary hover states */
+.bg-primary\/90 { background-color: rgba(79,45,127,0.9) !important; }
+
+/* Dashboard specific styles */
+.radar-chart {
+  height: 280px;
+  width: 100%;
+}
+
+.dashboard-card {
+  transition: all 0.3s ease;
+  margin-bottom: 1rem;
+}
+
+.dashboard-card:hover {
+  transform: translateY(-5px);
+  box-shadow: 0 10px 25px rgba(0, 0, 0, 0.1);
+}
+
+.progress-badge {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.progress-badge::after {
+  content: "";
+  position: absolute;
+  top: -2px;
+  right: -2px;
+  width: 8px;
+  height: 8px;
+  background-color: var(--color-primary);
+  border-radius: 50%;
+}
+
+.tab-button.active {
+  background-color: var(--color-primary);
+  color: var(--white);
+}
+
+.tab-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: .5rem;
+  border-radius: 9999px;
+  border: 2px solid var(--color-primary);
+  background: transparent;
+  color: var(--text-900);
+  padding: .45rem .95rem;
+  font-size: .95rem;
+  transition: background-color .2s ease, color .2s ease, border-color .2s ease, transform .2s ease;
+}
+
+.tab-button:hover {
+  background-color: rgba(79,45,127,0.06);
+  border-color: var(--color-primary-600);
+}
+
+.tab-button:focus {
+  outline: 3px solid rgba(79,45,127,0.12);
+  outline-offset: 2px;
+}
+
+.custom-switch {
+  position: relative;
+  display: inline-block;
+  width: 50px;
+  height: 24px;
+}
+
+.custom-switch input { opacity: 0; width: 0; height: 0; }
+
+.switch-slider {
+  position: absolute;
+  cursor: pointer;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background-color: #ccc;
+  transition: .4s;
+  border-radius: 24px;
+}
+
+.switch-slider:before {
+  position: absolute;
+  content: "";
+  height: 18px; width: 18px; left: 3px; bottom: 3px;
+  background-color: white; transition: .4s; border-radius: 50%;
+}
+
+input:checked + .switch-slider { background-color: var(--color-primary); }
+input:checked + .switch-slider:before { transform: translateX(26px); }
+
+/* =========================
+   SCORES BARS (UPDATED)
+   Fix: primary purple rule was overriding rag-* colors
+   ========================= */
+
+/* Default fill (purple) ONLY when not rag-* */
+.dashboard-card .w-full.bg-gray-200 > div:not(.rag-red):not(.rag-yellow):not(.rag-green),
+.dashboard-card [id$="-bar"]:not(.rag-red):not(.rag-yellow):not(.rag-green) {
+  background-color: var(--color-primary) !important;
+  height: 0.5rem !important;
+  border-radius: 9999px !important;
+}
+
+/* RAG fills (higher specificity than the purple default) */
+.dashboard-card .w-full.bg-gray-200 > div.rag-red,
+.dashboard-card [id$="-bar"].rag-red {
+  background-color: var(--rag-red) !important;
+}
+
+.dashboard-card .w-full.bg-gray-200 > div.rag-yellow,
+.dashboard-card [id$="-bar"].rag-yellow {
+  background-color: var(--rag-yellow) !important;
+}
+
+.dashboard-card .w-full.bg-gray-200 > div.rag-green,
+.dashboard-card [id$="-bar"].rag-green {
+  background-color: var(--rag-green) !important;
+}
+
+/* Ensure the numeric/label on the right uses primary color for emphasis */
+.dashboard-card .space-y-3 .flex.justify-between .font-medium {
+  color: var(--color-primary) !important;
+}
+
+/* Optional: if you also want the text itself to be colored when using rag-* */
+.rag-red { color: var(--rag-red) !important; }
+.rag-yellow { color: var(--rag-yellow) !important; }
+.rag-green { color: var(--rag-green) !important; }
+
+/* utility to show the accent dot color used in legends */
+.legend-accent { background-color: var(--color-accent); }
+
+/* small button helpers used in markup */
+.btn-primary {
+  background-color: var(--color-primary);
+  color: var(--white);
+  border: none;
+  padding: .5rem .75rem;
+  border-radius: .5rem;
+}
+.btn-primary:hover { background-color: var(--color-primary-600); }
+
+/* progress bars use primary for fills */
+.bg-primary-bar { background-color: var(--color-primary); }
+
+/* Responsive adjustments */
+@media (max-width: 640px) {
+  .radar-chart { height: 220px; }
+  .dashboard-card { padding: 0.75rem; }
+  .container { padding-left: 1rem; padding-right: 1rem; }
+  h1 { font-size: 1.25rem; }
+  .text-3xl { font-size: 1.25rem; }
+  .tab-button { padding: .35rem .65rem; font-size: .82rem; }
+  .flex.flex-wrap.gap-4 > div, .flex-1 { flex: 1 1 100%; }
+}
+
+@media (min-width: 641px) and (max-width: 1024px) {
+  .radar-chart { height: 240px; }
+  .dashboard-card { padding: 1rem; }
+  h1 { font-size: 1.5rem; }
+  .text-3xl { font-size: 1.5rem; }
+  .tab-button { padding: .4rem .85rem; font-size: .92rem; }
+}
+
+@media (min-width: 1025px) {
+  .radar-chart { height: 320px; }
+  .dashboard-card { padding: 1.25rem; }
+  h1 { font-size: 2rem; }
+  .text-3xl { font-size: 2rem; }
+  .tab-button { padding: .5rem 1rem; font-size: 1rem; }
+  .container { max-width: 1200px; }
+}
+
+/* Learning style / content typography */
+.dashboard-card h3 {
+  font-size: 1.125rem;
+  font-weight: 700;
+  color: var(--text-900);
+  margin-bottom: 0.6rem;
+}
+
+.dashboard-card h4 {
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--text-900);
+  margin-bottom: 0.5rem;
+}
+
+.dashboard-card p,
+.dashboard-card li {
+  font-size: 0.95rem;
+  color: var(--text-600);
+  line-height: 1.6;
+}
+
+.dashboard-card ul { margin-left: 1rem; }
+
+/* CTA in cards */
+.dashboard-card .btn-primary {
+  padding: .65rem 1.1rem;
+  border-radius: 9999px;
+  font-weight: 600;
+  font-size: .95rem;
+  box-shadow: none;
+}
+
+/* Ensure small badges / legends have appropriate font sizing */
+.dashboard-card .text-sm { font-size: .85rem; }
+
+/* Responsive typography tweaks for Learning Style area */
+@media (max-width: 640px) {
+  .dashboard-card h3 { font-size: 1rem; }
+  .dashboard-card h4 { font-size: .95rem; }
+  .dashboard-card p, .dashboard-card li { font-size: .88rem; }
+  .dashboard-card .btn-primary { padding: .5rem .85rem; font-size: .9rem; }
+}
+
+@media (min-width: 641px) and (max-width: 1024px) {
+  .dashboard-card h3 { font-size: 1.0625rem; }
+  .dashboard-card h4 { font-size: .98rem; }
+  .dashboard-card p, .dashboard-card li { font-size: .92rem; }
+  .dashboard-card .btn-primary { padding: .6rem 1rem; font-size: .94rem; }
+}
+
+@media (min-width: 1025px) {
+  .dashboard-card h3 { font-size: 1.125rem; }
+  .dashboard-card h4 { font-size: 1rem; }
+  .dashboard-card p, .dashboard-card li { font-size: .95rem; }
+  .dashboard-card .btn-primary { padding: .65rem 1.1rem; font-size: .95rem; }
+}
+
+/* =========================
+   Career Tooltip (FINAL)
+========================= */
+
+.career-tooltip-wrapper {
+  display: inline-block;
+}
+
+.career-tooltip {
+  position: fixed;
+  background: #ffffff;
+  color: #374151;
+  font-size: 12px;
+  line-height: 1.5;
+
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid #d1d5db;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s ease;
+  z-index: 9999;
+  
+  top: auto;
+  left: auto;
+}
+
+/* arrow */
+.career-tooltip::after {
+  content: "";
+  position: absolute;
+  top: 100%;
+  left: 50%;
+  transform: translateX(-50%);
+  border-width: 6px;
+  border-style: solid;
+  border-color: #ffffff transparent transparent transparent;
+}
+
+/* show on hover */
+.career-tooltip-wrapper:hover .career-tooltip {
+  opacity: 1;
+  top: calc(var(--tooltip-top, 0px));
+  left: calc(var(--tooltip-left, 0px));
+}

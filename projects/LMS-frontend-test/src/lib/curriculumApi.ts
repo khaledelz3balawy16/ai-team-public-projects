@@ -1,0 +1,4199 @@
+import { publishCrossTabWrite, subscribeCrossTabWrites } from '@/lib/crossTabWrites';
+
+export type CurriculumStatus = 'active' | 'draft' | 'archived' | 'published' | 'planned' | 'completed' | string;
+
+/**
+ * Determines if an error is retryable.
+ * Retries only transient failures; permanent errors fail immediately.
+ */
+export function isRetryableError(error: unknown): boolean {
+  // Check for AbortError first (DOMException)
+  if (error instanceof DOMException && error.name === 'AbortError') {
+    return false;
+  }
+
+  // Check for HTTP status codes embedded in Error messages from fetchJsonUncached
+  // Format: "Curriculum API returned NNN for /path"
+  if (error instanceof Error) {
+    const msg = error.message.toLowerCase();
+
+    // Extract status code from error message if present
+    const statusMatch = error.message.match(/curriculum api returned (\d{3})/i);
+    if (statusMatch) {
+      const status = parseInt(statusMatch[1], 10);
+      // Transient errors (retry)
+      if (status === 408 || status === 429 || (status >= 500 && status <= 599)) {
+        return true;
+      }
+      // Permanent errors (don't retry)
+      if ((status >= 400 && status <= 499)) {
+        return false;
+      }
+    }
+
+    // Network/timeout errors (no HTTP response)
+    if (msg.includes('network') || msg.includes('timeout')) {
+      return true; // Network errors are transient and should be retried
+    }
+  }
+
+  // If it's a Response object (unlikely in production given error handling above)
+  if (error instanceof Response) {
+    const status = error.status;
+    // Transient errors (retry)
+    if (status === 408 || status === 429 || (status >= 500 && status <= 599)) {
+      return true;
+    }
+    // Permanent errors (don't retry)
+    if ((status >= 400 && status <= 499)) {
+      return false;
+    }
+  }
+
+  // Default: retry unknown errors (network issues with no captured status)
+  return true;
+}
+
+interface CurriculumRequestInit {
+  method?: string;
+  credentials?: RequestCredentials;
+  headers?: Record<string, string>;
+  body?: string;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  /**
+   * Read past every cache, client *and* server: sends `Cache-Control: no-cache`,
+   * which makes the backend rebuild the payload from the database.
+   *
+   * That rebuild costs seconds -- the curriculum overview takes ~13s of Neon
+   * round trips -- so this is only for a read that must reflect a write this
+   * client just made. For "show me what exists now" on mount, use `revalidate`.
+   */
+  skipCache?: boolean;
+  /**
+   * Ignore the client-side cache, but let the server answer from its own.
+   *
+   * The same "always current" guarantee as `skipCache` for anything written
+   * elsewhere -- another tab, the structure wizard, another user -- because the
+   * request still goes to the network and the backend invalidates its payload
+   * cache on write. It just does not force the multi-second rebuild. The fresh
+   * response is written back to the client cache, so other pages benefit.
+   */
+  revalidate?: boolean;
+}
+
+export class CurriculumApiError extends Error {
+  status: number;
+  path: string;
+  data: unknown;
+
+  constructor(message: string, status: number, path: string, data?: unknown) {
+    super(message);
+    this.name = 'CurriculumApiError';
+    this.status = status;
+    this.path = path;
+    this.data = data;
+    Object.setPrototypeOf(this, CurriculumApiError.prototype);
+  }
+}
+
+/** One module already holding a slot the save tried to book the same tutor into. */
+export interface CurriculumTutorConflict {
+  moduleCatalogueId: string;
+  moduleName: string;
+  programme: string;
+  cohort: string;
+  group: string;
+  startTime: string;
+  endTime: string;
+  /** Every date the two modules overlap on, not just the first. */
+  dates: string[];
+}
+
+export interface CurriculumTutorConflictPayload {
+  error: string;
+  tutorConflicts: CurriculumTutorConflict[];
+  tutor: string;
+  moduleName: string;
+}
+
+/**
+ * A save refused because it would have put one tutor in two places at once.
+ *
+ * Raised by every endpoint that assigns a tutor — the module PATCH, the group
+ * modules POST/PATCH, the group and staffing PATCHes and the programme tree save
+ * — so a caller can recognise it once rather than per screen.
+ */
+export function isTutorConflictError(error: unknown): error is CurriculumApiError & { data: CurriculumTutorConflictPayload } {
+  return (
+    error instanceof CurriculumApiError
+    && error.status === 409
+    && Boolean(error.data)
+    && typeof error.data === 'object'
+    && Array.isArray((error.data as CurriculumTutorConflictPayload).tutorConflicts)
+  );
+}
+
+/**
+ * The backend's sentence for a clash, or null when the error is something else.
+ *
+ * `CurriculumApiError.message` wraps it in "Curriculum API returned 409 for
+ * /path: …", which is diagnostic rather than something to show a user. Screens
+ * that assign a tutor should prefer this and fall back to their own copy.
+ */
+export function tutorConflictMessage(error: unknown): string | null {
+  return isTutorConflictError(error) ? error.data.error : null;
+}
+
+/**
+ * The backend's own sentence and validation details for a refused write, or `fallback`.
+ *
+ * Same reasoning as `tutorConflictMessage` above, generalised: every handler
+ * answers a refusal with `{ error: '...' }` saying what to do about it, and
+ * `CurriculumApiError.message` buries that inside "Curriculum API returned 409
+ * for /path: …". A dialog should show the sentence, not the diagnostic.
+ */
+export function curriculumErrorMessage(error: unknown, fallback: string): string {
+  return error instanceof CurriculumApiError ? curriculumPayloadErrorMessage(error.data) || fallback : fallback;
+}
+
+function curriculumPayloadErrorMessage(data: unknown): string {
+  if (!data || typeof data !== 'object') return '';
+  const payload = data as Record<string, unknown>;
+  const message = typeof payload.error === 'string' && payload.error.trim() ? payload.error : '';
+  const details = [payload.validationErrors, payload.errors]
+    .flatMap(errors => Array.isArray(errors) ? errors : [])
+    .map((item: unknown) => typeof item === 'string'
+      ? item
+      : item && typeof item === 'object' ? (item as { message?: unknown }).message : undefined)
+    .filter((detail): detail is string => typeof detail === 'string' && Boolean(detail.trim()))
+    .map(detail => detail.trim())
+    .filter(detail => detail !== message.trim());
+  const validation = [...new Set(details)].join('; ');
+  return message && validation ? `${message} - ${validation}` : message || validation;
+}
+
+export interface CurriculumProgramme {
+  id: string;
+  sourceId: string;
+  name: string;
+  standard: string;
+  level: string;
+  status?: 'active' | 'draft' | 'archived' | string;
+  isArchived?: boolean;
+  isActive?: boolean;
+  modules: number;
+  freeComponents?: number;
+  weeks: number;
+  ksbMapped: number;
+  ksbTotal: number;
+  // Learner-consumed KSB progress across the whole programme, from the Component
+  // Progress snapshot (`learner_progress_ksbs`). This answers "what have the
+  // learners evidenced", which is a different question from ksbMapped/ksbTotal
+  // above — that pair is how much of the standard the design maps.
+  learnerKsbProgressPercentage?: number;
+  learnerKsbConsumedWeight?: number;
+  learnerKsbExpectedWeight?: number;
+  learnerKsbLearnerCount?: number;
+  learnerKsbCodesStarted?: number;
+  learnerKsbCodesComplete?: number;
+  learnerKsbCodesTotal?: number;
+  learners: number;
+  cohorts: number;
+  groups?: number;
+  lastUpdated: string;
+  /** When the record was first written. Blank on rows predating the column. */
+  createdAt?: string;
+  owner: string;
+  color: string;
+  description: string;
+  structureType?: 'scheduled' | 'free' | string;
+  ksbProfileSourceId?: string;
+  // Off-the-job hours a learner must complete for the whole programme. null means no
+  // target has been set, which is different from a target of zero.
+  requiredOtjh?: number | null;
+}
+
+export interface CurriculumWeeklySession {
+  day: string;
+  startTime: string;
+  endTime: string;
+}
+
+export interface CurriculumModule {
+  id: string;
+  // Temporary compatibility: moduleId may be a canonical ID or legacy delivery ID.
+  // Prefer moduleCatalogueId for canonical authoring identity and deliveryRowId for allocation identity.
+  moduleId?: string;
+  moduleCatalogueId?: string;
+  deliveryRowId?: number | string;
+  deliveryModuleId?: string;
+  legacyModuleId?: string;
+  invalidModuleCatalogueId?: string;
+  structureId?: string;
+  sourceId: number | string;
+  catalogueId?: string;
+  relatedCatalogueIds?: string[];
+  name: string;
+  programmeId?: string;
+  programme: string;
+  cohortId?: string;
+  cohort?: string;
+  groupId?: string;
+  group?: string;
+  isProgrammeDeleted?: boolean;
+  /**
+   * The authored week count — what the week builder holds and what the UI shows
+   * as "N weeks". NOT the number of calendar sessions: a group delivering
+   * Mon+Thu runs two sessions per week, so `sessionsNumber` is twice this.
+   */
+  weeks: number;
+  weekStructure?: Array<{
+    id: string;
+    weekNumber: number;
+    title: string;
+    displayOrder?: number;
+    ksbMappings?: CurriculumComponent['ksbMappings'];
+    components?: CurriculumComponent[];
+  }>;
+  /**
+   * The calendar session count — `weeks` x the group's delivery days per week.
+   * This is what the session dates, the tutor clash check and the Teams series
+   * are built from. Kept apart from `weeks` because one field meaning both made
+   * every edit round-trip multiply the weeks by the delivery days.
+   */
+  sessionsNumber?: number;
+  weeklySchedule?: CurriculumWeeklySession[];
+  sessionHolidays?: CurriculumHoliday[];
+  /** Teaching weeks, separate from imported content rows. */
+  deliveryWeeks?: number;
+  weekDays?: string;
+  startTime?: string;
+  endTime?: string;
+  startDate?: string;
+  endDate?: string;
+  totalOtjh?: number;
+  declaredTotalOtjh?: number;
+  ksbCount: number;
+  ksbProfileSourceId?: string;
+  lessons: number;
+  quizzes: number;
+  assignments: number;
+  status: 'published' | 'draft' | 'review' | string;
+  authoringStatus?: 'published' | 'draft' | 'review' | string;
+  sourceType?: string;
+  deliveryStatus?: string;
+  author: string;
+  tutor?: string;
+  coach?: string;
+  lastUpdated: string;
+  /** When the record was first written. Blank on rows predating the column. */
+  createdAt?: string;
+  color: string;
+  /**
+   * Optional module artwork — a pasted image URL, or a data: URL read off the
+   * picked file, exactly as a free course stores its cover. Empty means the
+   * Module Builder card keeps its generic icon.
+   */
+  coverImage?: string;
+  notes: string;
+  sessionNames: string[];
+  ksbCodes: string[];
+  moduleKsbMappings?: CurriculumComponent['ksbMappings'];
+}
+
+export interface CurriculumComponent {
+  id: string;
+  moduleCatalogueId?: string;
+  moduleId?: string;
+  weekId?: string;
+  title: string;
+  type: string;
+  displayOrder?: number;
+  module: string;
+  programme: string;
+  week: string;
+  weekTitle?: string;
+  duration: number;
+  expectedOtjh?: number;
+  reflectionRequired?: boolean;
+  /** What the learner reflects on. Only meaningful while reflection is required. */
+  reflectionQuestion?: string;
+  workplaceEvidenceRequired?: boolean;
+  tutorValidationRequired?: boolean;
+  /** Coach sign-off. Absent means on - see ModuleComponent.coachValidationRequired. */
+  coachValidationRequired?: boolean;
+  ksbRefs: string[];
+  ksbMappings?: Array<{
+    id: string;
+    ksbId: string;
+    code: string;
+    description: string;
+    sourceType?: string;
+    sourceId?: string;
+    type: string;
+    classification?: string;
+    weight: number;
+    weightClass: 'hard' | 'soft' | 'possible' | string;
+    weight_class?: 'hard' | 'soft' | 'possible' | string;
+  }>;
+  status: 'published' | 'draft' | 'review';
+  lastEdited: string;
+  contentSections: number;
+  quizQuestions?: number | null;
+  hasResources: boolean;
+  description?: string;
+  points?: number;
+  isDeleted?: boolean;
+  deletedAt?: string | null;
+  deletedViaParent?: string;
+  settings?: Record<string, unknown>;
+}
+
+/** Where a reusable component currently lives. */
+export type LibraryComponentOrigin = 'active' | 'archived' | 'library';
+
+/**
+ * A component offered for reuse. Same shape as a normal component plus its
+ * provenance, because the parent module may no longer exist: `originModuleTitle`
+ * and `originWeekLabel` are stamped on the row at detach time and are the only
+ * labels available for detached content.
+ */
+export interface LibraryComponent extends CurriculumComponent {
+  origin: LibraryComponentOrigin;
+  /**
+   * The authoring type (`live-session`, `reading`, …). Distinct from `type`,
+   * which the component endpoints fill with a human label ("Self-study") that
+   * several activity types share and which cannot be copied.
+   */
+  componentType: string;
+  originModuleCatalogueId?: string;
+  originModuleTitle?: string;
+  originWeekId?: string;
+  originWeekLabel?: string;
+  detachedAt?: string | null;
+  copiedFromId?: string;
+}
+
+export interface CurriculumKsbActivity {
+  activityType: string;
+  weight: number;
+}
+
+export interface CurriculumKsbEntry {
+  id: string;
+  code: string;
+  rawCode?: string;
+  fullCode?: string;
+  parentCode?: string;
+  parentId?: string | number | null;
+  displayOrder?: number;
+  title: string;
+  description: string;
+  type: 'Knowledge' | 'Skill' | 'Behaviour';
+  standard: string;
+  activities: CurriculumKsbActivity[];
+  modules: string[];
+  assessmentMethod: string;
+  mappedBy: string;
+  status: 'mapped' | 'partial' | 'unmapped';
+  lastUpdated: string;
+}
+
+export interface CurriculumKsbSet {
+  frameworkId?: string;
+  profileId?: string | number;
+  ksbProfileId?: string;
+  /** Skills England standard supplying funding/compliance metadata for this profile. */
+  standardSourceId?: string;
+  programmeId: string;
+  programmeIds?: string[];
+  cohortIds?: string[];
+  groupIds?: string[];
+  moduleCatalogueIds?: string[];
+  programmeName: string;
+  standard: string;
+  notes?: string;
+  status?: string;
+  ksbs: CurriculumKsbEntry[];
+}
+
+export interface CurriculumKsbFramework {
+  id: string;
+  profileId?: string | number;
+  ksbProfileId?: string;
+  /** Explicit parent standard; independent from the programmes using the profile. */
+  standardSourceId?: string;
+  programmeId?: string;
+  programmeIds?: string[];
+  cohortIds?: string[];
+  groupIds?: string[];
+  moduleCatalogueIds?: string[];
+  name: string;
+  standard: string;
+  programmeName?: string;
+  notes?: string;
+  ifateRef: string;
+  level: number;
+  totalKsbs: number;
+  knowledgeCount: number;
+  skillCount: number;
+  behaviourCount: number;
+  modulesCount: number;
+  mapped: number;
+  status: 'draft' | 'review' | 'published' | 'archived';
+  lastModified: string;
+  modifiedBy: string;
+  version: string;
+  programmes: string[];
+}
+
+export interface CurriculumStandardKsb {
+  id?: string | number;
+  code: string;
+  type: 'Knowledge' | 'Skill' | 'Behaviour';
+  description: string;
+}
+
+export interface CurriculumStandard {
+  id: string;
+  code: string;
+  standardRef: string;
+  version: string;
+  name: string;
+  status: string;
+  level: string;
+  levelValue: string;
+  degree: string;
+  route: string;
+  duration: string;
+  minimumHours: string;
+  maxFunding: string;
+  larsCode: string;
+  eqaProvider: string;
+  sourceUrl: string;
+  approvedForDelivery: string;
+  dateUpdated: string;
+  lastSynced: string;
+  knowledge: number;
+  skills: number;
+  behaviours: number;
+  total: number;
+  sampleKsbs?: CurriculumStandardKsb[];
+  ksbs?: CurriculumStandardKsb[];
+}
+
+export interface CurriculumKsbTraceMapping {
+  mapping_id: string;
+  mappingId: string;
+  programme_id: string;
+  programmeId: string;
+  programme_name: string;
+  programmeName: string;
+  module_id: string;
+  moduleId: string;
+  module_name: string;
+  moduleName: string;
+  group_id?: string;
+  groupId?: string;
+  group_name?: string;
+  groupName?: string;
+  group?: string;
+  groups?: string[];
+  week_id: string;
+  weekId: string;
+  week_name: string;
+  weekName: string;
+  component_id: string;
+  componentId: string;
+  component_name: string;
+  componentName: string;
+  component_type: string;
+  componentType: string;
+  // Expected OTJH of the component this mapping sits on. Week/module-level
+  // mappings are not attached to a single component and report 0.
+  component_otjh?: number;
+  componentOtjh?: number;
+  ksb_id: string;
+  ksbId: string;
+  code: string;
+  description: string;
+  source_type: string;
+  sourceType: string;
+  source_id: string;
+  sourceId: string;
+  source_name?: string;
+  sourceName?: string;
+  source_label?: string;
+  sourceLabel?: string;
+  classification: 'main' | 'secondary' | 'possible' | string;
+  weight_class?: 'hard' | 'soft' | 'possible' | string;
+  weightClass?: 'hard' | 'soft' | 'possible' | string;
+  mapping_level?: 'module' | 'week' | 'component' | string;
+  mappingLevel?: 'module' | 'week' | 'component' | string;
+  weight: number;
+}
+
+export interface CurriculumKsbCoverageItem {
+  ksb_id: string;
+  ksbId: string;
+  coverage_key?: string;
+  coverageKey?: string;
+  code: string;
+  title: string;
+  description: string;
+  ksb_type: 'knowledge' | 'skill' | 'behaviour' | string;
+  ksbType: 'knowledge' | 'skill' | 'behaviour' | string;
+  source_type: string;
+  sourceType: string;
+  source_id: string;
+  sourceId: string;
+  source_name?: string;
+  sourceName?: string;
+  source_label?: string;
+  sourceLabel?: string;
+  raw_total_weight: number;
+  rawTotalWeight: number;
+  coverage_percentage: number;
+  coveragePercentage: number;
+  progress_bar_percentage: number;
+  progressBarPercentage: number;
+  occurrence_count: number;
+  occurrenceCount: number;
+  mapping_count: number;
+  mappingCount: number;
+  module_count: number;
+  moduleCount: number;
+  week_count: number;
+  weekCount: number;
+  component_count: number;
+  componentCount: number;
+  classification_summary: Record<string, { count: number; weight: number }>;
+  classificationSummary: Record<string, { count: number; weight: number }>;
+  mappings: CurriculumKsbTraceMapping[];
+}
+
+export interface CurriculumKsbCoverageSummaryBucket {
+  required: number;
+  // KSBs carrying any weight at all, and the weight summed across the bucket.
+  // There is no fully/partially-covered verdict: the weight is the fact.
+  mapped: number;
+  unmapped: number;
+  total_weight: number;
+}
+
+/** Where a coverage response read its required-KSB set from. */
+export interface CurriculumKsbCoverageSource {
+  type: string;
+  id: string;
+  /**
+   * 'programme' (the source stored on the programme row), 'module', 'request',
+   * 'programme-name' (matched by name), 'mappings-only', or 'all-profiles' when
+   * nothing identified a source and every profile's KSBs stood in.
+   */
+  origin: 'programme' | 'module' | 'request' | 'programme-name' | 'mappings-only' | 'all-profiles' | string;
+  required_count: number;
+  requiredCount: number;
+  source_name?: string;
+  sourceName?: string;
+  source_label?: string;
+  sourceLabel?: string;
+}
+
+export interface CurriculumKsbCoverageResponse {
+  scope: string;
+  identifier: string;
+  source?: CurriculumKsbCoverageSource;
+  summary: {
+    overall: CurriculumKsbCoverageSummaryBucket;
+    knowledge: CurriculumKsbCoverageSummaryBucket;
+    skills: CurriculumKsbCoverageSummaryBucket;
+    behaviours: CurriculumKsbCoverageSummaryBucket;
+  };
+  items: CurriculumKsbCoverageItem[];
+  heatmap: {
+    modules: Array<{ module_id: string; moduleId: string; module_name: string; moduleName: string }>;
+    rows: Array<{
+      ksb_id: string;
+      ksbId: string;
+      coverage_key?: string;
+      coverageKey?: string;
+      code: string;
+      title: string;
+      ksb_type: string;
+      ksbType: string;
+      source_type?: string;
+      sourceType?: string;
+      source_id?: string;
+      sourceId?: string;
+      source_name?: string;
+      sourceName?: string;
+      source_label?: string;
+      sourceLabel?: string;
+      total: number;
+      modules: Array<{ module_id: string; moduleId: string; module_name: string; moduleName: string; weight: number; mappings: CurriculumKsbTraceMapping[] }>;
+    }>;
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Scope achievement — Programme -> Cohort -> Group -> Module -> Week.
+//
+// Curriculum plans; learners consume. Every level of the hierarchy answers the
+// same two questions about itself and nothing else: who is assigned here, and
+// what have they actually achieved here. One response shape, one set of rules,
+// so a cohort's number and its programme's number mean the same thing.
+// ---------------------------------------------------------------------------
+
+export type CurriculumLearnerScope = 'programme' | 'cohort' | 'group' | 'module' | 'week' | 'component';
+
+/** Where a scope sits in the hierarchy, resolved server-side. */
+export interface CurriculumScopeLineage {
+  scope: CurriculumLearnerScope | string;
+  identifier: string;
+  /** Whether the scope record itself exists. An empty scope is not a missing one. */
+  found: boolean;
+  programmeId: string;
+  programmeName: string;
+  cohortId: string;
+  cohortName: string;
+  groupId: string;
+  groupName: string;
+  moduleCatalogueId: string;
+  moduleTitle: string;
+  weekId: string;
+  weekTitle: string;
+  componentId: string;
+  componentTitle: string;
+  /**
+   * Which level's roster this scope reports. A module/week/component has none of
+   * its own: the learners who meet it are the ones enrolment placed in the group
+   * that delivers it.
+   */
+  placementBasis: 'programme' | 'cohort' | 'group' | string;
+}
+
+/** One learner's OTJH inside one scope. */
+export interface CurriculumScopeOtjhLearner {
+  learnerId: number | string;
+  learnerName: string;
+  email: string;
+  cohort: string;
+  group: string;
+  /** What the modules of *this learner's group* add up to in this scope. */
+  plannedOtjh: number;
+  /**
+   * Where `plannedOtjh` came from. 'group' is the normal case. 'none' means no
+   * module in this scope is delivered to this learner's group. 'scope' means no
+   * placement matched any delivering group, so the whole scope stood in.
+   */
+  plannedBasis?: 'group' | 'none' | 'scope' | string;
+  /** Credited: declared hours where a reflection exists, expected hours otherwise. */
+  achievedOtjh: number;
+  /** The learner's own declared hours only. */
+  declaredOtjh: number;
+  completedActivityCount: number;
+  reflectionCount: number;
+  progressPercentage: number;
+  /** Whole-programme figures from `Learner.learners`, never a scope subtotal. */
+  programmeCompletedHours?: number | null;
+  programmeTargetHours?: number | null;
+}
+
+export interface CurriculumScopeOtjhAchievement {
+  componentCount: number;
+  learnerCount: number;
+  /**
+   * Everything this scope authored, counted once. Not a per-learner figure: a
+   * module belongs to one group, so a cohort running two groups holds two module
+   * instances and no learner is assigned both.
+   */
+  authoredTotal: number;
+  /** The average of what its learners are each assigned. */
+  plannedPerLearner: number;
+  /** The sum of what its learners are each assigned — the real denominator. */
+  plannedTotal: number;
+  /** The headline: hours actually achieved in this scope, across its learners. */
+  achievedTotal: number;
+  declaredTotal: number;
+  creditedFromExpectedTotal: number;
+  achievedPerLearnerAverage: number;
+  progressPercentage: number;
+  completedActivityCount: number;
+  reflectionCount: number;
+  learners: CurriculumScopeOtjhLearner[];
+  sources: Record<string, string>;
+}
+
+/** One KSB's achieved weight inside one scope — a row of the achieved heatmap. */
+export interface CurriculumScopeKsbAchievementRow {
+  code: string;
+  title: string;
+  /** The standard's wording, shown under the code in the achievement table. */
+  description?: string;
+  ksbType: string;
+  /**
+   * 'K' | 'S' | 'B'. `ksbType` is a word whose spelling varies by import
+   * ('Skill'/'Skills'/'skill'), so anything grouping or filtering by family
+   * uses this instead.
+   */
+  ksbTypeCode?: 'K' | 'S' | 'B' | string;
+  sourceType: string;
+  sourceId: string;
+  sourceLabel: string;
+  /** Authored weight for this KSB across this scope, counted once. */
+  plannedWeight: number;
+  /**
+   * What this scope's learners are between them assigned: the weight authored in
+   * each learner's own group, summed. The honest denominator, and not the same
+   * as `plannedWeight × learnerCount` once a scope spans several groups.
+   */
+  expectedWeightTotal: number;
+  achievedWeightTotal: number;
+  /** Each learner capped at the planned weight. What a percentage is taken of. */
+  cappedAchievedWeightTotal: number;
+  declaredReflectionWeightTotal: number;
+  /** How many learners this KSB is actually authored for in this scope. */
+  learnerCount: number;
+  learnersAchievedCount: number;
+  learnersCompleteCount: number;
+  achievementPercentage: number;
+  /**
+   * 'unmapped' — required by the KSB source but taught nowhere in this scope (a
+   * coverage gap). 'unplanned' — a learner consumed it but the scope never
+   * authored it at all. Two different facts.
+   */
+  status: 'complete' | 'in_progress' | 'not_started' | 'unmapped' | 'unplanned' | string;
+}
+
+/**
+ * One of Knowledge / Skills / Behaviours, rolled up. The per-KSB table answers
+ * "how is S4 going"; this answers the question asked before it — how each
+ * family is going, and which of them nothing has touched.
+ */
+export interface CurriculumScopeKsbTypeSummary {
+  type: 'knowledge' | 'skill' | 'behaviour' | string;
+  letter: 'K' | 'S' | 'B' | string;
+  label: string;
+  ksbCount: number;
+  /** This scope's own KSBs of this family — excludes 'unplanned'. */
+  requiredCount: number;
+  mappedCount: number;
+  /** Required by the KSB source but taught nowhere here: a curriculum gap. */
+  unmappedCount: number;
+  /** Earned by a learner but authored nowhere here. */
+  unplannedCount: number;
+  startedCount: number;
+  completeCount: number;
+  notStartedCount: number;
+  /** Required here, and no learner has earned any of it yet. */
+  missingCount: number;
+  learnersAchievedTotal: number;
+  plannedWeightTotal: number;
+  expectedWeightTotal: number;
+  achievedWeightTotal: number;
+  cappedAchievedWeightTotal: number;
+  progressPercentage: number;
+}
+
+export interface CurriculumScopeKsbAchievement {
+  learnerCount: number;
+  requiredCount: number;
+  ksbCount: number;
+  mappedCount: number;
+  unmappedCount: number;
+  unplannedCount: number;
+  startedCount: number;
+  completeCount: number;
+  notStartedCount: number;
+  /** This scope's own KSBs that no learner has earned any of yet. */
+  missingCount: number;
+  /** Knowledge / Skills / Behaviours, always all three and always in that order. */
+  byType: CurriculumScopeKsbTypeSummary[];
+  plannedWeightTotal: number;
+  expectedWeightTotal: number;
+  achievedWeightTotal: number;
+  cappedAchievedWeightTotal: number;
+  declaredReflectionWeightTotal: number;
+  progressPercentage: number;
+  learnersWithAchievement: number;
+  rows: CurriculumScopeKsbAchievementRow[];
+  sources: Record<string, string>;
+}
+
+export interface CurriculumScopeStructureCounts {
+  moduleCount: number;
+  weekCount: number;
+  componentCount: number;
+  ksbMappingCount: number;
+  /** Above one, the scope's authored totals and its per-learner totals differ. */
+  groupCount: number;
+}
+
+export interface CurriculumProgrammeAssignedLearner {
+  id: number | string;
+  name: string;
+  email: string;
+  programme: string;
+  programmeStatus: string;
+  cohort: string;
+  group: string;
+  /**
+   * The stable keys behind `cohort` and `group`. Enrolment captures a placement
+   * as free text and curriculum owns the records that text names; these are the
+   * records it resolved to, so a renamed cohort or group no longer takes its
+   * learners off the rosters that used to find them by comparing names.
+   *
+   * Empty when the name never resolved to exactly one live record. Readers fall
+   * back to the name for those rows, which is what every row did before.
+   */
+  cohortId?: string;
+  groupId?: string;
+  lifecycleStatus: string;
+  coachName?: string;
+  coachEmail?: string;
+  completedHours?: number;
+  plannedHours?: number;
+  targetHours?: number;
+  progressHours?: number;
+  progressVariance?: string | number | null;
+  otjhStatus?: string;
+  // Reflection-declared OTJH, reported as its own fields. They do not replace
+  // `completedHours` / `plannedHours`, which cover the whole programme.
+  reflectionActualOtjh?: number | null;
+  reflectionExpectedOtjh?: number | null;
+  reflectionCount?: number;
+}
+
+export interface CurriculumLearnerKsbConsumptionItem {
+  code: string;
+  expectedWeight: number;
+  consumedWeight: number;
+  cappedConsumedWeight: number;
+  // What the learner's reflection declared for the same activity. Supplementary
+  // evidence, reported next to `consumedWeight` and never inside it.
+  declaredReflectionWeight?: number;
+  progressPercentage: number;
+  rawProgressPercentage: number;
+  status: 'complete' | 'in_progress' | 'not_started' | string;
+}
+
+export interface CurriculumLearnerKsbConsumption {
+  learnerId: number | string;
+  learnerName: string;
+  email: string;
+  cohort: string;
+  group: string;
+  consumedWeightTotal: number;
+  consumedWeightSource?: string;
+  declaredReflectionWeightTotal?: number;
+  expectedWeightTotal: number;
+  cappedConsumedWeightTotal: number;
+  progressPercentage: number;
+  ksbs: CurriculumLearnerKsbConsumptionItem[];
+}
+
+export interface CurriculumLearnerActivityKsb {
+  code: string;
+  weight: number;
+  weightClass?: string;
+  countsTowardAchievement: boolean;
+}
+
+export interface CurriculumLearnerActivityReflection {
+  submissionId: string | null;
+  status: string;
+  submittedAt: string;
+  dateCompleted: string;
+  text: string;
+  qualityScore: number | null;
+  actualOtjh: number | null;
+  actualOtjhSource: string;
+  declaredPlannedOtjh: number | null;
+  progressLinkStatus: 'linked' | 'unlinked' | string;
+  learnerResolution: string;
+  submissionLearnerId: string;
+  ksbRole: string;
+  countsTowardAchievement: false;
+}
+
+export interface CurriculumLearnerActivityEvidence {
+  evidenceId: string;
+  fileName: string;
+  status: string;
+  scanResult: string;
+  sectionRef: string;
+  componentId: string;
+  contentType: string;
+  sizeBytes: number | null;
+  uploadedAt: string;
+}
+
+/** One Progress activity, keyed on `learner_progress_entries.id`.
+ *
+ * The single identifier Learner, Coach and Curriculum share, so the same
+ * activity can be looked up in each layer instead of matched on titles, emails
+ * or enrolment source ids. `ksbSnapshot` is the canonical achieved weight;
+ * `declaredReflectionKsbs` is what the reflection claimed for the same activity.
+ * They are separate lists on purpose — summing both double-counts the activity.
+ */
+export interface CurriculumLearnerActivity {
+  progressId: number;
+  learnerId: number | string | null;
+  kind: string;
+  componentId: string;
+  componentTitle: string;
+  componentType: string;
+  /** Resolved live against the catalogue, not the label stored on the progress row. */
+  module: string;
+  /**
+   * Whether that module is still in the catalogue. 'deleted' means it was
+   * removed; 'unknown' means the component no longer resolves to one at all.
+   * Empty for an activity with no progress row behind it.
+   */
+  moduleStatus?: 'live' | 'deleted' | 'unknown' | string;
+  moduleCatalogueId?: string;
+  week: string;
+  /** Whether the activity belongs to the scope being reported on. */
+  scopeStatus?: 'in_scope' | 'out_of_scope' | 'unattributed' | string;
+  /**
+   * How it was placed there. 'component' — it is in this scope's live content.
+   * 'lineage' — that component is gone (deleted or re-authored), but the
+   * progress row was stamped with this scope when the learner completed it, so
+   * the work is still credited here rather than nowhere.
+   */
+  scopeBasis?: 'component' | 'lineage' | 'unfiltered' | 'none' | string;
+  /**
+   * Why an in-scope, completed activity still does not count. Currently only
+   * 'repeat_completion': the same component was completed before, and its hours
+   * and KSB weight were earned once.
+   */
+  exclusionReason?: 'repeat_completion' | string;
+  submittedAt: string;
+  progressStatus: 'achieved' | 'failed' | 'incomplete' | string;
+  passed: boolean | null;
+  countsTowardAchievement: boolean | null;
+  expectedOtjh: number | null;
+  expectedOtjhSource: string;
+  actualOtjh: number | null;
+  actualOtjhSource: string;
+  ksbSnapshot: CurriculumLearnerActivityKsb[];
+  achievedKsbWeightTotal: number;
+  declaredReflectionKsbs: CurriculumLearnerActivityKsb[];
+  declaredReflectionKsbWeightTotal: number;
+  reflection: CurriculumLearnerActivityReflection | null;
+  evidence: CurriculumLearnerActivityEvidence[];
+  evidenceCount: number;
+}
+
+// Learner placements are owned by the enrolment team. Curriculum reads this
+// roster to show who is arriving in a cohort/group and never writes to it.
+export interface CurriculumScopeLearnerRosterResponse {
+  scope: CurriculumLearnerScope | string;
+  identifier: string;
+  lineage: CurriculumScopeLineage;
+  placementBasis: CurriculumScopeLineage['placementBasis'];
+  source: string;
+  editable: boolean;
+  assignedLearnerCount: number;
+  assignedLearners: CurriculumProgrammeAssignedLearner[];
+  countsByCohort: Record<string, number>;
+  countsByGroup: Record<string, number>;
+}
+
+/** Retained name: the programme roster is the same read at the top scope. */
+export type CurriculumProgrammeLearnerRosterResponse = CurriculumScopeLearnerRosterResponse;
+
+export interface CurriculumScopeLearnerKsbImpactResponse {
+  scope: CurriculumLearnerScope | string;
+  identifier: string;
+  lineage: CurriculumScopeLineage;
+  placementBasis: CurriculumScopeLineage['placementBasis'];
+  structure: CurriculumScopeStructureCounts;
+  assignedLearnerCount: number;
+  assignedLearners: CurriculumProgrammeAssignedLearner[];
+  /** Retained name; `coverage` is the scope-neutral alias for the same payload. */
+  programmeCoverage: CurriculumKsbCoverageResponse;
+  coverage: CurriculumKsbCoverageResponse;
+  /** Hours actually achieved in this scope — the OTJH roll-up. */
+  otjhAchievement: CurriculumScopeOtjhAchievement;
+  /** KSB weight actually earned in this scope — the achieved heatmap. */
+  ksbAchievement: CurriculumScopeKsbAchievement;
+  learnerKsbConsumption: CurriculumLearnerKsbConsumption[];
+  learnerActivities?: CurriculumLearnerActivity[];
+  learnerActivityCount?: number;
+  ksbAchievementPolicy?: {
+    achievedWeightSource: string;
+    reflectionKsbRole: string;
+    reflectionKsbCountsTowardAchievedWeight: boolean;
+    reflectionLearnerResolution: string;
+    expectedOtjhSource: string;
+    actualOtjhSource: string;
+    scopeAttribution?: string;
+    /** Whether activity with no component reference counted. Programme only. */
+    unattributedActivityCounts?: boolean;
+    expectedWeightBasis?: string;
+    plannedOtjhBasis?: string;
+  };
+  consumptionSources: {
+    // Achieved delivery only. Failed activity and unresolved graded attempts are
+    // reported separately below so they stay visible without being summed as
+    // achievement — see backend learner_api/progress_rules.py.
+    progress: Array<Record<string, unknown>>;
+    // Resolved through `progress_entry_id`. Every row carries
+    // `countsTowardAchievement: false`: a reflection is evidence about an
+    // activity, not a second source of achieved KSB weight.
+    learningReflectionSubmissions: Array<Record<string, unknown>>;
+    excludedProgress?: Array<Record<string, unknown>>;
+    excludedLearningReflectionSubmissions?: Array<Record<string, unknown>>;
+    // Reflections on a component in this programme with no progress link, so no
+    // learner can be resolved without guessing. Reported as a visible gap.
+    unlinkedLearningReflectionSubmissions?: Array<Record<string, unknown>>;
+    // Achieved activity belonging to a different scope in the same programme.
+    // Reported so the gap between this scope's total and the learner's programme
+    // total is inspectable rather than an unexplained shortfall.
+    outOfScopeProgress?: Array<Record<string, unknown>>;
+    evidenceByProgressEntry?: Record<string, CurriculumLearnerActivityEvidence[]>;
+  };
+}
+
+/** Retained name: the programme impact is the same read at the top scope. */
+export type CurriculumProgrammeLearnerKsbImpactResponse = CurriculumScopeLearnerKsbImpactResponse;
+
+export interface CurriculumReadinessIssue {
+  severity: 'warning' | 'error' | string;
+  code: string;
+  raw_weight: number;
+  rawWeight: number;
+  message: string;
+}
+
+export interface CurriculumReadinessResponse {
+  ready: boolean;
+  canSaveDraft: boolean;
+  issues: CurriculumReadinessIssue[];
+  summary?: CurriculumKsbCoverageResponse['summary'];
+}
+
+export type CurriculumKsbMappingInput = {
+  id?: string;
+  ksbId?: string;
+  code: string;
+  description?: string;
+  sourceType: 'standard' | 'framework' | string;
+  sourceId: string;
+  classification: 'main' | 'secondary' | 'possible' | string;
+  type?: 'main' | 'secondary' | 'possible' | string;
+  weight: number;
+  weightClass: 'hard' | 'soft' | 'possible' | string;
+  weight_class?: 'hard' | 'soft' | 'possible' | string;
+};
+
+export interface CurriculumComponentKsbMappingsResponse {
+  componentId: string;
+  count: number;
+  results: CurriculumKsbTraceMapping[];
+}
+
+export type CurriculumKsbItemInput = {
+  id?: string | number;
+  type: 'K' | 'S' | 'B';
+  code: string;
+  parentCode?: string;
+  title: string;
+  description?: string;
+  displayOrder?: number;
+};
+
+export type CurriculumKsbFrameworkInput = {
+  name?: string;
+  ksbProfileId?: string;
+  standardSourceId?: string;
+  programmeId?: string;
+  programmeIds?: string[];
+  cohortIds?: string[];
+  groupIds?: string[];
+  moduleCatalogueIds?: string[];
+  programmeName?: string;
+  programme?: string;
+  description?: string;
+  notes?: string;
+  isActive?: boolean;
+  ksbItems?: CurriculumKsbItemInput[];
+  knowledgeCodes?: string[];
+  skillCodes?: string[];
+  behaviourCodes?: string[];
+};
+
+export interface CurriculumCohort {
+  id: string;
+  name: string;
+  programme: string;
+  programmeId: string;
+  startDate: string;
+  /** End of the practical period. practicalEndDate is the same date under the name the apprenticeship model uses. */
+  endDate: string;
+  practicalEndDate?: string;
+  /** End Point Assessment window in whole months. null means none recorded, which is not the same as 0. */
+  epaMonths?: number | null;
+  /** The date the apprenticeship ends: apprenticeshipEndOverride when set, otherwise practical end date plus epaMonths. */
+  apprenticeshipEndDate?: string;
+  /** Manually authored apprenticeship end date. Empty when the date is calculated. */
+  apprenticeshipEndOverride?: string;
+  durationMonths?: string | number;
+  /**
+   * The duration rule alone (start plus duration, less a day), before the
+   * holiday extension the practical end date already includes. Compare the two
+   * to tell whether holidays moved this cohort's dates.
+   */
+  baseEndDate?: string;
+  status: 'active' | 'planned' | 'completed' | 'archived' | string;
+  learners: number;
+  groups: string[];
+  modules: string[];
+  sessions: number;
+  color: string;
+  progress: number;
+  attendance: number;
+  /** The holidays that actually apply: every one in the cohort's period, less excludedHolidayIds. */
+  holidayIds?: Array<string | number>;
+  /** The holidays a human unticked in the cohort drawer, from the same in-period list. */
+  excludedHolidayIds?: Array<string | number>;
+  /** When the record was first written. Blank on rows predating the column. */
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface CurriculumGroup {
+  id: string;
+  name: string;
+  cohortId: string;
+  cohort: string;
+  programme: string;
+  programmeId?: string;
+  learners: number;
+  coach: string;
+  tutor: string;
+  startDate: string;
+  endDate: string;
+  status: string;
+  weekDays?: string;
+  startTime?: string;
+  endTime?: string;
+  schedule: string;
+  color?: string;
+  mode: string;
+  moduleIds?: string[];
+  modules: string[];
+  sessions: number;
+  /** When the record was first written. Blank on rows predating the column. */
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface CurriculumSession {
+  id: string;
+  trainingPlanId: number | string;
+  programmeId?: string;
+  programmeSourceId?: string;
+  cohortId?: string;
+  groupId?: string;
+  moduleId?: string;
+  moduleCatalogueId?: string;
+  weekId?: string;
+  deliveryRowId?: number | string;
+  // Temporary compatibility: prefer moduleCatalogueId when present.
+  deliveryModuleId?: string;
+  legacyModuleId?: string;
+  invalidModuleCatalogueId?: string;
+  componentId?: string;
+  title: string;
+  type: string;
+  date: string;
+  day: string;
+  startTime: string;
+  endTime: string;
+  tutor: string;
+  group: string;
+  cohort: string;
+  programme: string;
+  venue: string;
+  module: string;
+  week: number;
+  skippedHolidays?: string[];
+  scheduleWarnings?: string[];
+  status: 'scheduled' | 'completed' | 'cancelled' | 'pending' | string;
+  ksbCodes: string[];
+}
+
+/**
+ * Teams meeting state for one module, from `curriculum.live_sessions`.
+ *
+ * The meeting is never stored on the module row — it lives in its own table,
+ * keyed by module. Listing pages read this instead of pulling every module's
+ * full week structure just to inspect a live-session component's settings.
+ */
+export interface CurriculumTeamsMeetingSummary {
+  moduleCatalogueId: string;
+  liveSessionId: string;
+  status: string;
+  moduleTitle?: string;
+  joinUrl: string;
+  webLink?: string;
+  meetingOptionsUrl?: string;
+  eventId?: string;
+  onlineMeetingId?: string;
+  organizerEmail: string;
+  presenters?: string[];
+  /** People who run the meeting alongside the organizer: they can manage the
+   *  recording, the lobby and the meeting options without owning the calendar. */
+  coOrganizers?: string[];
+  attendees?: string[];
+  repeatPattern: string;
+  startDateTime: string;
+  durationMinutes: number;
+  occurrenceCount: number;
+  upcomingCount: number;
+  syncedCount: number;
+  nextOccurrence: string;
+  updatedAt: string;
+  /** Only present when asked for: the dates Teams currently holds, in order. */
+  occurrenceDates?: string[];
+  /**
+   * Only present when `occurrenceDates` was asked for: the backend's own
+   * verdict on whether the tracked Teams occurrences still match the module's
+   * *current* plan — computed against the authoring rows, not the (possibly
+   * cached) session list this page also reads. `'unverified'` means the
+   * comparison could not be made safely (a Neon read failed, the module row is
+   * gone, nothing is tracked yet) and must never be shown as agreement.
+   */
+  syncState?: 'in-sync' | 'out-of-sync' | 'no-sessions' | 'unverified';
+  syncReasons?: string[];
+  expectedOccurrenceCount?: number;
+  differingOccurrenceCount?: number;
+  missingFromTeams?: string[];
+  extraInTeams?: string[];
+}
+
+/** One scheduled instance of a live-session series. `status` is authored by the
+ *  Graph artifact-sync service — never derived from a date on the client. */
+export interface CurriculumLiveSessionOccurrence {
+  occurrenceId: string;
+  liveSessionId: string;
+  moduleCatalogueId: string;
+  sessionNumber: number;
+  status: string; // 'scheduled' | 'completed' | 'cancelled' | ...
+  scheduledStart: string;
+  scheduledEnd: string;
+  actualStart: string;
+  actualEnd: string;
+  participantCount: number;
+  joinUrl: string;
+  attendanceReportId: string;
+  artifactsSyncedAt: string;
+}
+
+export interface CurriculumLiveSessionSeries {
+  liveSessionId: string;
+  moduleCatalogueId: string;
+  moduleTitle?: string;
+  status: string;
+  joinUrl: string;
+  provider?: string;
+}
+
+export interface CurriculumLiveSessionOccurrencesResponse {
+  series: CurriculumLiveSessionSeries[];
+  occurrences: CurriculumLiveSessionOccurrence[];
+}
+
+/** A completed occurrence's captured artifacts (transcript / recording). */
+export interface LiveSessionArtifact {
+  id: string;
+  occurrence_id: string;
+  artifact_type: string; // 'transcript' | 'recording'
+  graph_artifact_id?: string;
+  content_url?: string;
+  created_datetime?: string;
+  end_datetime?: string;
+  metadata?: Record<string, unknown>;
+}
+
+/** One attendee row for a completed occurrence. */
+export interface LiveSessionAttendance {
+  id: string;
+  occurrence_id: string;
+  email?: string;
+  display_name?: string;
+  role?: string;
+  total_attendance_seconds?: number;
+  intervals?: Array<Record<string, unknown>>;
+  raw_data?: Record<string, unknown>;
+  expected?: boolean;
+  attended?: boolean;
+  join_count?: number;
+  attendance_report_id?: string;
+  attendance_report_start?: string;
+  attendance_report_end?: string;
+}
+
+/** An occurrence enriched with its attendance + artifacts (from the per-series
+ *  artifacts endpoint), loaded lazily when a completed row is expanded. */
+export interface LiveSessionArtifactOccurrence {
+  id: string;
+  live_session_id: string;
+  session_number?: number;
+  status?: string;
+  scheduled_start?: string;
+  scheduled_end?: string;
+  actual_start?: string;
+  actual_end?: string;
+  participant_count?: number;
+  join_url?: string;
+  attendance?: LiveSessionAttendance[];
+  artifacts?: LiveSessionArtifact[];
+}
+
+export interface LiveSessionArtifactsResponse {
+  series: Record<string, unknown>;
+  occurrences: LiveSessionArtifactOccurrence[];
+}
+
+/**
+ * Occurrence statuses that no longer stand for a meeting on the calendar.
+ *
+ * Shrinking a series marks its leftover rows cancelled rather than deleting
+ * them, so those rows are the record of what Teams *used* to hold. Counted as
+ * current they shift a session-by-session comparison by a slot, which is what
+ * made "Teams still holds ..." survive every press of Update Teams calendar.
+ * The same set the backend's sync verdict has always excluded.
+ */
+const OFF_CALENDAR_OCCURRENCE_STATUSES = new Set([
+  'cancelled', 'canceled', 'declined', 'deleted', 'removed',
+]);
+
+/** The tracked occurrences that still stand for a meeting on the calendar. */
+export function onCalendarOccurrences<T extends { status?: string }>(
+  occurrences: T[] | undefined,
+): T[] {
+  return (occurrences || []).filter(item => (
+    !OFF_CALENDAR_OCCURRENCE_STATUSES.has(String(item?.status || '').trim().toLowerCase())
+  ));
+}
+
+/**
+ * One holiday on the curriculum calendar, from either of its two sources.
+ *
+ * `/curriculum/holidays/` serves both in this one shape:
+ *
+ * - `source: 'gov.uk'` — an England and Wales bank holiday, mirrored from
+ *   https://www.gov.uk/bank-holidays.json. A single day, so `startDate` and
+ *   `endDate` are equal. Read-only: it changes when GOV.UK changes it.
+ * - `source: 'authored'` — one of this college's own closure periods, added on
+ *   the Holidays page. These usually span a *range*, which is why every holiday
+ *   carries a start and an end.
+ *
+ * Everything downstream measures the period and does not care which it is: a day
+ * is closed or it is not.
+ */
+export interface CurriculumHoliday {
+  id: string | number;
+  label: string;
+  startDate: string;
+  endDate: string;
+  type?: string;
+  color?: string;
+  /** Which of the two calendars this came from. Only an authored one can be edited. */
+  source?: 'gov.uk' | 'authored';
+  /** GOV.UK rows only, and only ever 'Substitute day' — the holiday moved off a weekend. */
+  notes?: string;
+  /** GOV.UK rows only: whether the day is marked as a flag-flying one. */
+  bunting?: boolean;
+}
+
+/** The fields the Holidays page writes. Only an authored holiday accepts them. */
+export type CurriculumHolidayInput = Partial<Pick<CurriculumHoliday, 'label' | 'startDate' | 'endDate' | 'type' | 'color'>>;
+
+/** One holiday as a recorded GOV.UK check reports it. */
+export interface EnglandHolidayChange {
+  id: string;
+  title: string;
+  date: string;
+  notes?: string;
+  bunting?: boolean;
+  /** Moves only: the date this holiday used to fall on. */
+  previousDate?: string;
+  /** Changes only: the title, note and bunting flag as they were before. */
+  previous?: { title?: string; notes?: string; bunting?: boolean };
+}
+
+/**
+ * One recorded check against GOV.UK — the answer to "what changed on the site?".
+ *
+ * A check that found nothing is recorded too, and matters: without it the last
+ * real change reads as the last time anyone looked.
+ */
+export interface EnglandHolidaySync {
+  id: string;
+  checkedAt: string;
+  /** 'auto' (the background refresh), 'manual' (the button), 'command' (the CLI). */
+  source: string;
+  status: 'ok' | 'error' | string;
+  feedCount: number;
+  added: EnglandHolidayChange[];
+  changed: EnglandHolidayChange[];
+  /** Holidays GOV.UK moved to a different date. */
+  moved: EnglandHolidayChange[];
+  /** Holidays GOV.UK withdrew. They are removed here too. */
+  withdrawn: EnglandHolidayChange[];
+  /** Dates that fell off the back of GOV.UK's rolling window. Kept, not removed. */
+  agedOut: EnglandHolidayChange[];
+  /** Why a failed check failed. */
+  message: string;
+}
+
+/** How current the GOV.UK mirror is, and when it refreshes itself next. */
+export interface EnglandHolidaySyncStatus {
+  autoSync: boolean;
+  intervalHours: number;
+  lastCheckedAt: string;
+  lastSuccessAt: string;
+  nextCheckDueAt: string;
+  source: string;
+}
+
+// GOV.UK's published bank holidays, mirrored into the curriculum schema. Read
+// only: these are not authored here, unlike CurriculumHoliday above.
+export interface EnglandHoliday {
+  id: string;
+  division: string;
+  title: string;
+  date: string;
+  // Only ever 'Substitute day' — the holiday moved because the real date fell
+  // on a weekend.
+  notes: string;
+  bunting: boolean;
+  fetchedAt?: string;
+}
+
+export interface CurriculumCohortAuthoringDetail {
+  cohortId: string;
+  cohortName: string;
+  programmeId: string;
+  programmeName: string;
+  startDate: string;
+  endDate: string;
+  practicalEndDate?: string;
+  epaMonths?: number | null;
+  apprenticeshipEndDate?: string;
+  apprenticeshipEndOverride?: string;
+  durationMonths: number;
+  color: string;
+  status: string;
+  moduleCatalogueIds?: string[];
+  trainingPlanIds?: string[];
+  groupIds: string[];
+  moduleNames: string[];
+  holidayIds: string[];
+  selectedHolidays: CurriculumHoliday[];
+  holidaysInRange: CurriculumHoliday[];
+  excludedHolidayIds: string[];
+  holidaySummary: {
+    global?: number;
+    inRange?: number;
+    selected?: number;
+  };
+  notes?: string;
+  sourceType?: string;
+  sourceId?: string;
+  updatedAt?: string;
+}
+
+export interface CurriculumStaffProfile {
+  id?: string | number;
+  role?: 'coach' | 'tutor' | string;
+  name?: string;
+  email?: string;
+  phone?: string;
+  jobTitle?: string;
+  status?: string;
+  specialisms?: string[];
+  assignedModuleIds?: string[];
+  assignedGroupIds?: string[];
+  assignedModules?: Array<Pick<CurriculumModule, 'id' | 'moduleId' | 'moduleCatalogueId' | 'deliveryRowId' | 'name' | 'programmeId' | 'programme' | 'cohortId' | 'cohort' | 'groupId' | 'group' | 'startDate' | 'endDate' | 'status'>>;
+  inProgressModules?: Array<Pick<CurriculumModule, 'id' | 'moduleId' | 'moduleCatalogueId' | 'deliveryRowId' | 'name' | 'programmeId' | 'programme' | 'cohortId' | 'cohort' | 'groupId' | 'group' | 'startDate' | 'endDate' | 'status'>>;
+  groupCount?: number;
+  moduleCount?: number;
+  inProgressCount?: number;
+  notes?: string;
+  [key: string]: unknown;
+}
+
+export type CurriculumAuditAction = 'created' | 'updated' | 'archived';
+
+export interface CurriculumAuditEvent {
+  id: string;
+  /** ISO stamp of the write itself, not a display date. */
+  at: string;
+  action: CurriculumAuditAction;
+  entity: 'programme' | 'module' | 'week' | 'component' | 'cohort' | 'group' | string;
+  entityLabel: string;
+  entityId: string;
+  title: string;
+  /** The record's parent - a programme name, or a module catalogue id. */
+  context: string;
+  /**
+   * The write handler's reason code on an archive (`component-delete`,
+   * `programme-archive`). It is NOT a person: no authoring table records an
+   * author, which is what `authorRecorded: false` states.
+   */
+  reason: string;
+  viaParent: string;
+  href: string;
+}
+
+export interface CurriculumAuditTrail {
+  generatedAt: string;
+  windowDays: number;
+  since: string;
+  limit: number;
+  total: number;
+  truncated: boolean;
+  actionCounts: Record<CurriculumAuditAction, number>;
+  entityCounts: Record<string, number>;
+  /** Entities whose table could not be read, so the page can name the gap. */
+  unreadable: string[];
+  /** Always false today: the authoring tables carry no author column. */
+  authorRecorded: boolean;
+  events: CurriculumAuditEvent[];
+}
+
+export type CurriculumVersionEntityType = 'module' | 'week' | 'component';
+export type CurriculumRevisionAction = 'created' | 'updated' | 'archived' | 'restored';
+
+/** One field that moved between two revisions. Long values are cut server-side. */
+export interface CurriculumFieldChange {
+  field: string;
+  from: string;
+  to: string;
+  truncated?: boolean;
+}
+
+export interface CurriculumRevision {
+  id: number;
+  entityType: CurriculumVersionEntityType | string;
+  entityId: string;
+  revisionNo: number;
+  action: CurriculumRevisionAction | string;
+  moduleCatalogueId: string;
+  parentId: string;
+  title: string;
+  versionLabel: string;
+  contentStatus: string;
+  changedFields: CurriculumFieldChange[];
+  /** The signed-in account that saved. Empty for a write with no session. */
+  actorName: string;
+  actorEmail: string;
+  /** Only set on an archive: the write handler's reason code. */
+  reason: string;
+  at: string;
+}
+
+/** A revision an author named — a component moving to 0.2, a module published. */
+export interface CurriculumNamedVersion {
+  id: number;
+  versionLabel: string;
+  revisionNo: number;
+  contentStatus: string;
+  note: string;
+  actorName: string;
+  at: string;
+}
+
+export interface CurriculumVersionEntity {
+  entityType: CurriculumVersionEntityType | string;
+  entityId: string;
+  title: string;
+  moduleCatalogueId: string;
+  parentId: string;
+  versionLabel: string;
+  contentStatus: string;
+  action: string;
+  revisions: number;
+  namedVersions: number;
+  lastChangeAt: string;
+  firstChangeAt: string;
+  lastActorName: string;
+}
+
+export interface CurriculumVersionIndex {
+  /** False when the history tables have not been created; `reason` says so. */
+  available: boolean;
+  reason?: string;
+  generatedAt?: string;
+  totalRevisions: number;
+  totalNamedVersions: number;
+  count: number;
+  entities: CurriculumVersionEntity[];
+}
+
+export interface CurriculumRecordHistory {
+  available: boolean;
+  reason?: string;
+  entityType: string;
+  entityId: string;
+  title: string;
+  moduleCatalogueId?: string;
+  versions: CurriculumNamedVersion[];
+  revisions: CurriculumRevision[];
+  /** Populated only when a revision number was asked for: its stored content. */
+  snapshot: { revisionNo: number; at: string; content: Record<string, unknown> } | null;
+}
+
+export interface CurriculumOverview {
+  schema: string;
+  stats: {
+    programmes: number;
+    activeProgrammes: number;
+    cohorts: number;
+    groups: number;
+    modules: number;
+    ksbFrameworks: number;
+    sessions: number;
+  };
+  programmes: CurriculumProgramme[];
+  modules: CurriculumModule[];
+  ksbFrameworks: CurriculumKsbFramework[];
+  ksbSets: CurriculumKsbSet[];
+  cohorts: CurriculumCohort[];
+  groups: CurriculumGroup[];
+  sessions: CurriculumSession[];
+  components?: CurriculumComponent[];
+  holidays?: CurriculumHoliday[];
+  cohortAuthoringDetails?: CurriculumCohortAuthoringDetail[];
+  tutors?: CurriculumStaffProfile[];
+  coaches?: CurriculumStaffProfile[];
+}
+
+export interface FreeProgrammeComponent {
+  id: string;
+  moduleId?: string;
+  weekId?: string;
+  displayOrder: number;
+  type: string;
+  title: string;
+  description: string;
+  expectedOtjh: number;
+  points: number;
+  reflectionRequired: boolean;
+  workplaceEvidenceRequired: boolean;
+  tutorValidationRequired: boolean;
+  settings?: Record<string, unknown>;
+}
+
+export interface FreeProgrammeModule {
+  id: string;
+  courseId?: string;
+  weekId?: string;
+  weekNumber?: number;
+  weekTitle?: string;
+  programmeId?: string;
+  programmeName?: string;
+  courseName?: string;
+  title: string;
+  description: string;
+  coverImageUrl?: string;
+  weekBuilderWeekIds?: string[];
+  displayOrder: number;
+  componentCount: number;
+  totalOtjh: number;
+  components: FreeProgrammeComponent[];
+}
+
+export interface CurriculumProgrammeDetail {
+  schema: string;
+  programme: CurriculumProgramme;
+  cohorts: Array<CurriculumCohort & { groups: Array<CurriculumGroup & { modules: CurriculumModule[] }> }>;
+  flat: {
+    cohorts: CurriculumCohort[];
+    groups: CurriculumGroup[];
+    groupIds: string[];
+    modules: CurriculumModule[];
+    sessions: CurriculumSession[];
+    components?: CurriculumComponent[];
+    weekTemplates?: unknown[];
+  };
+}
+
+export interface CurriculumSessionPlanPreview {
+  sessions: Array<{ sessionNumber: number; date: string; day: string; startTime?: string; endTime?: string; durationMinutes?: number; skippedHolidays: string[] }>;
+  skippedHolidays: string[];
+  finalEndDate: string;
+  warnings: string[];
+}
+
+/** One holiday's share of a cohort's end-date extension. */
+export interface CurriculumHolidayExtension {
+  label: string;
+  /** The first and last day of this holiday that fell inside the cohort's period. */
+  startDate: string;
+  endDate: string;
+  days: number;
+}
+
+export interface CurriculumCohortEndDatePreview {
+  endDate: string;
+  practicalEndDate?: string;
+  /** What the duration rule gives plus the holiday extension, regardless of any practical end date sent in. */
+  calculatedEndDate?: string;
+  /** The duration rule alone, before holidays. The holiday picker's window. */
+  baseEndDate?: string;
+  /** Days the selected holidays take out of the cohort's base period. */
+  holidayExtensionDays?: number;
+  /** Which holiday took which days, for an editor that names them. */
+  holidayExtensions?: CurriculumHolidayExtension[];
+  /** The contracted duration in months, unchanged by holidays. */
+  durationMonths?: number;
+  /** How long the cohort actually runs once the holidays are in. */
+  effectiveDurationMonths?: number;
+  /** True when the practical end date sent in differs from the calculated one. */
+  practicalEndIsManual?: boolean;
+  epaMonths?: number | null;
+  apprenticeshipEndDate?: string;
+  apprenticeshipEndOverride?: string;
+  autoCalculated: boolean;
+  rule: string;
+  epaRule?: string;
+  apprenticeshipRule?: string;
+  warnings: string[];
+}
+
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '/curriculum_api';
+
+interface CurriculumCollection<T> {
+  schema: string;
+  count: number;
+  results: T[];
+}
+
+// Multi-tier cache: hot cache for recent requests, cold cache for longer TTLs
+interface CacheEntry<T> {
+  value: T;
+  expiresAt: number;
+  hitCount: number;
+  createdAt: number;
+  entityType?: string; // 'programme', 'cohort', 'module', etc. for targeted invalidation
+  entityId?: string;   // the programme/cohort/module ID for invalidation scoping
+}
+
+// Cache tier configuration: TTL and size limits by data category
+const CACHE_TIERS = {
+  // Reference data: frameworks, standards, component types (rarely change)
+  metadata: { ttlMs: 300_000, maxEntries: 200 }, // 5 minutes
+  // Programme trees: structure with cohorts/groups/modules (changes with save)
+  programmeTree: { ttlMs: 60_000, maxEntries: 50 }, // 1 minute (per programme)
+  // Module structures: week/component hierarchies (large, changes with authoring)
+  moduleStructure: { ttlMs: 120_000, maxEntries: 100 }, // 2 minutes
+  // KSB coverage and impact analysis (computed, medium volatility)
+  ksbAnalysis: { ttlMs: 90_000, maxEntries: 50 }, // 1.5 minutes
+  // Dynamic lists: tutors, coaches, sessions (may change frequently)
+  dynamic: { ttlMs: 45_000, maxEntries: 100 }, // 45 seconds
+  // Default tier for other GET requests
+  default: { ttlMs: 30_000, maxEntries: 200 }, // 30 seconds
+} as const;
+
+// Cache statistics for observability
+interface CacheStats {
+  hits: number;
+  misses: number;
+  evictions: number;
+  totalSize: number;
+  entries: number;
+}
+
+class MultiTierCache {
+  private caches = new Map<keyof typeof CACHE_TIERS, Map<string, CacheEntry<unknown>>>();
+  private inFlightRequests = new Map<string, Promise<unknown>>();
+  private inFlightEpochs = new Map<string, number>();
+  private stats = new Map<keyof typeof CACHE_TIERS, CacheStats>();
+
+  constructor() {
+    for (const tier of Object.keys(CACHE_TIERS) as Array<keyof typeof CACHE_TIERS>) {
+      this.caches.set(tier, new Map());
+      this.stats.set(tier, { hits: 0, misses: 0, evictions: 0, totalSize: 0, entries: 0 });
+    }
+  }
+
+  private getTier(path: string): keyof typeof CACHE_TIERS {
+    if (path.includes('/standards/') || path.includes('/frameworks/') || path.includes('/component-types')) {
+      return 'metadata';
+    }
+    if (path.includes('/programmes/') && path.includes('/detail/')) {
+      return 'programmeTree';
+    }
+    if (path.includes('/modules/') && !path.includes('/ksb-') && !path.includes('/coverage')) {
+      return 'moduleStructure';
+    }
+    if (path.includes('/ksb-') || path.includes('/coverage') || path.includes('/impact')) {
+      return 'ksbAnalysis';
+    }
+    if (path.includes('/tutors') || path.includes('/coaches') || path.includes('/holidays') || path.includes('/sessions')) {
+      return 'dynamic';
+    }
+    return 'default';
+  }
+
+  private estimateSize(value: unknown): number {
+    if (typeof value === 'string') return value.length * 2;
+    if (typeof value === 'number') return 8;
+    if (typeof value === 'boolean') return 1;
+    if (value === null) return 0;
+    if (Array.isArray(value)) {
+      return 48 + value.reduce((sum, v) => sum + this.estimateSize(v), 0);
+    }
+    if (typeof value === 'object') {
+      try {
+        return JSON.stringify(value).length * 2;
+      } catch {
+        return 1024; // Conservative estimate for unserializable objects
+      }
+    }
+    return 0;
+  }
+
+  get<T>(path: string, options?: { skipCache?: boolean }): CacheEntry<T> | null {
+    if (options?.skipCache) return null;
+    const tier = this.getTier(path);
+    const cache = this.caches.get(tier);
+    const entry = cache?.get(path) as CacheEntry<T> | undefined;
+
+    if (!entry) {
+      const stats = this.stats.get(tier);
+      if (stats) stats.misses += 1;
+      return null;
+    }
+
+    if (entry.expiresAt > Date.now()) {
+      entry.hitCount += 1;
+      const stats = this.stats.get(tier);
+      if (stats) stats.hits += 1;
+      return entry;
+    }
+
+    // Expired entry
+    cache?.delete(path);
+    const stats = this.stats.get(tier);
+    if (stats) {
+      stats.evictions += 1;
+      stats.misses += 1;
+    }
+    return null;
+  }
+
+  set<T>(path: string, value: T, entityType?: string, entityId?: string): void {
+    const tier = this.getTier(path);
+    const cache = this.caches.get(tier);
+    if (!cache) return;
+
+    const tierConfig = CACHE_TIERS[tier];
+    const size = this.estimateSize(value);
+
+    // Evict LRU if cache full
+    if (cache.size >= tierConfig.maxEntries) {
+      let oldest: [string, CacheEntry<unknown>] | null = null;
+      for (const [key, entry] of cache) {
+        if (!oldest || entry.createdAt < oldest[1].createdAt) {
+          oldest = [key, entry];
+        }
+      }
+      if (oldest) {
+        cache.delete(oldest[0]);
+        const stats = this.stats.get(tier);
+        if (stats) stats.evictions += 1;
+      }
+    }
+
+    const entry: CacheEntry<T> = {
+      value,
+      expiresAt: Date.now() + tierConfig.ttlMs,
+      hitCount: 0,
+      createdAt: Date.now(),
+      entityType,
+      entityId,
+    };
+
+    cache.set(path, entry as CacheEntry<unknown>);
+    const stats = this.stats.get(tier);
+    if (stats) {
+      stats.entries = cache.size;
+      stats.totalSize += size;
+    }
+  }
+
+  // Invalidate cache entries by entity (e.g., save programme A → invalidate only programme A's tree)
+  invalidateByEntity(entityType: string, entityId?: string): number {
+    let count = 0;
+    for (const cache of this.caches.values()) {
+      for (const [key, entry] of cache) {
+        if (entry.entityType === entityType && (!entityId || entry.entityId === entityId)) {
+          cache.delete(key);
+          count += 1;
+        }
+      }
+    }
+    return count;
+  }
+
+  // Invalidate cache entries matching a pattern
+  invalidateByPattern(pattern: string | RegExp): number {
+    let count = 0;
+    for (const cache of this.caches.values()) {
+      for (const key of cache.keys()) {
+        const matches = typeof pattern === 'string' ? key.includes(pattern) : pattern.test(key);
+        if (matches) {
+          cache.delete(key);
+          count += 1;
+        }
+      }
+    }
+    return count;
+  }
+
+  clear(): void {
+    for (const cache of this.caches.values()) {
+      cache.clear();
+    }
+    this.inFlightRequests.clear();
+    this.inFlightEpochs.clear();
+    for (const stats of this.stats.values()) {
+      stats.hits = 0;
+      stats.misses = 0;
+      stats.evictions = 0;
+      stats.entries = 0;
+      stats.totalSize = 0;
+    }
+  }
+
+  getInFlight(key: string): Promise<unknown> | undefined {
+    return this.inFlightRequests.get(key);
+  }
+
+  // The mutation epoch a still-running GET was started in. A skipCache caller
+  // uses this to tell "already in flight, but started before my write landed"
+  // (must not be reused) from "in flight right now, after the write" (safe to
+  // share).
+  getInFlightEpoch(key: string): number | undefined {
+    return this.inFlightEpochs.get(key);
+  }
+
+  setInFlight(key: string, promise: Promise<unknown>, epoch: number): void {
+    this.inFlightRequests.set(key, promise);
+    this.inFlightEpochs.set(key, epoch);
+  }
+
+  clearInFlight(key: string): void {
+    this.inFlightRequests.delete(key);
+    this.inFlightEpochs.delete(key);
+  }
+
+  getStats() {
+    const result: Record<string, CacheStats> = {};
+    for (const [tier, stats] of this.stats) {
+      result[tier] = { ...stats };
+    }
+    return result;
+  }
+}
+
+const multiTierCache = new MultiTierCache();
+
+// Combines several abort signals into one. Prefers the native implementation and
+// falls back to a manual relay for older browsers.
+function anySignal(signals: AbortSignal[]): AbortSignal {
+  const nativeAny = (AbortSignal as unknown as { any?: (list: AbortSignal[]) => AbortSignal }).any;
+  if (typeof nativeAny === 'function') return nativeAny.call(AbortSignal, signals);
+  const controller = new AbortController();
+  const forward = (signal: AbortSignal) => {
+    if (signal.aborted) {
+      controller.abort(signal.reason);
+      return;
+    }
+    signal.addEventListener('abort', () => controller.abort(signal.reason), { once: true });
+  };
+  signals.forEach(forward);
+  return controller.signal;
+}
+
+// Incremented on every mutation. GETs record the epoch they started in so a
+// skipCache caller can tell whether an in-flight request already reflects the
+// most recent write (see fetchJson).
+let mutationEpoch = 0;
+
+// Shares an in-flight GET between concurrent callers. GETs are intentionally
+// not tied to component cleanup signals: React StrictMode can unmount/remount
+// immediately in development, and aborting those requests fills DevTools with
+// noisy "(cancelled)" rows even though the next mount needs the same data.
+/**
+ * The `/curriculum/preview/*` endpoints answer a question about what the form is
+ * currently holding -- where these session dates land, which tutors are free in
+ * this slot -- and write nothing. They are POSTs only because the question does
+ * not fit in a URL: the unsaved holidays, delivery days and dates go in a body.
+ *
+ * So they get a read's treatment, keyed on the question rather than on the path:
+ * the same body asked twice is one request, and the answer stands for a short
+ * while. Their URL is identical every time, which is why the multi-tier cache
+ * above -- keyed on path alone -- cannot hold them.
+ */
+const inFlightReads = new Map<string, Promise<unknown>>();
+const completedReads = new Map<string, { value: unknown; expiresAt: number }>();
+const READ_POST_TTL_MS = 30_000;
+const READ_POST_MAX_ENTRIES = 60;
+
+function isReadOnlyPost(method: string, path: string): boolean {
+  return method === 'POST' && path.startsWith('/curriculum/preview/');
+}
+
+export function clearCurriculumGetCache() {
+  multiTierCache.clear();
+  clearPreviewReads();
+}
+
+/**
+ * Throw away the preview answers.
+ *
+ * These are the only cached reads not held by `multiTierCache`, so every
+ * invalidation path has to say so twice or one of them keeps serving pre-write
+ * answers. The one that matters is tutor availability: it exists to stop a save
+ * being refused for a clash, and an answer cached from before somebody else took
+ * the slot tells the reader the tutor is free right up until the 409 says
+ * otherwise.
+ */
+function clearPreviewReads(): void {
+  completedReads.clear();
+  inFlightReads.clear();
+}
+
+export function invalidateCurriculumCacheByEntity(entityType: string, entityId?: string): number {
+  return multiTierCache.invalidateByEntity(entityType, entityId);
+}
+
+export function getCurriculumCacheStats() {
+  return multiTierCache.getStats();
+}
+
+/**
+ * A cached, de-duplicated GET for callers that hold their own response types.
+ *
+ * The module authoring layer had its own bare `fetch` for the structure
+ * endpoint, so its reads shared nothing: a workspace and a drawer open on the
+ * same module -- and each of them mounted twice under StrictMode -- each opened
+ * a separate request for identical bytes, and the slowest were still in flight
+ * when their 15s timeout aborted them. Going through `fetchJson` puts them on
+ * the one in-flight promise and the `moduleStructure` cache tier.
+ */
+export function fetchCurriculumJson<T>(path: string, init?: CurriculumRequestInit): Promise<T> {
+  return fetchJson<T>(path, init);
+}
+
+// Drops the cache entries a write to `path` makes wrong. Called both for this
+// tab's own mutations and for a mutation another tab broadcast, so the two tabs
+// throw away exactly the same entries.
+function applyMutationInvalidation(path: string): void {
+  // Every branch below drops these too. A preview is computed from the same
+  // rows a write just changed -- where these sessions land, which tutors are
+  // free -- and there is no path pattern that separates the ones a given write
+  // spoils from the ones it does not. They cost one small POST to rebuild and
+  // live 30s, so throwing the lot away is both correct and cheap.
+  clearPreviewReads();
+  // For mutations, invalidate cache selectively based on the endpoint
+  if (path.includes('/programmes/tree/')) {
+    // Tree save: invalidate all programme trees and related data
+    multiTierCache.invalidateByPattern(/\/overview\//);
+    multiTierCache.invalidateByPattern(/\/programmes\/.*\/detail\//);
+    multiTierCache.invalidateByEntity('programme');
+    multiTierCache.invalidateByEntity('cohort');
+    multiTierCache.invalidateByEntity('group');
+    multiTierCache.invalidateByEntity('module');
+  } else if (path.includes('/programmes/')) {
+    multiTierCache.invalidateByPattern(/\/overview\//);
+    multiTierCache.invalidateByEntity('programme');
+    multiTierCache.invalidateByEntity('cohort');
+    multiTierCache.invalidateByEntity('group');
+    multiTierCache.invalidateByEntity('module');
+  } else if (path.includes('/cohorts/') || path.includes('/groups/') || path.includes('/modules/')) {
+    // The overview payload carries programmes, cohorts, groups AND modules in
+    // one document, and a programme's detail tree carries the same structure.
+    // Neither is tagged with an entity type, so an entity-scoped invalidation
+    // left both in place: creating a group refreshed the page you were on (that
+    // reload asks for fresh data explicitly) but the next page you opened read
+    // the pre-write overview out of cache and showed no new group until a full
+    // browser refresh threw the cache away.
+    multiTierCache.invalidateByPattern(/\/overview\//);
+    multiTierCache.invalidateByPattern(/\/programmes\/.*\/detail\//);
+    multiTierCache.invalidateByEntity('cohort');
+    multiTierCache.invalidateByEntity('group');
+    multiTierCache.invalidateByEntity('module');
+  } else if (path.includes('/ksb-')) {
+    multiTierCache.invalidateByEntity('ksb');
+  } else {
+    // Fallback: clear all caches for unknown mutations
+    multiTierCache.clear();
+  }
+}
+
+const CURRICULUM_WRITE_SCOPE = 'curriculum';
+
+// A page that wants to re-read when somebody else writes. Only remote writes
+// reach these listeners: the tab that saved already refreshes itself on the
+// save path, and firing here too would double every post-save read.
+const remoteWriteListeners = new Set<(path: string) => void>();
+
+/**
+ * The path a listener is given when the write was made outside this browser and
+ * only the epoch poll knows about it. There is no path to report -- the counter
+ * says that something changed, not what -- so a listener that filters on paths
+ * must let this one through.
+ */
+export const UNKNOWN_WRITE_PATH = '*';
+
+export function subscribeCurriculumRemoteWrites(listener: (path: string) => void): () => void {
+  remoteWriteListeners.add(listener);
+  startEpochPolling();
+  return () => {
+    remoteWriteListeners.delete(listener);
+    if (!remoteWriteListeners.size) stopEpochPolling();
+  };
+}
+
+function notifyRemoteWrite(path: string): void {
+  remoteWriteListeners.forEach(listener => {
+    try { listener(path); } catch { /* one bad listener must not stop the rest */ }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Noticing a write made on somebody else's machine.
+//
+// BroadcastChannel reaches the other tabs of this browser and no further, so a
+// colleague saving in another country changes nothing here: the only trigger
+// left is the reader coming back to the tab, and a tab that is simply left in
+// the foreground never fires it. Both screens then sit there quietly stale.
+//
+// So the server is asked, on a timer, for the one number that moves on every
+// write -- the same counter invalidate_curriculum_cache() bumps. It is a Redis
+// read with no database behind it, which is what makes polling it affordable at
+// all; a real payload could not be asked for this often.
+//
+// One timer for the whole tab, however many hooks are subscribed, and only
+// while the tab is visible: a backgrounded tab re-reads when it is looked at
+// again, and polling it in the meantime buys nothing.
+// ---------------------------------------------------------------------------
+
+const EPOCH_PATH = '/curriculum/cache-epoch/';
+// 10s rather than the 25s this shipped with. A reader watching a list
+// somebody else is editing waits half the interval on average, so this is
+// ~5s instead of ~12s. What it costs is one authenticated request per open
+// tab: two Redis GETs here, plus the single indexed LoginSession lookup
+// every request pays. The last_seen_at write is throttled to 5 minutes
+// (login/sessions.py), so polling faster adds reads, never writes.
+const EPOCH_POLL_INTERVAL_MS = 10_000;
+// The endpoint ships with the backend, and the frontend can be deployed ahead of
+// it. Rather than call a missing URL every few seconds for the life of the tab,
+// give up after a few failures and leave the return-to-tab refresh to cover it.
+const EPOCH_POLL_MAX_FAILURES = 3;
+// A hung read would otherwise leave the in-flight guard set for good and stop
+// the tab polling for the rest of its life.
+const EPOCH_READ_TIMEOUT_MS = 10_000;
+
+let epochPollTimer: ReturnType<typeof setInterval> | null = null;
+let epochVisibilityBound = false;
+let lastSeenEpoch: number | null = null;
+let epochFailures = 0;
+let epochPollingAbandoned = false;
+let epochReadInFlight = false;
+let quietResyncPending = false;
+
+function isDocumentVisible(): boolean {
+  return typeof document === 'undefined'
+    || typeof document.visibilityState !== 'string'
+    || document.visibilityState === 'visible';
+}
+
+/**
+ * `missing` separates the two ways this can fail, because only one of them is a
+ * reason to stop asking. A 404 means the backend does not have the endpoint --
+ * the frontend was deployed ahead of it -- and no amount of retrying will
+ * conjure it up. A dropped connection or a 502 means the server is restarting,
+ * which is exactly when a tab must keep its place and carry on afterwards.
+ */
+type EpochRead = { epoch: number | null; missing: boolean; changes: EpochChange[] };
+
+/**
+ * One entry from the server's log of what moved the counter: the path that was
+ * written, and the span of epochs `(lo, hi]` that write accounts for.
+ *
+ * Advisory. The counter is the fact; this is how a client avoids having to treat
+ * every write in the estate as "reload everything". An old backend sends none,
+ * a busy one may have dropped the oldest, and both cases have the same answer --
+ * see `changedPathsSince`.
+ */
+type EpochChange = { path: string; lo: number; hi: number };
+
+function parseEpochChanges(value: unknown): EpochChange[] {
+  if (!Array.isArray(value)) return [];
+  const parsed: EpochChange[] = [];
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object') continue;
+    const { path, lo, hi } = entry as { path?: unknown; lo?: unknown; hi?: unknown };
+    if (typeof path !== 'string') continue;
+    const low = Number(lo);
+    const high = Number(hi);
+    if (!Number.isFinite(low) || !Number.isFinite(high) || high <= low) continue;
+    parsed.push({ path, lo: low, hi: high });
+  }
+  return parsed;
+}
+
+/**
+ * The paths written between `previous` and `current`, or null when the log does
+ * not account for all of it.
+ *
+ * Null is the important half. The log is written without a lock, so a busy
+ * moment can drop an entry, and an entry that never arrives looks exactly like
+ * an epoch nobody wrote in. Refreshing only the paths that *are* named would
+ * then quietly skip the one that went missing, which is the stale screen this
+ * whole mechanism exists to prevent. So every epoch in the span has to be
+ * spoken for; one gap and the caller falls back to refreshing the lot.
+ */
+function changedPathsSince(previous: number, current: number, changes: EpochChange[]): string[] | null {
+  if (!changes.length) return null;
+  const paths = new Set<string>();
+  for (let epoch = previous + 1; epoch <= current; epoch += 1) {
+    const owner = changes.find(change => change.lo < epoch && epoch <= change.hi);
+    if (!owner) return null;
+    paths.add(owner.path);
+  }
+  return [...paths];
+}
+
+async function readCurriculumEpoch(): Promise<EpochRead> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), EPOCH_READ_TIMEOUT_MS);
+  try {
+    const response = await fetch(`${API_BASE_URL}${EPOCH_PATH}`, {
+      cache: 'no-store',
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      // 404/405/501: this build of the backend does not serve the counter.
+      return {
+        epoch: null,
+        missing: response.status === 404 || response.status === 405 || response.status === 501,
+        changes: [],
+      };
+    }
+    const payload = await response.json() as { epoch?: unknown; changes?: unknown };
+    const epoch = Number(payload?.epoch);
+    // A 200 that is not a number is a proxy or a login page answering in the
+    // endpoint's place, which is the deployment gap again rather than a blip.
+    return Number.isFinite(epoch)
+      ? { epoch, missing: false, changes: parseEpochChanges(payload?.changes) }
+      : { epoch: null, missing: true, changes: [] };
+  } catch {
+    return { epoch: null, missing: false, changes: [] };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/**
+ * @param quiet Record where the counter has got to without telling anybody --
+ *   used when the caller knows a refresh is already happening, so that the poll
+ *   does not ask for the same data a second time.
+ */
+async function pollEpoch(quiet = false): Promise<void> {
+  if (epochPollingAbandoned || !isDocumentVisible()) return;
+  if (epochReadInFlight) {
+    // A quiet caller must not simply be dropped. Its whole job is to record the
+    // counter our own write moved, and losing it makes the next tick read that
+    // write back as though a stranger had made it.
+    if (quiet) quietResyncPending = true;
+    return;
+  }
+  epochReadInFlight = true;
+  try {
+    const read = await readCurriculumEpoch();
+    if (read.epoch === null) {
+      // A server that is merely down does not count towards giving up: it comes
+      // back, and a tab left open across a deploy should still be live after it.
+      if (!read.missing) return;
+      epochFailures += 1;
+      if (epochFailures >= EPOCH_POLL_MAX_FAILURES) {
+        epochPollingAbandoned = true;
+        stopEpochPolling();
+      }
+      return;
+    }
+    epochFailures = 0;
+    const previous = lastSeenEpoch;
+    lastSeenEpoch = read.epoch;
+    // The first read establishes where the counter is; there is nothing to
+    // compare it against yet, and treating it as a change would refresh every
+    // page the moment it mounted.
+    if (quiet || previous === null || previous === read.epoch) return;
+    // Somebody wrote. Every GET this tab has in flight was started before we
+    // knew that, so no skipCache caller may reuse one.
+    mutationEpoch += 1;
+    // The counter moving backwards means the server's cache was restarted under
+    // us; nothing about our own entries can be trusted against a fresh count.
+    const written = read.epoch > previous
+      ? changedPathsSince(previous, read.epoch, read.changes)
+      : null;
+    if (written) {
+      // The server said what was written, so throw away that and no more. This
+      // is the same invalidation the writing tab applied, arriving by a longer
+      // road.
+      written.forEach(path => {
+        applyMutationInvalidation(path);
+        notifyRemoteWrite(path);
+      });
+      return;
+    }
+    // No usable account of what changed -- an older backend, or a log that has
+    // moved on past us. Guessing which pages are safe to leave alone is exactly
+    // how a stale screen happens, so everything goes.
+    multiTierCache.clear();
+    clearPreviewReads();
+    notifyRemoteWrite(UNKNOWN_WRITE_PATH);
+  } finally {
+    epochReadInFlight = false;
+    if (quietResyncPending) {
+      quietResyncPending = false;
+      void pollEpoch(true);
+    }
+  }
+}
+
+function startEpochPolling(): void {
+  if (epochPollingAbandoned || typeof window === 'undefined') return;
+  if (!epochVisibilityBound && typeof document !== 'undefined') {
+    epochVisibilityBound = true;
+    document.addEventListener('visibilitychange', () => {
+      if (!remoteWriteListeners.size) return;
+      // Coming back to the tab already triggers a re-read of its own, so this
+      // only catches the counter up. Without it the next tick would see the
+      // jump that happened while the tab was hidden and read everything twice.
+      if (isDocumentVisible()) void pollEpoch(true);
+    });
+  }
+  if (epochPollTimer) return;
+  epochPollTimer = setInterval(() => { void pollEpoch(); }, EPOCH_POLL_INTERVAL_MS);
+  // Establish the starting value straight away rather than 25s from now.
+  void pollEpoch(true);
+}
+
+function stopEpochPolling(): void {
+  if (!epochPollTimer) return;
+  clearInterval(epochPollTimer);
+  epochPollTimer = null;
+}
+
+/**
+ * Catch the counter up after a write this browser already knows about, without
+ * refreshing anything for it.
+ *
+ * Our own save moves the server counter too, so without this the tab would poll,
+ * see the jump it caused itself, and re-read everything a second time. The delay
+ * lets the write commit -- the epoch is bumped on_commit -- before the value is
+ * recorded. Nothing is missed by staying quiet: the refresh that follows a save
+ * reads current server state, which includes anything a colleague committed in
+ * the same moment.
+ */
+function scheduleQuietEpochResync(): void {
+  if (epochPollingAbandoned || typeof window === 'undefined') return;
+  if (!remoteWriteListeners.size) return;
+  window.setTimeout(() => { void pollEpoch(true); }, 1_500);
+}
+
+/** Test seam: forgets the counter and stops the timer. */
+export function resetCurriculumEpochPolling(): void {
+  stopEpochPolling();
+  lastSeenEpoch = null;
+  epochFailures = 0;
+  epochPollingAbandoned = false;
+  epochReadInFlight = false;
+  quietResyncPending = false;
+}
+
+subscribeCrossTabWrites(write => {
+  if (write.scope !== CURRICULUM_WRITE_SCOPE) return;
+  // The write landed in another tab, so every GET this tab has in flight was
+  // started before it. Bump the epoch for the same reason the local branch does.
+  mutationEpoch += 1;
+  applyMutationInvalidation(write.path);
+  notifyRemoteWrite(write.path);
+  // This browser has already dealt with the write, so the poll must not treat
+  // the counter moving as news.
+  scheduleQuietEpochResync();
+});
+
+async function fetchJson<T>(path: string, init?: CurriculumRequestInit): Promise<T> {
+  const method = (init?.method || 'GET').toUpperCase();
+  // A preview read, answered before the mutation branch below can treat it as a
+  // write. It used to fall through to that branch's `else`, so every one of them
+  // cleared the whole cache and bumped the mutation epoch -- and the module
+  // drawer fires two of them (session plan, tutor availability) on a 300ms
+  // debounce as the weeks or the start date are typed. Each keystroke therefore
+  // threw away the overview, the tutors, the coaches and the holidays, and the
+  // page spent the next few seconds fetching back data that had not changed.
+  if (isReadOnlyPost(method, path)) {
+    const key = `${path}|${typeof init?.body === 'string' ? init.body : ''}`;
+    const cached = completedReads.get(key);
+    if (cached && !init?.skipCache && !init?.revalidate) {
+      if (cached.expiresAt > Date.now()) {
+        return settleWithCallerAbort(Promise.resolve(cached.value as T), init?.signal);
+      }
+      completedReads.delete(key);
+    }
+    const existingRead = inFlightReads.get(key) as Promise<T> | undefined;
+    // The epoch this question was asked in. Clearing the cache cannot reach a
+    // request that is already on its way, so a preview in flight when a write
+    // lands would otherwise come back afterwards and install a pre-write answer
+    // as though it were current -- the same trap the GET path tags for.
+    const askedAt = mutationEpoch;
+    const readPending = existingRead || fetchJsonUncached<T>(
+      path,
+      init?.signal ? { ...init, signal: undefined } : init,
+    ).then(value => {
+      if (askedAt !== mutationEpoch) return value;
+      if (completedReads.size >= READ_POST_MAX_ENTRIES) {
+        const oldest = completedReads.keys().next();
+        if (!oldest.done) completedReads.delete(oldest.value);
+      }
+      completedReads.set(key, { value, expiresAt: Date.now() + READ_POST_TTL_MS });
+      return value;
+    });
+    if (!existingRead) {
+      inFlightReads.set(key, readPending as Promise<unknown>);
+      const clearRead = () => {
+        if (inFlightReads.get(key) === (readPending as Promise<unknown>)) inFlightReads.delete(key);
+      };
+      readPending.then(clearRead, clearRead);
+    }
+    return settleWithCallerAbort(readPending, init?.signal);
+  }
+  if (method !== 'GET') {
+    // Any GET started before this point predates the write, so skipCache callers
+    // must not reuse it.
+    mutationEpoch += 1;
+    applyMutationInvalidation(path);
+    // The other tabs of this browser hold their own copy of these caches and
+    // cannot see the call that just happened, so they kept serving pre-write
+    // rows until their TTL lapsed. Tell them what was written.
+    publishCrossTabWrite(CURRICULUM_WRITE_SCOPE, path);
+    // Our own write moves the server's counter as well; record it quietly so the
+    // epoch poll does not read everything back a second time for our own save.
+    scheduleQuietEpochResync();
+    return fetchJsonUncached<T>(path, init);
+  }
+
+  // GET: check multi-tier cache. `revalidate` skips this read like `skipCache`
+  // does, but unlike `skipCache` it still stores the response below -- the point
+  // of a revalidation is to refresh the entry, not to stop using it.
+  if (!init?.skipCache && !init?.revalidate) {
+    const cached = multiTierCache.get<T>(path, init);
+    if (cached) {
+      return settleWithCallerAbort(Promise.resolve(cached.value), init?.signal);
+    }
+  }
+
+  // Check in-flight deduplication. skipCache means "do not read a stale cached
+  // value", not "do not share a request that is already going to the network
+  // right now": a fresh in-flight GET satisfies the caller's freshness need just
+  // as well as a new one. Several independent hooks refresh the same endpoints
+  // concurrently after a save (tutors/coaches/programme detail), and giving each
+  // its own request produced 5-6 duplicate calls per endpoint.
+  //
+  // The one case skipCache must still bypass is an in-flight request that was
+  // started *before* this caller's mutation landed, since that response predates
+  // the write. Requests are therefore tagged with the epoch they began in, and a
+  // skipCache caller only joins an in-flight GET from the current epoch.
+  const sharedInit = init?.signal ? { ...init, signal: undefined } : init;
+  const inFlight = multiTierCache.getInFlight(path) as Promise<T> | undefined;
+  const inFlightIsFresh = inFlight !== undefined
+    && (!init?.skipCache || multiTierCache.getInFlightEpoch(path) === mutationEpoch);
+  const existing = inFlightIsFresh ? inFlight : undefined;
+
+  const pending = existing || fetchJsonUncached<T>(path, sharedInit).then(value => {
+    if (!init?.skipCache) {
+      // Tag cache entries with entity type for targeted invalidation
+      let entityType: string | undefined;
+      let entityId: string | undefined;
+      if (path.includes('/programmes/') && path.includes('/detail/')) {
+        entityType = 'programme';
+        const match = path.match(/\/programmes\/([^/]+)\/detail/);
+        entityId = match ? decodeURIComponent(match[1]) : undefined;
+      } else if (path.includes('/programmes/')) {
+        entityType = 'programme';
+      } else if (path.includes('/cohorts/')) {
+        entityType = 'cohort';
+      } else if (path.includes('/groups/')) {
+        entityType = 'group';
+      } else if (path.includes('/modules/')) {
+        entityType = 'module';
+      } else if (path.includes('/ksb-') || path.includes('/coverage') || path.includes('/impact')) {
+        entityType = 'ksb';
+      }
+      multiTierCache.set(path, value, entityType, entityId);
+    }
+    return value;
+  });
+
+  // Register even skipCache requests so concurrent refreshes of the same endpoint
+  // collapse onto one network call. The cache *write* above still respects
+  // skipCache, so nothing stale is stored.
+  if (!existing) {
+    multiTierCache.setInFlight(path, pending as Promise<unknown>, mutationEpoch);
+    const clearInFlight = () => {
+      if (multiTierCache.getInFlight(path) === (pending as Promise<unknown>)) {
+        multiTierCache.clearInFlight(path);
+      }
+    };
+    pending.then(clearInFlight, clearInFlight);
+  }
+
+  return settleWithCallerAbort(pending, init?.signal);
+}
+
+/**
+ * How many further attempts a failed request is worth, and the wait before the
+ * first of them. Two is sized for the thing this exists for -- a worker being
+ * replaced under a deploy, unavailable for a moment and then not -- and stops
+ * well short of turning a backend that is genuinely down into a burst of load.
+ */
+const RETRY_ATTEMPTS = 2;
+const RETRY_BASE_DELAY_MS = 300;
+
+/**
+ * Whether this request can be sent a second time without changing the outcome.
+ *
+ * A retry is only ever correct when the server cannot tell one delivery from
+ * two. Reads qualify by definition. Writes do not, and not for a theoretical
+ * reason: a 502 from the proxy is returned just as readily *after* the write
+ * committed as before it, so a retried POST creates the record twice and a
+ * retried PATCH re-applies an edit over whatever landed in between. Making
+ * those safe needs an idempotency key the backend honours, which is a contract
+ * between the two sides rather than something this file can decide alone.
+ *
+ * The preview POSTs are the exception, and only because they are reads wearing
+ * a POST so the question fits in a body.
+ */
+function isRetryableRequest(method: string, path: string): boolean {
+  return method === 'GET' || method === 'HEAD' || isReadOnlyPost(method, path);
+}
+
+function retryDelay(attempt: number): Promise<void> {
+  // Jittered, so a page that lost six parallel reads to one restart does not
+  // send all six back at the same instant.
+  const wait = RETRY_BASE_DELAY_MS * (2 ** attempt) + Math.floor(Math.random() * 100);
+  return new Promise(resolve => { setTimeout(resolve, wait); });
+}
+
+/**
+ * One network call, with a retry for the failures that are worth one.
+ *
+ * Without this a single 502 -- which is what a deploy looks like from a browser
+ * -- blanked whichever page happened to be reading at that second, and the only
+ * cure was the manual refresh this whole area exists to stop people needing.
+ * `isRetryableError` decides what counts: 408/429/5xx and network failures yes,
+ * every 4xx and any caller abort no.
+ */
+async function fetchJsonUncached<T>(path: string, init?: CurriculumRequestInit): Promise<T> {
+  const method = (init?.method || 'GET').toUpperCase();
+  if (!isRetryableRequest(method, path)) return fetchJsonOnce<T>(path, init);
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await fetchJsonOnce<T>(path, init);
+    } catch (error) {
+      // A caller's own abort never reaches here -- `fetchJson` strips the signal
+      // before this point and settles the caller separately -- and a timeout
+      // arrives as its own message that `isRetryableError` declines, so a slow
+      // endpoint cannot have its budget spent three times over.
+      if (attempt >= RETRY_ATTEMPTS || !isRetryableError(error)) throw error;
+      await retryDelay(attempt);
+    }
+  }
+}
+
+async function fetchJsonOnce<T>(path: string, init?: CurriculumRequestInit): Promise<T> {
+  const timeoutController = init?.timeoutMs ? new AbortController() : null;
+  const timeout = timeoutController && init?.timeoutMs
+    ? window.setTimeout(() => timeoutController.abort(), init.timeoutMs)
+    : null;
+  // `revalidate` is destructured out with the other non-fetch options: it is a
+  // client-cache directive only and must not reach the backend, or it would
+  // force the same rebuild `skipCache` does.
+  const { timeoutMs: _timeoutMs, signal: callerSignal, skipCache: _skipCache, revalidate: _revalidate, ...fetchInit } = init || {};
+  const signal = callerSignal && timeoutController
+    ? anySignal([callerSignal, timeoutController.signal])
+    : callerSignal || timeoutController?.signal;
+  try {
+  const response = await fetch(`${API_BASE_URL}${path}`, {
+    ...fetchInit,
+    ...(init?.skipCache ? { cache: 'no-store' as const } : {}),
+    signal,
+    headers: {
+      ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
+      ...(init?.skipCache ? { 'Cache-Control': 'no-cache' } : {}),
+      ...(init?.headers || {}),
+    },
+  });
+  if (!response.ok) {
+    let detail = '';
+    let payload: unknown;
+    try {
+      payload = await response.json();
+      const errorText = curriculumPayloadErrorMessage(payload);
+      detail = errorText ? `: ${errorText}` : '';
+    } catch {
+      detail = '';
+    }
+    throw new CurriculumApiError(`Curriculum API returned ${response.status} for ${path}${detail}`, response.status, path, payload);
+  }
+  return response.json();
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      // Only a timeout becomes a generic error; a caller-initiated abort must stay
+      // an AbortError so effect cleanups can tell cancellation from failure.
+      if (timeoutController?.signal.aborted && !callerSignal?.aborted) {
+        throw new Error(`Curriculum API timed out for ${path}`);
+      }
+    }
+    throw error;
+  } finally {
+    if (timeout !== null) window.clearTimeout(timeout);
+  }
+}
+
+function abortError(): DOMException {
+  return new DOMException('The operation was aborted.', 'AbortError');
+}
+
+function settleWithCallerAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(abortError());
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => reject(abortError());
+    signal.addEventListener('abort', abort, { once: true });
+    promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
+  });
+}
+
+async function fetchCollection<T>(path: string, init?: CurriculumRequestInit): Promise<T[]> {
+  const payload = await fetchJson<CurriculumCollection<T>>(path, init);
+  return payload.results;
+}
+
+// `compact` drops weekStructure (~94% of this payload) server-side. Only pass it
+// from callers that read module identity/metadata alone: anything that reads
+// weekStructure, its nested components, or ranks duplicate modules by component
+// count must keep the full response. See fetchCurriculumModules callers.
+export function fetchCurriculumModules(signal?: AbortSignal, options: {
+  compact?: boolean;
+  programmeId?: string;
+  cohortId?: string;
+  groupId?: string;
+  status?: string;
+  page?: number;
+  pageSize?: number;
+  skipCache?: boolean;
+  revalidate?: boolean;
+} = {}): Promise<CurriculumModule[]> {
+  const query = new URLSearchParams();
+  if (options.compact) query.set('compact', 'true');
+  if (options.programmeId) query.set('programme_id', options.programmeId);
+  if (options.cohortId) query.set('cohort_id', options.cohortId);
+  if (options.groupId) query.set('group_id', options.groupId);
+  if (options.status) query.set('status', options.status);
+  if (options.page) query.set('page', String(options.page));
+  if (options.pageSize) query.set('page_size', String(options.pageSize));
+  const suffix = query.toString() ? `?${query.toString()}` : '';
+  return fetchCollection<CurriculumModule>(`/curriculum/modules/${suffix}`, { signal, skipCache: options.skipCache, revalidate: options.revalidate });
+}
+
+export function fetchCurriculumComponents(signal?: AbortSignal, options: { moduleCatalogueIds?: string[]; page?: number; pageSize?: number; skipCache?: boolean; revalidate?: boolean } = {}): Promise<CurriculumComponent[]> {
+  const query = new URLSearchParams();
+  const moduleCatalogueIds = (options.moduleCatalogueIds || []).filter(Boolean);
+  if (moduleCatalogueIds.length) query.set('module_catalogue_ids', moduleCatalogueIds.join(','));
+  if (options.page) query.set('page', String(options.page));
+  if (options.pageSize) query.set('page_size', String(options.pageSize));
+  const suffix = query.toString() ? `?${query.toString()}` : '';
+  return fetchCollection<CurriculumComponent>(`/curriculum/components/${suffix}`, { signal, skipCache: options.skipCache, revalidate: options.revalidate });
+}
+
+/**
+ * Search components available for reuse, across all programmes.
+ *
+ * Returns list rows only: no `settings`, no `ksbMappings`. Those are 24 MB
+ * across the components table, the picker does not show them, and fetching
+ * them for a whole page would dominate the request. Call
+ * `fetchComponentLibraryDetail` for the handful actually being copied.
+ *
+ * Deliberately not cached: a filtered search changes with every keystroke,
+ * unlike the stable snapshot `fetchCurriculumComponents` serves.
+ */
+export function fetchComponentLibrary(options: {
+  search?: string;
+  types?: string[];
+  programmeIds?: string[];
+  origins?: LibraryComponentOrigin[];
+  page?: number;
+  pageSize?: number;
+} = {}, signal?: AbortSignal): Promise<LibraryComponent[]> {
+  const query = new URLSearchParams();
+  const search = (options.search || '').trim();
+  if (search) query.set('search', search);
+  const types = (options.types || []).filter(Boolean);
+  if (types.length) query.set('types', types.join(','));
+  const programmeIds = (options.programmeIds || []).filter(Boolean);
+  if (programmeIds.length) query.set('programme_ids', programmeIds.join(','));
+  const origins = (options.origins || []).filter(Boolean);
+  if (origins.length) query.set('origins', origins.join(','));
+  if (options.page) query.set('page', String(options.page));
+  if (options.pageSize) query.set('page_size', String(options.pageSize));
+  const suffix = query.toString() ? `?${query.toString()}` : '';
+  return fetchCollection<LibraryComponent>(`/curriculum/components/library/${suffix}`, { signal, skipCache: true });
+}
+
+/**
+ * Full authoring detail for specific components — `settings` and `ksbMappings`
+ * included. Call this with the ids being copied, never with a whole page.
+ */
+export function fetchComponentLibraryDetail(ids: string[], signal?: AbortSignal): Promise<LibraryComponent[]> {
+  const wanted = ids.filter(Boolean);
+  if (!wanted.length) return Promise.resolve([]);
+  const query = new URLSearchParams({ ids: wanted.join(',') });
+  return fetchCollection<LibraryComponent>(`/curriculum/components/library/?${query.toString()}`, { signal, skipCache: true });
+}
+
+export function fetchCurriculumStats(signal?: AbortSignal): Promise<CurriculumOverview['stats']> {
+  return fetchJson<CurriculumOverview['stats']>('/curriculum/stats/', { signal });
+}
+
+export function fetchCurriculumProgrammes(signal?: AbortSignal, options: { skipCache?: boolean; revalidate?: boolean; visibility?: 'all' | 'operational' } = {}): Promise<CurriculumProgramme[]> {
+  const query = new URLSearchParams();
+  if (options.visibility === 'all') query.set('visibility', 'all');
+  const suffix = query.toString() ? `?${query.toString()}` : '';
+  return fetchCollection<CurriculumProgramme>(`/curriculum/programmes/${suffix}`, { signal, skipCache: options.skipCache, revalidate: options.revalidate });
+}
+
+export function fetchCurriculumGroups(signal?: AbortSignal): Promise<CurriculumGroup[]> {
+  return fetchCollection<CurriculumGroup>('/curriculum/groups/', { signal });
+}
+
+export function fetchCurriculumKsbFrameworks(signal?: AbortSignal): Promise<CurriculumKsbFramework[]> {
+  return fetchCollection<CurriculumKsbFramework>('/curriculum/ksb-frameworks/', { signal });
+}
+
+export function fetchCurriculumKsbSets(signal?: AbortSignal, options: { all?: boolean } = {}): Promise<CurriculumKsbSet[]> {
+  const query = new URLSearchParams();
+  if (options.all) query.set('visibility', 'all');
+  const suffix = query.toString() ? `?${query.toString()}` : '';
+  return fetchCollection<CurriculumKsbSet>(`/curriculum/ksb-sets/${suffix}`, { signal });
+}
+
+export function fetchCurriculumStandards(signal?: AbortSignal): Promise<CurriculumStandard[]> {
+  return fetchCollection<CurriculumStandard>('/curriculum/standards/', { signal });
+}
+
+export function fetchCurriculumStandardDetail(id: string, signal?: AbortSignal): Promise<CurriculumStandard> {
+  return fetchJson<CurriculumStandard>(`/curriculum/standards/${encodeURIComponent(id)}/`, { signal });
+}
+
+export function fetchCurriculumKsbCoverage(params: { sourceType?: string; sourceId?: string } = {}, signal?: AbortSignal): Promise<CurriculumKsbCoverageResponse> {
+  const query = new URLSearchParams();
+  if (params.sourceType) query.set('source_type', params.sourceType);
+  if (params.sourceId) query.set('source_id', params.sourceId);
+  const suffix = query.toString() ? `?${query.toString()}` : '';
+  return fetchJson<CurriculumKsbCoverageResponse>(`/curriculum/ksb-coverage/${suffix}`, { signal });
+}
+
+export function fetchCurriculumProgrammeKsbCoverage(programmeId: string, params: { sourceType?: string; sourceId?: string; actualMappings?: boolean } = {}, signal?: AbortSignal): Promise<CurriculumKsbCoverageResponse> {
+  const query = new URLSearchParams();
+  if (params.sourceType) query.set('source_type', params.sourceType);
+  if (params.sourceId) query.set('source_id', params.sourceId);
+  if (params.actualMappings) query.set('actual_mappings', '1');
+  const suffix = query.toString() ? `?${query.toString()}` : '';
+  return fetchJson<CurriculumKsbCoverageResponse>(`/curriculum/programmes/${encodeURIComponent(programmeId)}/ksb-coverage/${suffix}`, { signal });
+}
+
+// Kept as named entry points because the Programme workspace reads them by
+// name; both are the scope reads at the top of the hierarchy.
+export function fetchCurriculumProgrammeLearnerKsbImpact(programmeId: string, params: { sourceType?: string; sourceId?: string; learnerStatus?: string } = {}, signal?: AbortSignal): Promise<CurriculumProgrammeLearnerKsbImpactResponse> {
+  return fetchCurriculumScopeLearnerKsbImpact('programme', programmeId, params, signal);
+}
+
+export function fetchCurriculumProgrammeLearnerRoster(programmeId: string, params: { cohort?: string; group?: string; learnerStatus?: string } = {}, signal?: AbortSignal): Promise<CurriculumProgrammeLearnerRosterResponse> {
+  return fetchCurriculumScopeLearnerRoster('programme', programmeId, params, signal);
+}
+
+// One route per level of Programme -> Cohort -> Group -> Module -> Week, so a
+// page asks for its own scope and nothing wider. `component` has no path route
+// of its own and goes through the query form.
+const SCOPE_ROSTER_PATHS: Record<string, (id: string) => string> = {
+  programme: id => `/curriculum/programmes/${encodeURIComponent(id)}/learner-roster/`,
+  cohort: id => `/curriculum/cohorts/${encodeURIComponent(id)}/learner-roster/`,
+  group: id => `/curriculum/groups/${encodeURIComponent(id)}/learner-roster/`,
+  module: id => `/curriculum/modules/${encodeURIComponent(id)}/learner-roster/`,
+  week: id => `/curriculum/weeks/${encodeURIComponent(id)}/learner-roster/`,
+};
+
+const SCOPE_IMPACT_PATHS: Record<string, (id: string) => string> = {
+  programme: id => `/curriculum/programmes/${encodeURIComponent(id)}/learner-ksb-impact/`,
+  cohort: id => `/curriculum/cohorts/${encodeURIComponent(id)}/learner-ksb-impact/`,
+  group: id => `/curriculum/groups/${encodeURIComponent(id)}/learner-ksb-impact/`,
+  module: id => `/curriculum/modules/${encodeURIComponent(id)}/learner-ksb-impact/`,
+  week: id => `/curriculum/weeks/${encodeURIComponent(id)}/learner-ksb-impact/`,
+};
+
+function scopePath(
+  paths: Record<string, (id: string) => string>,
+  fallback: string,
+  scope: CurriculumLearnerScope,
+  identifier: string,
+  query: URLSearchParams,
+) {
+  const builder = paths[scope];
+  if (builder) {
+    const suffix = query.toString() ? `?${query.toString()}` : '';
+    return `${builder(identifier)}${suffix}`;
+  }
+  query.set('scope', scope);
+  query.set('identifier', identifier);
+  return `${fallback}?${query.toString()}`;
+}
+
+/**
+ * The learners enrolment placed inside one curriculum scope.
+ *
+ * A module/week/component reports the roster of the group that delivers it —
+ * `placementBasis` on the response says which level the roster came from.
+ */
+export function fetchCurriculumScopeLearnerRoster(
+  scope: CurriculumLearnerScope,
+  identifier: string,
+  params: { cohort?: string; group?: string; learnerStatus?: string } = {},
+  signal?: AbortSignal,
+): Promise<CurriculumScopeLearnerRosterResponse> {
+  const query = new URLSearchParams();
+  if (params.cohort) query.set('cohort', params.cohort);
+  if (params.group) query.set('group', params.group);
+  if (params.learnerStatus) query.set('learnerStatus', params.learnerStatus);
+  return fetchJson<CurriculumScopeLearnerRosterResponse>(
+    scopePath(SCOPE_ROSTER_PATHS, '/curriculum/learner-roster/', scope, identifier, query),
+    { signal },
+  );
+}
+
+/**
+ * What the learners in one curriculum scope have actually achieved there.
+ *
+ * `otjhAchievement` is hours, `ksbAchievement` is the achieved KSB heatmap, and
+ * both are computed from the components inside this scope alone — a cohort is
+ * never handed the whole programme's consumption.
+ */
+export function fetchCurriculumScopeLearnerKsbImpact(
+  scope: CurriculumLearnerScope,
+  identifier: string,
+  params: { sourceType?: string; sourceId?: string; learnerStatus?: string } = {},
+  signal?: AbortSignal,
+): Promise<CurriculumScopeLearnerKsbImpactResponse> {
+  const query = new URLSearchParams();
+  if (params.sourceType) query.set('source_type', params.sourceType);
+  if (params.sourceId) query.set('source_id', params.sourceId);
+  if (params.learnerStatus) query.set('learnerStatus', params.learnerStatus);
+  return fetchJson<CurriculumScopeLearnerKsbImpactResponse>(
+    scopePath(SCOPE_IMPACT_PATHS, '/curriculum/learner-ksb-impact/', scope, identifier, query),
+    { signal },
+  );
+}
+
+export function fetchCurriculumGroupKsbCoverage(groupId: string, params: { sourceType?: string; sourceId?: string } = {}, signal?: AbortSignal): Promise<CurriculumKsbCoverageResponse> {
+  const query = new URLSearchParams();
+  if (params.sourceType) query.set('source_type', params.sourceType);
+  if (params.sourceId) query.set('source_id', params.sourceId);
+  const suffix = query.toString() ? `?${query.toString()}` : '';
+  return fetchJson<CurriculumKsbCoverageResponse>(`/curriculum/groups/${encodeURIComponent(groupId)}/ksb-coverage/${suffix}`, { signal });
+}
+
+export function fetchCurriculumModuleKsbCoverage(moduleId: string, params: { sourceType?: string; sourceId?: string } = {}, signal?: AbortSignal): Promise<CurriculumKsbCoverageResponse> {
+  const query = new URLSearchParams();
+  if (params.sourceType) query.set('source_type', params.sourceType);
+  if (params.sourceId) query.set('source_id', params.sourceId);
+  const suffix = query.toString() ? `?${query.toString()}` : '';
+  return fetchJson<CurriculumKsbCoverageResponse>(`/curriculum/modules/${encodeURIComponent(moduleId)}/ksb-coverage/${suffix}`, { signal });
+}
+
+export function fetchCurriculumWeekKsbCoverage(weekId: string, params: { sourceType?: string; sourceId?: string } = {}, signal?: AbortSignal): Promise<CurriculumKsbCoverageResponse> {
+  const query = new URLSearchParams();
+  if (params.sourceType) query.set('source_type', params.sourceType);
+  if (params.sourceId) query.set('source_id', params.sourceId);
+  const suffix = query.toString() ? `?${query.toString()}` : '';
+  return fetchJson<CurriculumKsbCoverageResponse>(`/curriculum/weeks/${encodeURIComponent(weekId)}/ksb-coverage/${suffix}`, { signal });
+}
+
+export function fetchCurriculumCohortKsbCoverage(cohortId: string, params: { sourceType?: string; sourceId?: string } = {}, signal?: AbortSignal): Promise<CurriculumKsbCoverageResponse> {
+  const query = new URLSearchParams();
+  if (params.sourceType) query.set('source_type', params.sourceType);
+  if (params.sourceId) query.set('source_id', params.sourceId);
+  const suffix = query.toString() ? `?${query.toString()}` : '';
+  return fetchJson<CurriculumKsbCoverageResponse>(`/curriculum/cohorts/${encodeURIComponent(cohortId)}/ksb-coverage/${suffix}`, { signal });
+}
+
+export function fetchCurriculumKsbTrace(ksbId: string, params: { sourceType?: string; sourceId?: string } = {}, signal?: AbortSignal): Promise<CurriculumKsbCoverageItem> {
+  const query = new URLSearchParams();
+  if (params.sourceType) query.set('source_type', params.sourceType);
+  if (params.sourceId) query.set('source_id', params.sourceId);
+  const suffix = query.toString() ? `?${query.toString()}` : '';
+  return fetchJson<CurriculumKsbCoverageItem>(`/curriculum/ksb-coverage/trace/${encodeURIComponent(ksbId)}/${suffix}`, { signal });
+}
+
+export function fetchCurriculumReadiness(params: { scope?: string; identifier?: string; sourceType?: string; sourceId?: string } = {}, signal?: AbortSignal): Promise<CurriculumReadinessResponse> {
+  const query = new URLSearchParams();
+  if (params.scope) query.set('scope', params.scope);
+  if (params.identifier) query.set('identifier', params.identifier);
+  if (params.sourceType) query.set('source_type', params.sourceType);
+  if (params.sourceId) query.set('source_id', params.sourceId);
+  const suffix = query.toString() ? `?${query.toString()}` : '';
+  return fetchJson<CurriculumReadinessResponse>(`/curriculum/readiness/ksb-coverage/${suffix}`, { signal });
+}
+
+export function fetchComponentKsbMappings(componentId: string, signal?: AbortSignal): Promise<CurriculumComponentKsbMappingsResponse> {
+  return fetchJson<CurriculumComponentKsbMappingsResponse>(`/curriculum/components/${encodeURIComponent(componentId)}/ksb-mappings/`, { signal });
+}
+
+export function createComponentKsbMapping(componentId: string, input: CurriculumKsbMappingInput | { mappings: CurriculumKsbMappingInput[] }) {
+  return postJson<CurriculumComponentKsbMappingsResponse & { created: boolean }>(`/curriculum/components/${encodeURIComponent(componentId)}/ksb-mappings/`, input);
+}
+
+export function updateComponentKsbMapping(mappingId: string, input: Partial<CurriculumKsbMappingInput>) {
+  return patchJson<{ updated: boolean; mapping: CurriculumKsbTraceMapping }>(`/curriculum/ksb-mappings/${encodeURIComponent(mappingId)}/`, input);
+}
+
+export function deleteComponentKsbMapping(mappingId: string) {
+  return deleteJson<{ deleted: boolean; id: string }>(`/curriculum/ksb-mappings/${encodeURIComponent(mappingId)}/`);
+}
+
+export function createCurriculumKsbFramework(input: CurriculumKsbFrameworkInput) {
+  return postJson<{ created: boolean; framework: CurriculumKsbFramework }>('/curriculum/ksb-frameworks/', input);
+}
+
+export function updateCurriculumKsbFramework(id: string, input: CurriculumKsbFrameworkInput) {
+  return patchJson<{ updated: boolean; id: string }>(`/curriculum/ksb-frameworks/${encodeURIComponent(id)}/`, input);
+}
+
+export function deleteCurriculumKsbFramework(id: string) {
+  return deleteJson<{ deleted: boolean; id: string }>(`/curriculum/ksb-frameworks/${encodeURIComponent(id)}/`);
+}
+
+export function fetchCurriculumTeamsMeetingSummaries(
+  signal?: AbortSignal,
+  options: { moduleCatalogueIds?: string[]; occurrenceDates?: boolean; skipCache?: boolean; revalidate?: boolean } = {},
+): Promise<CurriculumTeamsMeetingSummary[]> {
+  const ids = (options.moduleCatalogueIds || []).filter(Boolean);
+  const query = new URLSearchParams();
+  if (ids.length) query.set('module_catalogue_ids', ids.join(','));
+  // Opt-in: the occurrence dates are only needed by the page that compares them
+  // against the module's stored session plan, and they are the bulk of the payload.
+  if (options.occurrenceDates) query.set('occurrence_dates', '1');
+  const suffix = query.toString() ? `?${query.toString()}` : '';
+  return fetchCollection<CurriculumTeamsMeetingSummary>(
+    `/curriculum/teams-meetings/summary/${suffix}`,
+    { signal, skipCache: options.skipCache, revalidate: options.revalidate },
+  );
+}
+
+/** Real per-occurrence live-session state (status/dates/attendance counts) for a
+ *  set of modules and/or series. Feeds the Sessions tab's scheduled/completed
+ *  badges — the status comes from the sync service, not a client date guess.
+ *  Light by design: attendance rows and transcript/recording artifacts are NOT
+ *  included here (load them lazily with `fetchLiveSessionArtifacts`). */
+export function fetchCurriculumLiveSessionOccurrences(
+  options: { moduleCatalogueIds?: string[]; liveSessionIds?: string[]; skipCache?: boolean; signal?: AbortSignal } = {},
+): Promise<CurriculumLiveSessionOccurrencesResponse> {
+  const moduleIds = (options.moduleCatalogueIds || []).filter(Boolean);
+  const sessionIds = (options.liveSessionIds || []).filter(Boolean);
+  if (!moduleIds.length && !sessionIds.length) {
+    return Promise.resolve({ series: [], occurrences: [] });
+  }
+  const query = new URLSearchParams();
+  if (moduleIds.length) query.set('module_catalogue_ids', moduleIds.join(','));
+  if (sessionIds.length) query.set('live_session_ids', sessionIds.join(','));
+  return fetchJson<CurriculumLiveSessionOccurrencesResponse>(
+    `/curriculum/live-sessions/occurrences/?${query.toString()}`,
+    { signal: options.signal, skipCache: options.skipCache },
+  );
+}
+
+/** A completed live session's captured artifacts: every occurrence with its
+ *  attendance list and transcript/recording artifacts. Keyed by the series id
+ *  (`teamsLiveSessionId` on the component). Heavier than the occurrences read, so
+ *  the Sessions tab only calls this when a completed row is expanded. */
+export function fetchLiveSessionArtifacts(
+  liveSessionId: string,
+  options: { skipCache?: boolean; signal?: AbortSignal } = {},
+): Promise<LiveSessionArtifactsResponse> {
+  return fetchJson<LiveSessionArtifactsResponse>(
+    `/curriculum/teams-meetings/${encodeURIComponent(liveSessionId)}/artifacts/`,
+    { signal: options.signal, skipCache: options.skipCache },
+  );
+}
+
+/** Absolute URL that streams a transcript/recording artifact's content (proxied
+ *  from Graph server-side). Same-origin + cookie auth, so it can be used directly
+ *  as an `href` / `download` / media `src`. */
+export function liveSessionArtifactContentUrl(liveSessionId: string, artifactId: string): string {
+  return `${API_BASE_URL}/curriculum/teams-meetings/${encodeURIComponent(liveSessionId)}/artifacts/${encodeURIComponent(artifactId)}/content/`;
+}
+
+/** Same-origin redirect that records which Week/occurrence launched the shared Teams meeting. */
+export function liveSessionJoinUrl(liveSessionId: string, occurrenceId: string): string {
+  return `${API_BASE_URL}/curriculum/teams-meetings/${encodeURIComponent(liveSessionId)}/occurrences/${encodeURIComponent(occurrenceId)}/join/`;
+}
+
+/** Inline media/text response. Without this flag the backend deliberately sends
+ * Content-Disposition: attachment so the same endpoint is a real download. */
+export function liveSessionArtifactPreviewUrl(liveSessionId: string, artifactId: string): string {
+  return `${liveSessionArtifactContentUrl(liveSessionId, artifactId)}?preview=1`;
+}
+
+export function fetchCurriculumSessions(
+  signal?: AbortSignal,
+  options: { skipCache?: boolean; revalidate?: boolean } = {},
+): Promise<CurriculumSession[]> {
+  // Sessions live in the 45s "dynamic" cache tier, so a caller that has just
+  // scheduled a module (or opens straight after) can otherwise read a stale
+  // snapshot that predates its session dates. skipCache lets those callers read
+  // the current plan instead of waiting out the TTL. `revalidate` is for the
+  // background re-read after somebody else's write: past this tab's cache, but
+  // answered from the server's.
+  return fetchCollection<CurriculumSession>('/curriculum/sessions/', { signal, skipCache: options.skipCache, revalidate: options.revalidate });
+}
+
+// 30s, not 15s: a forced rebuild of the curriculum payload takes ~13s, so a 15s
+// budget aborted these on a cold cache while the backend was still succeeding.
+export function fetchCurriculumTutors(signal?: AbortSignal, options: { skipCache?: boolean; revalidate?: boolean } = {}): Promise<CurriculumStaffProfile[]> {
+  return fetchCollection<CurriculumStaffProfile>('/curriculum/tutors/', { signal, skipCache: options.skipCache, revalidate: options.revalidate, timeoutMs: 30000 });
+}
+
+export function fetchCurriculumCoaches(signal?: AbortSignal, options: { skipCache?: boolean; revalidate?: boolean } = {}): Promise<CurriculumStaffProfile[]> {
+  return fetchCollection<CurriculumStaffProfile>('/curriculum/coaches/', { signal, skipCache: options.skipCache, revalidate: options.revalidate, timeoutMs: 30000 });
+}
+
+export function fetchCurriculumHolidays(signal?: AbortSignal, options: { skipCache?: boolean; revalidate?: boolean } = {}): Promise<CurriculumHoliday[]> {
+  return fetchCollection<CurriculumHoliday>('/curriculum/holidays/', { signal, skipCache: options.skipCache, revalidate: options.revalidate });
+}
+
+export function fetchEnglandHolidays(signal?: AbortSignal, options: { skipCache?: boolean; revalidate?: boolean } = {}): Promise<EnglandHoliday[]> {
+  return fetchCollection<EnglandHoliday>('/curriculum/england-holidays/', { signal, skipCache: options.skipCache, revalidate: options.revalidate });
+}
+
+export function fetchCurriculumOverview(signal?: AbortSignal, options: { compact?: boolean; skipCache?: boolean; revalidate?: boolean; timeoutMs?: number } = {}): Promise<CurriculumOverview> {
+  return fetchJson<CurriculumOverview>(`/curriculum/overview/${options.compact ? '?compact=true' : ''}`, { signal, skipCache: options.skipCache, revalidate: options.revalidate, timeoutMs: options.timeoutMs });
+}
+
+export function fetchCurriculumProgrammeDetail(id: string, signal?: AbortSignal, options: { visibility?: 'all' | 'operational'; skipCache?: boolean; revalidate?: boolean } = {}): Promise<CurriculumProgrammeDetail> {
+  const query = new URLSearchParams();
+  if (options.visibility === 'all') query.set('visibility', 'all');
+  const suffix = query.toString() ? `?${query.toString()}` : '';
+  return fetchJson<CurriculumProgrammeDetail>(`/curriculum/programmes/${encodeURIComponent(id)}/detail/${suffix}`, { signal, skipCache: options.skipCache, revalidate: options.revalidate });
+}
+
+export { fetchCurriculumOverview as fetchCurriculumOverviewBundle };
+
+/**
+ * Versioned curriculum records, most recently changed first. Answers
+ * `available: false` — not an error — when the history tables do not exist.
+ */
+export function fetchCurriculumVersions(
+  options: { module?: string; entityType?: string; search?: string; limit?: number; signal?: AbortSignal; skipCache?: boolean } = {},
+): Promise<CurriculumVersionIndex> {
+  const query = new URLSearchParams();
+  if (options.module) query.set('module', options.module);
+  if (options.entityType && options.entityType !== 'all') query.set('entity_type', options.entityType);
+  if (options.search) query.set('search', options.search);
+  if (options.limit) query.set('limit', String(options.limit));
+  const suffix = query.toString() ? `?${query.toString()}` : '';
+  return fetchJson<CurriculumVersionIndex>(`/curriculum/quality/versions/${suffix}`, {
+    signal: options.signal,
+    skipCache: options.skipCache,
+    timeoutMs: 30000,
+  });
+}
+
+/**
+ * One record's timeline. Pass `snapshot` to also get the stored content of that
+ * revision — what the record actually held, which is what a version number is
+ * looked up in order to see.
+ */
+export function fetchCurriculumRecordHistory(
+  entityType: string,
+  entityId: string,
+  options: { snapshot?: number; limit?: number; signal?: AbortSignal; skipCache?: boolean } = {},
+): Promise<CurriculumRecordHistory> {
+  const query = new URLSearchParams();
+  if (options.snapshot) query.set('snapshot', String(options.snapshot));
+  if (options.limit) query.set('limit', String(options.limit));
+  const suffix = query.toString() ? `?${query.toString()}` : '';
+  return fetchJson<CurriculumRecordHistory>(
+    `/curriculum/quality/versions/${encodeURIComponent(entityType)}/${encodeURIComponent(entityId)}/${suffix}`,
+    { signal: options.signal, skipCache: options.skipCache, timeoutMs: 30000 },
+  );
+}
+
+/**
+ * Record activity across the curriculum authoring tables: what was created,
+ * edited or archived, newest first. Derived from created_at/updated_at/
+ * deleted_at on the records themselves - Quality owns no log of its own.
+ */
+export function fetchCurriculumAuditTrail(
+  options: {
+    days?: number;
+    limit?: number;
+    entity?: string;
+    action?: string;
+    search?: string;
+    signal?: AbortSignal;
+    skipCache?: boolean;
+  } = {},
+): Promise<CurriculumAuditTrail> {
+  const query = new URLSearchParams();
+  if (options.days) query.set('days', String(options.days));
+  if (options.limit) query.set('limit', String(options.limit));
+  if (options.entity && options.entity !== 'all') query.set('entity', options.entity);
+  if (options.action && options.action !== 'all') query.set('action', options.action);
+  if (options.search) query.set('search', options.search);
+  const suffix = query.toString() ? `?${query.toString()}` : '';
+  return fetchJson<CurriculumAuditTrail>(`/curriculum/quality/audit-trail/${suffix}`, {
+    signal: options.signal,
+    skipCache: options.skipCache,
+    timeoutMs: 30000,
+  });
+}
+
+function postJson<T>(path: string, body: unknown): Promise<T> {
+  return fetchJson<T>(path, { method: 'POST', body: JSON.stringify(body) });
+}
+
+function patchJson<T>(path: string, body: unknown): Promise<T> {
+  return fetchJson<T>(path, { method: 'PATCH', body: JSON.stringify(body) });
+}
+
+function deleteJson<T>(path: string): Promise<T> {
+  return fetchJson<T>(path, { method: 'DELETE' });
+}
+
+export type CurriculumProgrammeInput = Partial<Pick<CurriculumProgramme, 'name' | 'standard' | 'level' | 'owner' | 'color' | 'description' | 'structureType' | 'ksbProfileSourceId' | 'status'>> & {
+  /**
+   * Off-the-job hours target. A string is accepted because form inputs produce
+   * one and the backend parses either; null clears a stored target, and omitting
+   * the key leaves it untouched.
+   */
+  requiredOtjh?: number | string | null;
+};
+export type CurriculumModuleInput = Partial<Pick<CurriculumModule, 'name' | 'weeks' | 'color' | 'notes' | 'coverImage'>> & {
+  programmeId?: string;
+  programmeName?: string;
+  programme?: string;
+  ksbProfileSourceId?: string;
+  cohortId?: string;
+  cohortName?: string;
+  cohort?: string;
+  groupId?: string;
+  groupName?: string;
+  group?: string;
+  startDate?: string;
+  endDate?: string;
+  tutor?: string;
+  coach?: string;
+  weeklySchedule?: CurriculumWeeklySession[];
+  weekDays?: string;
+  startTime?: string;
+  endTime?: string;
+  ksbMappings?: unknown[];
+  // Both are already honoured by PATCH /curriculum/modules/<id>/ — declared here
+  // so the module workspace can send them without casting.
+  status?: string;
+  /** Calendar sessions (weeks x delivery days per week). See `CurriculumModule`. */
+  sessionsNumber?: number;
+  /** Authored weeks. Sent alongside `sessionsNumber`, never instead of it. */
+  weeks?: number;
+  /**
+   * Book a slot the tutor already holds. Without it the save is refused with a
+   * 409 carrying `tutorConflicts` — see `isTutorConflictError`.
+   */
+  allowTutorConflict?: boolean;
+};
+export type CurriculumComponentInput = Partial<Omit<CurriculumComponent, 'lastEdited'>>;
+export type CurriculumCohortInput = { id?: string; cohortId?: string; name?: string; programme?: string; programmeId?: string; startDate?: string; endDate?: string; durationMonths?: number; epaMonths?: number | null; /** null clears the manual apprenticeship end date and restores the calculated one. */ apprenticeshipEndOverride?: string | null; color?: string; moduleName?: string; sessionsNumber?: number; /** The ticked ids -- the holidays this cohort's module sessions must skip. */ holidayIds?: Array<string | number>; /** The unticked ids, from the same in-period list. Sent alongside `holidayIds` so an explicit empty array ("Select all") is never mistaken for the key being omitted. */ excludedHolidayIds?: Array<string | number> };
+export type CurriculumGroupInput = { id?: string; groupId?: string; name?: string; cohortId?: string; programmeId?: string; tutor?: string; coach?: string; color?: string; weekDays?: string; startTime?: string; endTime?: string; startDate?: string; endDate?: string; moduleName?: string; sessionsNumber?: number; /** Honoured by PATCH /curriculum/groups/<id>/ only. */ status?: string; /** See CurriculumModuleInput.allowTutorConflict. */ allowTutorConflict?: boolean };
+export type CurriculumSessionInput = Partial<Pick<CurriculumSession, 'date' | 'startTime' | 'endTime' | 'tutor'>>;
+export type CurriculumStaffingInput = { groupId?: string; tutor?: string; coach?: string; /** See CurriculumModuleInput.allowTutorConflict. */ allowTutorConflict?: boolean };
+export type CurriculumModuleAttachmentInput = {
+  moduleName: string;
+  programmeId?: string;
+  cohortId?: string;
+  groupId?: string;
+  catalogueId?: string | number;
+  color?: string;
+  /** See CurriculumModule.coverImage. */
+  coverImage?: string;
+  startDate?: string;
+  endDate?: string;
+  coach?: string;
+  tutor?: string;
+  weeklySchedule?: CurriculumWeeklySession[];
+  weekDays?: string;
+  startTime?: string;
+  endTime?: string;
+  sessionsNumber?: number;
+  weeks?: number;
+  notes?: string;
+  holidays?: unknown[];
+  linkedHolidays?: unknown[];
+  /** See CurriculumModuleInput.allowTutorConflict. */
+  allowTutorConflict?: boolean;
+};
+export type FreeProgrammeComponentInput = Partial<FreeProgrammeComponent> & {
+  id: string;
+  type: string;
+  settings?: Record<string, unknown>;
+};
+export type FreeProgrammeModuleInput = {
+  id?: string;
+  courseId?: string;
+  weekId?: string;
+  weekNumber?: number;
+  weekTitle?: string;
+  courseName?: string;
+  title: string;
+  description?: string;
+  coverImageUrl?: string;
+  components?: FreeProgrammeComponentInput[];
+};
+
+export function createCurriculumProgramme(input: CurriculumProgrammeInput) {
+  return postJson<{ created: boolean; programme: CurriculumProgramme }>('/curriculum/programmes/', input);
+}
+
+export function updateCurriculumProgramme(id: string, input: CurriculumProgrammeInput) {
+  return patchJson<{ updated: boolean; programme: CurriculumProgramme }>(`/curriculum/programmes/${encodeURIComponent(id)}/`, input);
+}
+
+/**
+ * What a programme DELETE answers with — an archive, or a permanent removal.
+ *
+ * `removed` counts the curriculum rows a permanent delete took with it, keyed by
+ * kind; `learners` is how many learner plans referenced it and were left alone.
+ * See curriculum_api.views.curriculum_programme_detail.
+ */
+export type CurriculumProgrammeDeleteResult = {
+  deleted: boolean;
+  permanent: boolean;
+  archived?: boolean;
+  reason?: string;
+  message?: string;
+  id: string;
+  removed?: Record<string, number>;
+  learners?: number;
+};
+
+/** What still hangs off a programme, when a permanent delete is refused. */
+export type CurriculumProgrammeDependencyReport = {
+  blocked: boolean;
+  counts: Record<string, number>;
+  total: number;
+  programme?: {
+    id?: string;
+    sourceId?: string;
+    name?: string;
+  };
+  cleanupStartStep?: string;
+  message?: string;
+};
+
+/**
+ * A refused delete. `blockers` names what still depends on the programme —
+ * learner delivery, which is never deleted with a programme — so the caller can
+ * say what has to be cleared first rather than only that it failed.
+ */
+export type CurriculumProgrammeDependencyError = {
+  error?: string;
+  reason?: 'programme-has-dependencies' | 'programme-has-learner-delivery' | 'programme-not-archived' | string;
+  deleted?: false;
+  permanent?: false;
+  id?: string;
+  blockers?: Record<string, number>;
+  dependencyReport?: CurriculumProgrammeDependencyReport;
+  message?: string;
+};
+
+export function deleteCurriculumProgramme(id: string, options: { permanent?: boolean } = {}) {
+  const suffix = options.permanent ? '?permanent=true' : '';
+  return fetchJson<CurriculumProgrammeDeleteResult>(
+    `/curriculum/programmes/${encodeURIComponent(id)}/${suffix}`,
+    { method: 'DELETE', timeoutMs: 60000 },
+  );
+}
+
+export const archiveCurriculumProgramme = (id: string) => deleteCurriculumProgramme(id);
+export const permanentlyDeleteCurriculumProgramme = (id: string) => deleteCurriculumProgramme(id, { permanent: true });
+
+export type CurriculumProgrammeRestoreResult = {
+  restored: boolean;
+  id: string;
+  programme?: CurriculumProgramme | null;
+  details?: {
+    programmeRestored?: boolean;
+    cohorts?: number;
+    groups?: number;
+    modules?: number;
+    weeks?: number;
+    components?: number;
+    ksbMappings?: number;
+  };
+  message?: string;
+};
+
+export function restoreCurriculumProgramme(id: string) {
+  return postJson<CurriculumProgrammeRestoreResult>(
+    `/curriculum/programmes/${encodeURIComponent(id)}/restore/`,
+    {},
+  );
+}
+
+export function createCurriculumCohort(input: CurriculumCohortInput) {
+  return postJson<{ created: boolean; cohort: CurriculumCohort }>('/curriculum/cohorts/', input);
+}
+
+export function createProgrammeCohort(programmeId: string, input: Omit<CurriculumCohortInput, 'programme'>) {
+  return postJson<{ created: boolean; cohort: CurriculumCohort }>(`/curriculum/programmes/${encodeURIComponent(programmeId)}/cohorts/`, input);
+}
+
+export function updateCurriculumCohort(id: string, input: CurriculumCohortInput) {
+  return patchJson<{ updated: boolean; id: string }>(`/curriculum/cohorts/${encodeURIComponent(id)}/`, input);
+}
+
+export function archiveCurriculumCohort(id: string) {
+  return deleteJson(`/curriculum/cohorts/${encodeURIComponent(id)}/`);
+}
+
+export function createCurriculumGroup(input: CurriculumGroupInput) {
+  return postJson<{ created: boolean; group: CurriculumGroup }>('/curriculum/groups/', input);
+}
+
+export function createCohortGroup(cohortId: string, input: Omit<CurriculumGroupInput, 'cohortId'>) {
+  return postJson<{ created: boolean; group: CurriculumGroup }>(`/curriculum/cohorts/${encodeURIComponent(cohortId)}/groups/`, input);
+}
+
+export function updateCurriculumGroup(id: string, input: CurriculumGroupInput) {
+  return patchJson<{ updated: boolean; id: string; teamsCalendarsToUpdate?: StaleTeamsCalendar[] }>(`/curriculum/groups/${encodeURIComponent(id)}/`, input);
+}
+
+export function archiveCurriculumGroup(id: string) {
+  return deleteJson(`/curriculum/groups/${encodeURIComponent(id)}/`);
+}
+
+// ============================================================================
+// The cohort/group archive.
+//
+// `archiveCurriculumCohort`/`archiveCurriculumGroup` above soft-delete: the row
+// keeps its place in the database and only leaves the active lists. These are
+// the two things that were missing on the other side of that — reading what is
+// archived, and either putting one back or removing it for good — and they
+// mirror the programme archive (`restoreCurriculumProgramme` /
+// `permanentlyDeleteCurriculumProgramme`) call for call.
+// ============================================================================
+
+/** How a record came to be archived, as the archive list reports it. */
+export interface CurriculumArchiveStamp {
+  /** When the archive happened, ISO. */
+  archivedAt: string;
+  /**
+   * The write handler that archived it — 'cohort-delete', 'group-delete',
+   * 'programme-delete'. Never a person: no authoring table records who.
+   */
+  archivedBy: string;
+  /**
+   * The parent whose own archive took this row down, when that is what
+   * happened. Restoring that parent is what brings this record back.
+   */
+  archivedViaParent: string;
+}
+
+export interface CurriculumArchivedCohort extends CurriculumArchiveStamp {
+  id: string;
+  name: string;
+  programme: string;
+  programmeId: string;
+  startDate: string;
+  endDate: string;
+  practicalEndDate: string;
+  apprenticeshipEndDate: string;
+  epaMonths: number | null;
+  durationMonths: number;
+  color: string;
+  status: 'archived';
+  /** Archived groups under it — what a restore returns and a delete removes. */
+  groups: number;
+  /** Live learners still placed here. Any at all blocks a permanent delete. */
+  learners: number;
+}
+
+export interface CurriculumArchivedGroup extends CurriculumArchiveStamp {
+  id: string;
+  name: string;
+  cohortId: string;
+  cohort: string;
+  programmeId: string;
+  programme: string;
+  coach: string;
+  weekDays: string;
+  startTime: string;
+  endTime: string;
+  schedule: string;
+  color: string;
+  status: 'archived';
+  learners: number;
+  /**
+   * Its cohort is archived too, so this group has nothing to come back to. The
+   * restore endpoint refuses it and says to restore the cohort instead, which
+   * brings back every group archived with it.
+   */
+  cohortArchived: boolean;
+}
+
+export interface CurriculumArchivedModule extends CurriculumArchiveStamp {
+  id: string;
+  catalogueId: string;
+  title: string;
+  programmeId: string;
+  programme: string;
+  cohortId: string;
+  cohort: string;
+  groupId: string;
+  group: string;
+  tutor: string;
+  /** What a restore brings back, and a permanent delete destroys. */
+  weeks: number;
+  sessions: number;
+  components: number;
+  status: 'archived';
+  /**
+   * Its programme is archived too, so the module has nothing to come back to:
+   * every catalogue list is scoped by programme, and a module restored under an
+   * archived one returns invisible. Restore the programme instead.
+   */
+  programmeArchived: boolean;
+}
+
+/**
+ * `revalidate` on both reads below: the archive is opened in order to act on it,
+ * and the very next thing the reader does is restore or delete something, so a
+ * cached list would keep showing the row that was just dealt with. Not
+ * `skipCache` — these two endpoints read the tables directly rather than through
+ * the cached overview payload, so there is no server-side build to force.
+ */
+export function fetchArchivedCurriculumCohorts(signal?: AbortSignal): Promise<CurriculumArchivedCohort[]> {
+  return fetchCollection<CurriculumArchivedCohort>('/curriculum/cohorts/archived/', { signal, revalidate: true });
+}
+
+export function fetchArchivedCurriculumGroups(signal?: AbortSignal): Promise<CurriculumArchivedGroup[]> {
+  return fetchCollection<CurriculumArchivedGroup>('/curriculum/groups/archived/', { signal, revalidate: true });
+}
+
+export function fetchArchivedCurriculumModules(signal?: AbortSignal): Promise<CurriculumArchivedModule[]> {
+  return fetchCollection<CurriculumArchivedModule>('/curriculum/modules/archived/', { signal, revalidate: true });
+}
+
+export type CurriculumRestoreResult = {
+  restored: boolean;
+  id: string;
+  /** Only the cohort restore reports one: the groups it brought back with it. */
+  details?: { groups?: number };
+  message?: string;
+};
+
+/**
+ * Restoring a cohort brings back the groups its own archive took down; a group
+ * archived on its own keeps its own state, exactly as a programme restore works.
+ *
+ * Refused with 409 when the parent is still archived — restore that instead —
+ * and the refusal carries the sentence to show.
+ */
+export function restoreCurriculumCohort(id: string) {
+  return postJson<CurriculumRestoreResult>(`/curriculum/cohorts/${encodeURIComponent(id)}/restore/`, {});
+}
+
+/**
+ * Brings back the weeks, components and KSB mappings archived with the module --
+ * matched on the marker its own archive stamped, so a component deleted by hand
+ * beforehand stays deleted. Refused with 409 while its programme is archived.
+ *
+ * Quizzes are the one thing it cannot return: archiving a module sends the
+ * quizzes only it owned to the Quiz Archive, which is the Quiz Workspace's own
+ * state. The response says so in `message`.
+ */
+export function restoreCurriculumModule(id: string) {
+  return postJson<CurriculumRestoreResult>(`/curriculum/modules/${encodeURIComponent(id)}/restore/`, {});
+}
+
+export function restoreCurriculumGroup(id: string) {
+  return postJson<CurriculumRestoreResult>(`/curriculum/groups/${encodeURIComponent(id)}/restore/`, {});
+}
+
+export type CurriculumPermanentDeleteResult = {
+  deleted: boolean;
+  permanent: boolean;
+  id: string;
+  /** Rows the delete removed, keyed by table. */
+  removed?: Record<string, number>;
+  message?: string;
+};
+
+/**
+ * Only an already-archived record can be removed for good, and only while
+ * nothing live still depends on it: learners placed in it, or — for a cohort —
+ * a group that is not archived. Either refusal comes back as a 409 naming what
+ * to clear first. Module content is never deleted with the delivery record.
+ */
+export function permanentlyDeleteCurriculumCohort(id: string) {
+  return deleteJson<CurriculumPermanentDeleteResult>(`/curriculum/cohorts/${encodeURIComponent(id)}/?permanent=true`);
+}
+
+export function permanentlyDeleteCurriculumGroup(id: string) {
+  return deleteJson<CurriculumPermanentDeleteResult>(`/curriculum/groups/${encodeURIComponent(id)}/?permanent=true`);
+}
+
+/**
+ * Unlike the cohort and group deletes above, this one does destroy authoring:
+ * the module row and every week, component, KSB mapping, completion rule and
+ * advanced detail under it. There is nothing left to restore afterwards.
+ */
+export function permanentlyDeleteCurriculumModule(id: string) {
+  return deleteJson<CurriculumPermanentDeleteResult>(`/curriculum/modules/${encodeURIComponent(id)}/?permanent=true`);
+}
+
+export function fetchFreeProgrammeModules(programmeId: string, signal?: AbortSignal): Promise<FreeProgrammeModule[]> {
+  return fetchCollection<FreeProgrammeModule>(`/curriculum/free-programmes/${encodeURIComponent(programmeId)}/modules/`, { signal });
+}
+
+export function saveFreeProgrammeModules(programmeId: string, input: { programmeName?: string; modules: FreeProgrammeModuleInput[] }) {
+  return patchJson<{ saved: boolean; programmeId: string; modules: FreeProgrammeModule[] }>(`/curriculum/free-programmes/${encodeURIComponent(programmeId)}/modules/`, input);
+}
+
+export function createGroupModule(groupId: string, input: CurriculumModuleAttachmentInput) {
+  return postJson(`/curriculum/groups/${encodeURIComponent(groupId)}/modules/`, input);
+}
+
+export function fetchGroupModules(groupId: string, signal?: AbortSignal): Promise<CurriculumModule[]> {
+  return fetchCollection<CurriculumModule>(`/curriculum/groups/${encodeURIComponent(groupId)}/modules/`, { signal });
+}
+
+/**
+ * The canonical practical-end / EPA / apprenticeship-end calculation, run by the
+ * backend. Editors call this while the user types rather than reimplementing the
+ * date rules client-side, so the preview and the saved value cannot disagree.
+ */
+export function previewCohortEndDate(input: {
+  startDate?: string;
+  durationMonths?: number;
+  /** An authored practical end date. Overrides the duration rule for this preview. */
+  practicalEndDate?: string | null;
+  epaMonths?: number | null;
+  apprenticeshipEndDate?: string;
+  apprenticeshipEndOverride?: string | null;
+  /**
+   * The holidays applied to this cohort. Days these take out of the cohort's own
+   * period push the practical end date out, which carries the apprenticeship end
+   * date with it via the EPA rule.
+   */
+  holidays?: { label?: string; startDate: string; endDate: string }[];
+}) {
+  return postJson<CurriculumCohortEndDatePreview>('/curriculum/preview/cohort-end-date/', input);
+}
+
+export function previewModuleSessionPlan(input: { startDate?: string; numberOfSessions?: number; sessionsNumber?: number; weeklySchedule?: CurriculumWeeklySession[]; weekDays?: string | string[]; deliveryDays?: string | string[]; holidays?: unknown[] }) {
+  return postJson<CurriculumSessionPlanPreview>('/curriculum/preview/module-session-plan/', input);
+}
+
+/** The slot a tutor is being asked about. Matches the module's own schedule fields. */
+export interface CurriculumTutorAvailabilityInput {
+  startDate?: string;
+  sessionsNumber?: number | string;
+  weeklySchedule?: CurriculumWeeklySession[];
+  weekDays?: string;
+  startTime?: string;
+  endTime?: string;
+  /** Ask about one person. Omit to get a verdict for every tutor in one call. */
+  tutor?: string;
+  /** The module being edited, so it is not reported as blocking its own slot. */
+  moduleCatalogueId?: string;
+  /**
+   * The parent cohort, so the slot is dated the way the calendar dates it — its
+   * ticked holidays move a session onto the next delivery day, and a clash is
+   * about the day the session actually runs on.
+   */
+  cohortId?: string;
+  /**
+   * The ticked holidays themselves, for a form previewing a cohort choice that
+   * is not saved yet. Sent, they win over what `cohortId` would have read back.
+   */
+  holidays?: CurriculumHoliday[];
+}
+
+export interface CurriculumTutorAvailabilityVerdict {
+  tutor: string;
+  available: boolean;
+  conflicts: CurriculumTutorConflict[];
+  /** The same sentence the save would have refused with, or '' when free. */
+  message: string;
+}
+
+export interface CurriculumTutorAvailabilitySlot {
+  sessionDates: string[];
+  startTime: string;
+  endTime: string;
+  /** False when the slot books nothing, so "everyone is free" is not an all-clear. */
+  bookable: boolean;
+}
+
+export type CurriculumTutorAvailability = CurriculumTutorAvailabilitySlot & CurriculumTutorAvailabilityVerdict;
+
+export type CurriculumTutorAvailabilityRoster = CurriculumTutorAvailabilitySlot & {
+  results: CurriculumTutorAvailabilityVerdict[];
+  availableCount: number;
+  busyCount: number;
+};
+
+/**
+ * Whether a tutor is already teaching in a proposed slot — asked *before* saving.
+ *
+ * Runs the same rule the save enforces, so a screen can warn while the tutor is
+ * still being chosen instead of letting the person fill in a whole form and
+ * discover the clash from a refused save.
+ */
+export function previewTutorAvailability(input: CurriculumTutorAvailabilityInput & { tutor: string }) {
+  return postJson<CurriculumTutorAvailability>('/curriculum/preview/tutor-availability/', input);
+}
+
+/** Every tutor's verdict for one slot, for annotating a tutor picker. */
+export function previewTutorAvailabilityRoster(input: CurriculumTutorAvailabilityInput) {
+  return postJson<CurriculumTutorAvailabilityRoster>('/curriculum/preview/tutor-availability/', input);
+}
+
+export function createCurriculumModule(input: CurriculumModuleInput) {
+  return postJson<{ created: boolean; module: CurriculumModule }>('/curriculum/modules/', input);
+}
+
+/**
+ * A module whose Teams calendar a schedule edit has just left behind. The saves
+ * that move dates name these back so the drawer can say so on the spot: the
+ * calendar itself is only ever written from the Teams Meetings page, so nothing
+ * about a date change reaches Teams on its own.
+ */
+export interface StaleTeamsCalendar {
+  moduleCatalogueId: string;
+  moduleName: string;
+}
+
+export function updateCurriculumModule(id: string, input: CurriculumModuleInput) {
+  return patchJson<{ updated: boolean; module: CurriculumModule; teamsCalendarsToUpdate?: StaleTeamsCalendar[] }>(`/curriculum/modules/${encodeURIComponent(id)}/`, input);
+}
+
+export function updateCurriculumModuleCover(id: string, coverImage: string) {
+  return patchJson<{ updated: boolean; coverImage: string }>(`/curriculum/modules/${encodeURIComponent(id)}/`, { coverImage });
+}
+
+export function archiveCurriculumModule(id: string) {
+  return deleteJson<{ archived: boolean; id: string }>(`/curriculum/modules/${encodeURIComponent(id)}/`);
+}
+
+export function createCurriculumComponent(input: CurriculumComponentInput) {
+  return postJson<{ created: boolean; component: CurriculumComponent }>('/curriculum/components/', input);
+}
+
+export function updateCurriculumComponent(id: string, input: CurriculumComponentInput) {
+  return patchJson<{ updated: boolean; component: CurriculumComponent }>(`/curriculum/components/${encodeURIComponent(id)}/`, input);
+}
+
+export function deleteCurriculumComponent(id: string) {
+  return deleteJson<{ deleted: boolean; id: string }>(`/curriculum/components/${encodeURIComponent(id)}/`);
+}
+
+export function createCurriculumSession(input: CurriculumSessionInput) {
+  return postJson('/curriculum/sessions/', input);
+}
+
+export function updateCurriculumSession(id: string, input: CurriculumSessionInput) {
+  return patchJson(`/curriculum/sessions/${encodeURIComponent(id)}/`, input);
+}
+
+export function archiveCurriculumSession(id: string) {
+  return deleteJson(`/curriculum/sessions/${encodeURIComponent(id)}/`);
+}
+
+export function createStaffingAssignment(input: CurriculumStaffingInput) {
+  return postJson('/curriculum/staffing/', input);
+}
+
+export function updateStaffingAssignment(id: string, input: CurriculumStaffingInput) {
+  return patchJson(`/curriculum/staffing/${encodeURIComponent(id)}/`, input);
+}
+
+export function deleteStaffingAssignment(id: string) {
+  return deleteJson(`/curriculum/staffing/${encodeURIComponent(id)}/`);
+}
+
+// Holidays: the authored half of the calendar is written through these three.
+// A GOV.UK bank holiday is not — the endpoint answers 405 for one, because it
+// changes when GOV.UK changes it and not before. See `refreshEnglandHolidays`.
+
+export function createCurriculumHoliday(input: CurriculumHolidayInput) {
+  return postJson('/curriculum/holidays/', input);
+}
+
+export function updateCurriculumHoliday(id: string | number, input: CurriculumHolidayInput) {
+  return patchJson(`/curriculum/holidays/${encodeURIComponent(String(id))}/`, input);
+}
+
+export function archiveCurriculumHoliday(id: string | number) {
+  return deleteJson(`/curriculum/holidays/${encodeURIComponent(String(id))}/`);
+}
+
+/**
+ * Every recent check against GOV.UK, newest first, with the current state.
+ *
+ * The England Holidays page reads this to show what the site changed and when it
+ * was last looked at. Deliberately a separate call from the holidays themselves:
+ * it is a log, it is only read on that one page, and it must never be cached
+ * alongside the dates.
+ */
+export function fetchEnglandHolidaySyncs(signal?: AbortSignal, limit = 20): Promise<{
+  status: EnglandHolidaySyncStatus;
+  results: EnglandHolidaySync[];
+}> {
+  return fetchJson(`/curriculum/england-holidays/syncs/?limit=${encodeURIComponent(String(limit))}`, {
+    signal,
+    skipCache: true,
+  });
+}
+
+/**
+ * Check GOV.UK now and report what moved.
+ *
+ * The mirror refreshes itself on an interval; this is the "I have just read that
+ * a bank holiday changed and need it today" path. `dryRun` reports without
+ * writing.
+ */
+export function refreshEnglandHolidays(options: { dryRun?: boolean } = {}): Promise<{
+  summary: EnglandHolidaySync & { applied: boolean; unchanged: number };
+  status: EnglandHolidaySyncStatus;
+}> {
+  return postJson('/curriculum/england-holidays/refresh/', { dryRun: Boolean(options.dryRun) });
+}
+
+// ---------------------------------------------------------------------------
+// Programme Reviews ("Reviews ID" tab)
+//
+// A Review here is a reusable *template* belonging to one Programme -- its
+// recurrence, eligibility and Form Builder questions. It is not a learner's
+// completed review; that is a future, separate domain. Review ids are opaque
+// strings minted by the backend (REV-...), the same id style as every other
+// curriculum entity (MOD-..., PROG-...) -- never parsed here, never generated
+// here.
+
+/**
+ * The canonical Programme status values (learner_api/constants.py
+ * PROGRAMME_STATUS_CHOICES). No frontend copy of this existed before Reviews;
+ * kept in sync by hand since curriculum_api has no read endpoint for it yet.
+ */
+export const CURRICULUM_PROGRAMME_STATUSES = [
+  'Fresh user', 'Onboarding', 'Delivery', 'Ready to enrol', 'Active', 'Withdrawn', 'On break', 'Completed',
+] as const;
+
+export type ReviewRecurrenceUnit = 'days' | 'weeks' | 'months';
+
+export type ReviewFieldType =
+  | 'text'
+  | 'boolean'
+  | 'numeric'
+  | 'date'
+  | 'list_item'
+  | 'boolean_case_block'
+  | 'email'
+  | 'phone'
+  | 'postcode_address'
+  | 'title_description'
+  | 'text_multiline'
+  | 'action_button';
+
+export const REVIEW_FIELD_TYPE_LABELS: Record<ReviewFieldType, string> = {
+  text: 'Text',
+  boolean: 'Boolean',
+  numeric: 'Numeric',
+  date: 'Date',
+  list_item: 'List item',
+  boolean_case_block: 'Boolean with case block',
+  email: 'Email',
+  phone: 'Phone number',
+  postcode_address: 'Post code and address',
+  title_description: 'Title & description',
+  text_multiline: 'Text (multiline)',
+  action_button: 'Action button',
+};
+
+export const REVIEW_FIELD_TYPES: ReviewFieldType[] = Object.keys(REVIEW_FIELD_TYPE_LABELS) as ReviewFieldType[];
+
+/** Field types that carry a Boolean with case block's IF YES / IF NO children. */
+export const CONDITIONAL_FIELD_TYPE: ReviewFieldType = 'boolean_case_block';
+
+/** Field types with no learner-entered answer -- Required/Optional is not shown for these. */
+export const DISPLAY_ONLY_FIELD_TYPES: ReviewFieldType[] = ['title_description', 'action_button'];
+
+export type ReviewParticipantRole = 'advisor' | 'employer' | 'participant' | 'referrer';
+
+export type ReviewConditionValue = 'yes' | 'no';
+
+export interface ListItemConfiguration {
+  options: string[];
+}
+
+export interface TitleDescriptionConfiguration {
+  description: string;
+}
+
+/** Discriminated by fieldType at the call site; falls back to a generic bag for
+ * types (text, boolean, numeric, date, email, phone, postcode_address, ...)
+ * that carry no field-specific configuration today. */
+export type ReviewFieldConfiguration = ListItemConfiguration | TitleDescriptionConfiguration | Record<string, unknown>;
+
+export interface ReviewField {
+  id: string;
+  reviewId: string;
+  sectionId: string;
+  /** Set only on a conditional child -- the id of its Boolean-with-case-block parent. */
+  parentFieldId: string | null;
+  /** Set only on a conditional child -- which branch of its parent it belongs to. */
+  conditionValue: ReviewConditionValue | null;
+  title: string;
+  fieldType: ReviewFieldType;
+  required: boolean;
+  displayOrder: number;
+  configuration: ReviewFieldConfiguration;
+  createdAt: string;
+  updatedAt: string;
+  /** Present (possibly empty) only when fieldType is 'boolean_case_block'. */
+  yesFields?: ReviewField[];
+  /** Present (possibly empty) only when fieldType is 'boolean_case_block'. */
+  noFields?: ReviewField[];
+}
+
+export interface ReviewFieldInput {
+  id?: string;
+  title: string;
+  fieldType: ReviewFieldType;
+  required: boolean;
+  configuration?: ReviewFieldConfiguration;
+  /** boolean_case_block only. */
+  yesFields?: ReviewFieldInput[];
+  /** boolean_case_block only. */
+  noFields?: ReviewFieldInput[];
+}
+
+export interface ReviewSection {
+  id: string;
+  reviewId: string;
+  title: string;
+  estimatedMinutes: number;
+  displayOrder: number;
+  enabled: boolean;
+  fields: ReviewField[];
+}
+
+export interface ReviewSectionInput {
+  id?: string;
+  title: string;
+  estimatedMinutes: number;
+  enabled: boolean;
+  fields: ReviewFieldInput[];
+}
+
+export interface ReviewRoleFlags {
+  advisor: boolean;
+  employer: boolean;
+  participant: boolean;
+  referrer: boolean;
+}
+
+export interface ReviewNotificationFlags {
+  employer: boolean;
+  participant: boolean;
+}
+
+/** A Review's classification, chosen in the Review editor's General tab.
+ *
+ *  Type is NOT name and NOT schedule: a Review named "Monthly Learner
+ *  Catch-up" of type Monthly Coaching Meeting still filters as MCM on the
+ *  coach calendar, and it may recur every 6 weeks -- the type never implies a
+ *  recurrence. `code` is generated once from the name and frozen, so routing
+ *  survives a rename; `id` is the only thing a Review ever stores. */
+export interface ReviewType {
+  id: string;
+  name: string;
+  /** Stable routing code. 'mcm' and 'progress_review' are the system types. */
+  code: string;
+  /** System types can never be renamed or deleted. */
+  isSystem: boolean;
+  isActive: boolean;
+}
+
+export interface ReviewApplicability {
+  scope: 'programme' | 'cohort' | 'group';
+  ids: string[];
+}
+
+export interface ReviewSummary {
+  id: string;
+  programmeId: string;
+  name: string;
+  enabled: boolean;
+  recurrence: { interval: number; unit: ReviewRecurrenceUnit };
+  /** The date the first occurrence is calculated from -- see the Review Schedule below. */
+  scheduleAnchorDate: string;
+  /** How many times this review recurs before it stops; null/undefined means unlimited. */
+  occurrenceCount: number | null;
+  /** The Review Type this review is classified as -- a review_types.id, the
+   *  stable identity every downstream consumer keys on. */
+  reviewTypeId: string;
+  /** Echoed for display and calendar routing; never written by a client. */
+  reviewTypeCode: string;
+  reviewTypeName: string;
+  applicableStatuses: string[];
+  applicability?: ReviewApplicability;
+  fieldCount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ReviewDetail extends ReviewSummary {
+  signatures: ReviewRoleFlags;
+  visibleTo: ReviewRoleFlags;
+  recordTimeSpent: boolean;
+  /** Hours one occurrence of this review is expected to take. */
+  expectedOtjh: number;
+  /** Whether completing an occurrence adds expectedOtjh to the learner's total OTJH. */
+  countsTowardsOtjh: boolean;
+  allowEditingPriorDays: number;
+  notifications: ReviewNotificationFlags;
+  incompleteMarker: string;
+  createdBy: string;
+  updatedBy: string;
+  /** Canonical Form Builder structure: Section -> Field -> optional conditional children. */
+  sections: ReviewSection[];
+  /** Flattened convenience view (every top-level field, across every section) -- see reviews.py. */
+  fields: ReviewField[];
+}
+
+export interface CreateReviewInput {
+  name: string;
+  enabled: boolean;
+  recurrence: { interval: number; unit: ReviewRecurrenceUnit };
+  /** Optional -- defaults to today on the backend when omitted. */
+  scheduleAnchorDate?: string;
+  /** Optional -- omit or leave null for a review that recurs indefinitely. */
+  occurrenceCount?: number | null;
+  /** Required -- a Review cannot be saved without a Review Type. */
+  reviewTypeId: string;
+  applicableStatuses: string[];
+  applicability?: ReviewApplicability;
+  signatures: ReviewRoleFlags;
+  visibleTo: ReviewRoleFlags;
+  recordTimeSpent: boolean;
+  expectedOtjh: number;
+  countsTowardsOtjh: boolean;
+  allowEditingPriorDays: number;
+  notifications: ReviewNotificationFlags;
+  incompleteMarker: string;
+  sections: ReviewSectionInput[];
+}
+
+export type UpdateReviewInput = Partial<CreateReviewInput>;
+
+export interface CloneReviewRequest {
+  sourceProgrammeId: string;
+  reviewIds: string[];
+}
+
+export interface CloneReviewResponse {
+  cloned: boolean;
+  sourceProgrammeId: string;
+  programmeId: string;
+  reviewIds: string[];
+  reviews: ReviewSummary[];
+}
+
+export interface FetchReviewsOptions {
+  signal?: AbortSignal;
+  skipCache?: boolean;
+  revalidate?: boolean;
+}
+
+/** Every active Review Type, system types first. */
+export function fetchReviewTypes(options: FetchReviewsOptions = {}) {
+  return fetchCollection<ReviewType>('/curriculum/review-types/', {
+    signal: options.signal,
+    skipCache: options.skipCache,
+    revalidate: options.revalidate,
+  });
+}
+
+/** Create a custom Review Type. The name is the ONLY thing a user supplies:
+ *  the backend generates the id, the stable code, and the system/active
+ *  flags, so none of them appear in the create UI. */
+export async function createReviewType(name: string) {
+  const payload = await postJson<{ created: boolean; reviewType: ReviewType }>(
+    '/curriculum/review-types/', { name },
+  );
+  return payload.reviewType;
+}
+
+/** Deactivate a custom Review Type. Never a hard delete -- Reviews already
+ *  classified with it keep working and keep classifying. System types are
+ *  refused by the backend. */
+export function archiveReviewType(reviewTypeId: string) {
+  return deleteJson<{ deleted: boolean; archived: boolean; id: string; reviewType: ReviewType }>(
+    `/curriculum/review-types/${encodeURIComponent(reviewTypeId)}/`,
+  );
+}
+
+export function fetchProgrammeReviews(programmeId: string, options: FetchReviewsOptions = {}) {
+  return fetchCollection<ReviewSummary>(`/curriculum/programmes/${encodeURIComponent(programmeId)}/reviews/`, {
+    signal: options.signal,
+    skipCache: options.skipCache,
+    revalidate: options.revalidate,
+  });
+}
+
+export async function fetchReviewDetail(reviewId: string, options: FetchReviewsOptions = {}) {
+  const payload = await fetchJson<{ review: ReviewDetail }>(`/curriculum/reviews/${encodeURIComponent(reviewId)}/`, {
+    signal: options.signal,
+    skipCache: options.skipCache,
+    revalidate: options.revalidate,
+  });
+  return payload.review;
+}
+
+export async function createReviewTemplate(programmeId: string, input: CreateReviewInput) {
+  const payload = await postJson<{ created: boolean; review: ReviewDetail }>(
+    `/curriculum/programmes/${encodeURIComponent(programmeId)}/reviews/`, input,
+  );
+  return payload.review;
+}
+
+export async function updateReviewTemplate(reviewId: string, input: UpdateReviewInput) {
+  const payload = await patchJson<{ updated: boolean; review: ReviewDetail }>(
+    `/curriculum/reviews/${encodeURIComponent(reviewId)}/`, input,
+  );
+  return payload.review;
+}
+
+export function archiveReviewTemplate(reviewId: string) {
+  return deleteJson<{ deleted: boolean; permanent: boolean; archived: boolean; id: string }>(
+    `/curriculum/reviews/${encodeURIComponent(reviewId)}/`,
+  );
+}
+
+export function cloneReviewTemplates(programmeId: string, input: CloneReviewRequest) {
+  return postJson<CloneReviewResponse>(`/curriculum/programmes/${encodeURIComponent(programmeId)}/reviews/clone/`, input);
+}
+
+// ---------------------------------------------------------------------------
+// Review Schedule / clash resolution
+//
+// A Programme can have several recurring Review templates whose occurrences
+// land in the same calendar month (e.g. a Progress Review every 12 weeks and
+// a Monthly Coaching Meeting every month). This previews each template's
+// projected occurrences, groups them by month, and lets staff decide -- per
+// month -- which occurrences stay scheduled. "Skip" removes one occurrence
+// from the effective schedule; it never disables or deletes the recurring
+// template, so future months are unaffected.
+
+export type ReviewScheduleOccurrenceStatus = 'scheduled' | 'skipped';
+export type ReviewScheduleResolutionStatus = 'none' | 'unresolved' | 'resolved' | 'kept_all';
+export type ReviewClashDecisionAction = 'skip' | 'keep';
+
+export interface ReviewScheduleOccurrence {
+  reviewId: string;
+  reviewName: string;
+  occurrenceDate: string;
+  recurrenceLabel: string;
+  status: ReviewScheduleOccurrenceStatus;
+  skippedBy: string | null;
+  skippedAt: string | null;
+  reason: string | null;
+}
+
+export interface ReviewScheduleMonth {
+  /** 'YYYY-MM' */
+  month: string;
+  hasClash: boolean;
+  resolutionStatus: ReviewScheduleResolutionStatus;
+  clashSignature: string | null;
+  occurrences: ReviewScheduleOccurrence[];
+}
+
+export interface ReviewScheduleResponse {
+  programmeId: string;
+  windowStart: string;
+  windowEnd: string;
+  monthsPreviewed: number;
+  months: ReviewScheduleMonth[];
+}
+
+export interface ReviewClashDecisionItem {
+  reviewId: string;
+  occurrenceDate: string;
+  action: ReviewClashDecisionAction;
+  reason?: string;
+}
+
+export interface ReviewClashResolutionInput {
+  month: string;
+  occurrences: ReviewClashDecisionItem[];
+}
+
+export interface ReviewClashResolutionResponse {
+  resolved: boolean;
+  programmeId: string;
+  month: ReviewScheduleMonth;
+}
+
+export interface FetchReviewScheduleOptions extends FetchReviewsOptions {
+  months?: number;
+}
+
+export function fetchReviewSchedule(programmeId: string, options: FetchReviewScheduleOptions = {}) {
+  const query = options.months ? `?months=${encodeURIComponent(String(options.months))}` : '';
+  return fetchJson<ReviewScheduleResponse>(`/curriculum/programmes/${encodeURIComponent(programmeId)}/reviews/schedule/${query}`, {
+    signal: options.signal,
+    skipCache: options.skipCache,
+    revalidate: options.revalidate,
+  });
+}
+
+export function resolveReviewClash(programmeId: string, input: ReviewClashResolutionInput) {
+  return postJson<ReviewClashResolutionResponse>(
+    `/curriculum/programmes/${encodeURIComponent(programmeId)}/reviews/clashes/resolve/`, input,
+  );
+}

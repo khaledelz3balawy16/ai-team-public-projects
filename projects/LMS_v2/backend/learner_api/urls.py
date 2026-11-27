@@ -1,0 +1,406 @@
+from . import working_hours_holidays
+from . import reward_tracking
+from . import employer_contracts
+from . import employer_meetings
+from .coach_availability import coach_available_slots, case_owner_available_slots
+from . import presentation_design
+from . import personal_learning
+from . import learner_import
+from . import monthly_reflection_ai
+from .assignment_ai_check import assignment_ai_check
+from . import ksb_generation
+from django.urls import include, path
+from coach_api.migrated_completion_views import (
+    migrated_review_party_csrf, migrated_review_party_detail, migrated_review_party_pdf, migrated_review_party_sign,
+    migrated_review_party_answers,
+)
+from coach_api.migrated_reopening_views import party_revision_pdf
+from coach_api.personal_support_access import prepare_learner_personal_support
+from coach_api.learner_review_prepare import prepare_learner_review, preview_learner_review
+from curriculum_api import recording_views
+from . import monthly_logs
+from .dashboard_metrics import learner_metrics
+from .overview_week import overview_week
+from .web_week_points import web_points
+from .rewards_summary import learner_rewards_summary
+from .profile_photo import learner_profile_photo
+from .attendance_lectures import attendance_lectures
+from .attendance_confirmation import confirm_attendance
+from .meeting_attendance import meeting_attendance, confirm_meeting_attendance
+from .attendance_mode import attendance_mode, attendance_modes, review_attendance_mode
+from .first_session_bookings import first_session_bookings
+from .first_login_details import first_login_details
+from .review_sessions import learner_review_sessions
+
+from . import certificates, monthly_assignment, legacy_assignments, quiz_reading, review_history
+from . import historical_evidence
+from . import mobile_absence
+from .dashboard_header import dashboard_header, dashboard_bootstrap
+from .dashboard_weekly import dashboard_weekly
+from .dashboard_tabs import dashboard_tab
+from .dashboard_training import training_module
+from . import module_progress, extra_activities, absence_reports, apprenticeship_agreement, attendance, calendar, components, curriculum, calendar_connections, employer_portal, employers, evidence, free_courses_view, ilr_document, monthly_assignment, monthly_reports, training_plan_document, written_agreement, learner_detail, learning_plan, lms_schema, media_proxy, module_shift, quizzes, reflection_ai, reflection_submissions, review_form, student_activity, time_tracking, training_plan_view, training_plan_dashboard, videos, views
+from .my_learning import my_learning
+from . import progress_transfer
+from . import support_tickets
+from . import reading_ocr
+from . import user_archive
+
+from curriculum_api import session_results
+from .session_recovery import link_catchup
+
+urlpatterns = [
+    path('web-points/<str:kind>/<int:pk>/', web_points, name='learner-web-points'),
+    path('reading/ocr/csrf/', reading_ocr.reading_ocr_csrf),
+    path('reading/ocr/', reading_ocr.reading_ocr),
+    path('support/tickets/', support_tickets.learner_tickets),
+    path('support/tickets/<uuid:ticket_id>/', support_tickets.learner_ticket),
+    path('support/tickets/<uuid:ticket_id>/attachments/<uuid:attachment_id>/', support_tickets.learner_attachment),
+    path('support/queue/', support_tickets.staff_tickets),
+    path('support/queue/<uuid:ticket_id>/', support_tickets.staff_ticket),
+    path('support/queue/<uuid:ticket_id>/attachments/<uuid:attachment_id>/', support_tickets.staff_attachment),
+    path('progress-transfer/requests/', progress_transfer.admin_requests),
+    path('progress-transfer/requests/<uuid:request_id>/', progress_transfer.admin_requests),
+    path('progress-transfer/<str:kind>/<int:pk>/', progress_transfer.learner_request),
+    path("mobile/absence-reports/", mobile_absence.absence_reports, name="mobile-absence-reports"),
+    path("mobile/", include("learner_api.mobile_urls")),
+    path('migrated-reviews/csrf', migrated_review_party_csrf, name='migrated-review-party-csrf'),
+    path('migrated-reviews/<str:review_id>/party', migrated_review_party_detail, name='migrated-review-party-detail'),
+    path('migrated-reviews/<str:review_id>/prepare-psp', prepare_learner_personal_support, name='learner-prepare-personal-support'),
+    path('migrated-reviews/<str:review_id>/prepare-review', prepare_learner_review, name='learner-prepare-migrated-review'),
+    path('migrated-reviews/<str:review_id>/preview-review/<str:kind>/<int:pk>', preview_learner_review, name='admin-preview-migrated-review'),
+    path('migrated-reviews/<str:review_id>/party-pdf', migrated_review_party_pdf, name='migrated-review-party-pdf'),
+    path('migrated-reviews/<str:review_id>/revisions/<int:number>/pdf', party_revision_pdf, name='migrated-review-party-revision-pdf'),
+    path('migrated-reviews/<str:review_id>/party-sign', migrated_review_party_sign, name='migrated-review-party-sign'),
+    path('migrated-reviews/<str:review_id>/party-answers', migrated_review_party_answers, name='migrated-review-party-answers'),
+    path("reflection/extra-activities/", extra_activities.list_extra_activities, name="learner-extra-activities"),
+    path('personal-learning/courses/', personal_learning.courses),
+    path('personal-learning/verify/<uuid:token>/', personal_learning.verify_certificate),
+    path('personal-learning/<str:identity>/request/', personal_learning.learner_request),
+    path('session-results/<str:kind>/<int:learner_id>/<str:series_id>/sessions/<int:session_number>/join/', session_results.learner_join),
+    path('session-catchup/<str:kind>/<int:learner_id>/', link_catchup),
+    path('session-results/<str:kind>/<int:learner_id>/<str:series_id>/sessions/<int:session_number>/', session_results.learner_results),
+    path('session-results/<str:kind>/<int:learner_id>/<str:series_id>/artifacts/<str:artifact_id>/', session_results.learner_content),
+    path('session-results/<str:kind>/<int:learner_id>/<str:series_id>/artifacts/<str:artifact_id>/watch/', recording_views.learner_recording_watch),
+    path("calendar/<str:kind>/<int:pk>/coach-availability/", coach_available_slots, name="coach-available-slots"),
+    # Enrolment: no learner exists yet, so the case owner is named directly.
+    path("calendar/case-owner-availability/", case_owner_available_slots, name="case-owner-availability"),
+    path('monthly-logs/learners/', monthly_logs.learners, name='monthly-log-learners'),
+    path('monthly-logs/<int:learner_id>/', monthly_logs.summary, name='monthly-log-summary'),
+    path('monthly-logs/<int:learner_id>/documents/<uuid:file_id>/', monthly_logs.document, name='monthly-log-document'),
+    path('monthly-logs/<int:learner_id>/canonical-documents/<int:file_id>/', monthly_logs.canonical_document, name='monthly-log-canonical-document'),
+    path('monthly-logs/<int:learner_id>/<str:month>/', monthly_logs.detail, name='monthly-log-detail'),
+    path('monthly-logs/<int:learner_id>/<str:month>/manual-time/<int:progress_id>/', monthly_logs.correct_manual_time, name='monthly-log-manual-time'),
+    path('monthly-logs/<int:learner_id>/<str:month>/sign/', monthly_logs.sign, name='monthly-log-sign'),
+    path('monthly-logs/<int:learner_id>/<str:month>/complete/', monthly_logs.complete, name='monthly-log-complete'),
+    path('monthly-logs/<int:learner_id>/<str:month>/unlock/', monthly_logs.unlock, name='monthly-log-unlock'),
+    path('monthly-logs/<int:learner_id>/<str:month>/activities/<int:row_id>/', monthly_logs.content, name='monthly-log-content'),
+    path('monthly-logs/<int:learner_id>/<str:month>/activities/<int:row_id>/materials/<int:material_id>/', monthly_logs.canonical_material, name='monthly-log-canonical-material'),
+    path('attendance/<str:kind>/<int:learner_id>/lectures/', attendance_lectures, name='attendance-lectures'),
+    path('attendance/<str:kind>/<int:learner_id>/attend/', confirm_attendance, name='confirm-attendance'),
+    path('meeting-attendance/<str:kind>/<int:learner_id>/', meeting_attendance, name='meeting-attendance'),
+    path('meeting-attendance/<str:kind>/<int:learner_id>/attend/', confirm_meeting_attendance, name='confirm-meeting-attendance'),
+    path('attendance/<str:kind>/<int:learner_id>/mode/', attendance_mode, name='attendance-mode'),
+    path('attendance-mode/review/', review_attendance_mode, name='attendance-mode-review'),
+    path('attendance-mode/', attendance_modes, name='attendance-modes'),
+    path('profile-photo/<str:kind>/<int:pk>/', learner_profile_photo, name='learner-profile-photo'),
+    path("tutor-learners/", views.tutor_learners, name="tutor-learners"),
+    # Enrolment workspace: every learner's first-session booking, read only.
+    path("first-session-bookings/", first_session_bookings, name="first-session-bookings"),
+    path("first-login-details/<int:pk>/", first_login_details, name="first-login-details"),
+    path("enrolment-users/", views.enrolment_users, name="enrolment-users"),
+    path("enrolment-users/import-template/", learner_import.import_template, name="enrolment-users-import-template"),
+    path("enrolment-users/import/", learner_import.import_students, name="enrolment-users-import"),
+    path("enrolment-users/options/", views.enrolment_user_options, name="enrolment-user-options"),
+    path("enrolment-users/<int:pk>/", views.enrolment_user_detail, name="enrolment-user-detail"),
+    path("enrolment-users/<int:pk>/archive/", user_archive.archive_user, name="enrolment-user-archive"),
+    path("enrolment-users/<int:pk>/restore/", user_archive.restore_user, name="enrolment-user-restore"),
+    path("enrolment-users/<int:pk>/fields/", views.enrolment_user_fields, name="enrolment-user-fields"),
+    path("enrolment-users/<int:pk>/finish/", views.enrolment_user_finish, name="enrolment-user-finish"),
+    # The learner's learning plan: their group's modules, editable within the
+    # same programme. Offered once the learner reaches Delivery.
+    path("learning-plan/<int:pk>/", learning_plan.learning_plan, name="learning-plan"),
+    # The same assignment from the module's side: one module, every learner,
+    # ticked on or off. A tick is a plan save, so it writes the very same
+    # "Created_users" plan the route above reads.
+    path("module-learners/<str:module_id>/", learning_plan.module_learners, name="module-learners"),
+    # The modules taught alongside one module — the alternatives a learner can be
+    # shifted onto. The shift itself is a plan save, so it has no endpoint here.
+    # "options/" before the <int:pk> route, which would otherwise never be
+    # reached for it.
+    path("module-shift/options/", module_shift.module_shift_options, name="module-shift-options"),
+    path("module-shift/<int:pk>/", module_shift.module_shift, name="module-shift"),
+    # The week-by-week pairing behind a shift's progress step: which of the
+    # learner's completed components line up with the module they are joining.
+    path(
+        "module-shift/<int:pk>/progress/",
+        module_shift.module_shift_progress,
+        name="module-shift-progress",
+    ),
+    # The statutory Apprenticeship Agreement, filled from the learner's record,
+    # their group's delivery window and their learning plan's total hours.
+    path(
+        "apprenticeship-agreement/<int:pk>/",
+        apprenticeship_agreement.apprenticeship_agreement,
+        name="apprenticeship-agreement",
+    ),
+    path(
+        "apprenticeship-agreement/<int:pk>/issue/",
+        apprenticeship_agreement.issue_agreement,
+        name="apprenticeship-agreement-issue",
+    ),
+    path(
+        "apprenticeship-agreement/<int:pk>/sign/",
+        apprenticeship_agreement.sign_agreement,
+        name="apprenticeship-agreement-sign",
+    ),
+    # The Individual Learner Record: signed by the learner and the provider.
+    # Never shown to the employer.
+    path("ilr-document/<int:pk>/", ilr_document.ilr_document, name="ilr-document"),
+    path("ilr-document/<int:pk>/issue/", ilr_document.issue_ilr, name="ilr-document-issue"),
+    path("ilr-document/<int:pk>/sign/", ilr_document.sign_ilr, name="ilr-document-sign"),
+    # The tripartite Training Plan: signed by the apprentice, the employer and
+    # the training provider.
+    path("training-plan-document/<int:pk>/", training_plan_document.training_plan_document, name="training-plan-document"),
+    path("training-plan-document/<int:pk>/issue/", training_plan_document.issue_training_plan, name="training-plan-document-issue"),
+    path("training-plan-document/<int:pk>/sign/", training_plan_document.sign_training_plan, name="training-plan-document-sign"),
+    # The Written Agreement: signed by the learner, employer and provider.
+    path("written-agreement/<int:pk>/", written_agreement.written_agreement, name="written-agreement"),
+    path("written-agreement/<int:pk>/issue/", written_agreement.issue_written_agreement, name="written-agreement-issue"),
+    path("written-agreement/<int:pk>/sign/", written_agreement.sign_written_agreement, name="written-agreement-sign"),
+    path("commercial-users/", views.commercial_users, name="commercial-users"),
+    path("commercial-users/<int:pk>/", views.commercial_user_detail, name="commercial-user-detail"),
+    path("staff-users/", views.staff_users, name="staff-users"),
+    path("staff-users/<int:pk>/", views.staff_user_detail, name="staff-user-detail"),
+    # organisation + employer profiles. "options/" is declared before the
+    # <int:pk> routes, which would otherwise never be reached for it.
+    path("employers/options/", employers.employer_options, name="employer-options"),
+    path("organisations/", employers.organisations, name="organisations"),
+    path("organisations/<int:pk>/", employers.organisation_detail, name="organisation-detail"),
+    path("employers/", employers.employers, name="employers"),
+    # The employer-facing portal: their learners, and the documents they must sign.
+    # Declared before "employers/<int:pk>/" is irrelevant (different prefix), but
+    # the signature route is declared before the learner route for clarity.
+    path("employer-portal/<int:employer_id>/", employer_portal.employer_portal, name="employer-portal"),
+    path("employer-portal/<int:employer_id>/meetings/", employer_meetings.employer_meetings, name="employer-meetings"),
+    path("employer-portal/<int:employer_id>/learner/<str:kind>/<int:learner_id>/contracts/",
+         employer_contracts.employer_learner_contracts, name="employer-learner-contracts"),
+    path(
+        "employer-portal/<int:employer_id>/documents/",
+        employer_portal.employer_portal_documents,
+        name="employer-portal-documents",
+    ),
+    path(
+        "employer-portal/<int:employer_id>/learner/<str:kind>/<int:learner_id>/",
+        employer_portal.employer_portal_learner,
+        name="employer-portal-learner",
+    ),
+    path(
+        "employer-portal/<int:employer_id>/learner/<str:kind>/<int:learner_id>/plan/",
+        employer_portal.employer_portal_learner_plan,
+        name="employer-portal-learner-plan",
+    ),
+    path(
+        "employer-portal/<int:employer_id>/learner/<str:kind>/<int:learner_id>/overview/<str:part>/",
+        employer_portal.employer_portal_learner_overview,
+        name="employer-portal-learner-overview",
+    ),
+    path(
+        "employer-portal/<int:employer_id>/learner/<str:kind>/<int:learner_id>/assignments/",
+        employer_portal.employer_portal_learner_assignments,
+        name="employer-portal-learner-assignments",
+    ),
+    path("employer-portal/<int:employer_id>/learner/<str:kind>/<int:learner_id>/monthly-logs/",
+         employer_portal.employer_portal_monthly_logs, name="employer-portal-monthly-logs"),
+    path("employer-portal/<int:employer_id>/learner/<str:kind>/<int:learner_id>/monthly-logs/<str:month>/",
+         employer_portal.employer_portal_monthly_logs, name="employer-portal-monthly-log"),
+    path("employer-portal/<int:employer_id>/learner/<str:kind>/<int:learner_id>/monthly-logs/<str:month>/activities/<int:row_id>/",
+         employer_portal.employer_portal_monthly_logs, name="employer-portal-monthly-log-content"),
+    path("employer-portal/<int:employer_id>/learner/<str:kind>/<int:learner_id>/monthly-logs/<str:month>/activities/<int:row_id>/materials/<int:material_id>/",
+         employer_portal.employer_portal_monthly_logs, name="employer-portal-monthly-log-material"),
+    path("employer-portal/<int:employer_id>/learner/<str:kind>/<int:learner_id>/monthly-logs/documents/<uuid:file_id>/",
+         employer_portal.employer_portal_monthly_logs, name="employer-portal-monthly-log-document"),
+    path("employer-portal/<int:employer_id>/learner/<str:kind>/<int:learner_id>/monthly-logs/canonical-documents/<int:file_id>/",
+         employer_portal.employer_portal_monthly_logs, {"document_source": "canonical"}, name="employer-portal-monthly-log-canonical-document"),
+    path(
+        "employer-portal/<int:employer_id>/learner/<str:kind>/<int:learner_id>/assignments/files/<uuid:file_id>/",
+        employer_portal.employer_portal_assignment_file,
+        name="employer-portal-assignment-file",
+    ),
+    path(
+        "employer-portal/<int:employer_id>/learner/<str:kind>/<int:learner_id>/assignments/legacy/<str:evidence_id>/",
+        employer_portal.employer_portal_legacy_assignment_file,
+        name="employer-portal-legacy-assignment-file",
+    ),
+    path("employer-portal/<int:employer_id>/learner/<str:kind>/<int:learner_id>/documents/<str:document_kind>/<str:document_id>/",
+         employer_portal.employer_document_preview, name="employer-document-preview"),
+    path("employer-portal/<int:employer_id>/learner/<str:kind>/<int:learner_id>/events/<path:event_key>/review/pdf/",
+         employer_portal.employer_review_instance, {"as_pdf": True}, name="employer-review-instance-pdf"),
+    path(
+        "employer-portal/<int:employer_id>/learner/<str:kind>/<int:learner_id>/events/<path:event_key>/review/",
+        employer_portal.employer_review_instance,
+        name="employer-review-instance",
+    ),
+    path("employer-portal/<int:employer_id>/dashboard-metrics/",
+         employer_portal.employer_dashboard_metrics, name="employer-dashboard-metrics"),
+    path("employer-portal/<int:employer_id>/learner/<str:kind>/<int:learner_id>/progress-reviews/",
+         employer_portal.employer_portal_progress_reviews, name="employer-progress-reviews"),
+    path("employer-portal/<int:employer_id>/learner/<str:kind>/<int:learner_id>/mcm-timeline/",
+         employer_portal.employer_portal_mcm_timeline, name="employer-mcm-timeline"),
+    path("employer-portal/<int:employer_id>/learner/<str:kind>/<int:learner_id>/progress-reviews/<path:event_key>/pdf/",
+         employer_portal.employer_portal_progress_reviews, {"as_pdf": True}, name="employer-progress-review-pdf"),
+    path("employer-portal/<int:employer_id>/learner/<str:kind>/<int:learner_id>/progress-reviews/<path:event_key>/artifacts/",
+         employer_portal.employer_portal_review_artifacts, name="employer-progress-review-artifacts"),
+    path("employer-portal/<int:employer_id>/learner/<str:kind>/<int:learner_id>/progress-reviews/<path:event_key>/"
+         "artifacts/<str:artifact_type>/<str:artifact_id>/content/",
+         employer_portal.employer_portal_review_artifact_content,
+         name="employer-progress-review-artifact-content"),
+    path("employer-portal/<int:employer_id>/learner/<str:kind>/<int:learner_id>/progress-reviews/<path:event_key>/",
+         employer_portal.employer_portal_progress_reviews, name="employer-progress-review"),
+    path(
+        "employer-portal/<int:employer_id>/learner/<str:kind>/<int:learner_id>/reviews/<path:event_key>/",
+        employer_portal.employer_enrolment_review,
+        name="employer-enrolment-review",
+    ),
+    path("employers/<int:pk>/", employers.employer_detail, name="employer-detail"),
+    path("learner-detail/<str:kind>/<int:pk>/", learner_detail.learner_detail, name="learner-detail"),
+    path("learner-summary/<str:kind>/<int:pk>/", learner_detail.learner_summary, name="learner-summary"),
+    path("weekly-learning/<str:kind>/<int:pk>/", dashboard_weekly, name="learner-weekly-learning"),
+    path("dashboard/<str:kind>/<int:pk>/header/", dashboard_header, name="learner-dashboard-header"),
+    path("dashboard/<str:kind>/<int:pk>/header/minimal/", dashboard_header, {'minimal': True}, name="learner-dashboard-minimal-header"),
+    path("dashboard/<str:kind>/<int:pk>/bootstrap/", dashboard_bootstrap, name="learner-dashboard-bootstrap"),
+    path("dashboard/<str:kind>/<int:pk>/header/presentation/", dashboard_header, {'presentation': True}, name="learner-dashboard-presentation"),
+    path("dashboard/<str:kind>/<int:pk>/weekly/plan/", dashboard_weekly, name="learner-dashboard-weekly-plan"),
+    path("dashboard/<str:kind>/<int:pk>/weekly/plan/<str:week_id>/", dashboard_weekly, name="learner-dashboard-weekly-plan-detail"),
+    path("dashboard/<str:kind>/<int:pk>/monthly/plan/", dashboard_tab, {'tab': 'monthly', 'canonical_contract': True}, name="learner-dashboard-monthly-plan"),
+    path("dashboard/<str:kind>/<int:pk>/weekly/", dashboard_weekly, name="learner-dashboard-weekly"),
+    path("dashboard/<str:kind>/<int:pk>/weekly/<str:week_id>/", dashboard_weekly, name="learner-dashboard-week-detail"),
+    path("dashboard/<str:kind>/<int:pk>/training/modules/<str:module_id>/", training_module, name="learner-dashboard-training-module"),
+    path("dashboard/<str:kind>/<int:pk>/<str:tab>/", dashboard_tab, name="learner-dashboard-tab"),
+    path("metrics/<str:kind>/<int:pk>/", learner_metrics, name="learner-metrics"),
+    path("overview-week/<str:kind>/<int:pk>/", overview_week, name="learner-overview-week"),
+    path("rewards-summary/<str:kind>/<int:pk>/", learner_rewards_summary, name="learner-rewards-summary"),
+    path("module-progress/<str:kind>/<int:pk>/", module_progress.learner_module_progress, name="module-progress"),
+    path("student-activity/<str:kind>/<int:pk>/", student_activity.student_activity, name="student-activity"),
+    path('my-learning/<str:kind>/<int:pk>/', my_learning, name='my-learning-catalogue'),
+    path('my-learning/<str:kind>/<int:pk>/search/', my_learning, {'resource':'search'}, name='my-learning-search'),
+    path('my-learning/<str:kind>/<int:pk>/upcoming/', my_learning, {'resource':'upcoming'}, name='my-learning-upcoming'),
+    path('my-learning/<str:kind>/<int:pk>/modules/<path:subject_id>/', my_learning, name='my-learning-module'),
+    path("student-activity/<str:kind>/<int:pk>/<int:group_id>/<int:activity_id>/attempts/", student_activity.start_subject_attempt, name="subject-attempt-start"),
+    path("student-activity/<str:kind>/<int:pk>/<int:group_id>/<int:activity_id>/attempts/<uuid:attempt_id>/", student_activity.submit_subject_attempt, name="subject-attempt-submit"),
+    path("subject-covers/<int:pk>/", student_activity.subject_covers, name="subject-covers"),
+    path("subject-cover/<str:subject_ref>/", student_activity.upload_subject_cover, name="subject-cover-upload"),
+    path("training-plan/<str:kind>/<int:pk>/", training_plan_view.training_plan, name="training-plan"),
+    # The free courses assigned to this learner, each with its authored
+    # week/activity tree. Read-only; no hours/KSBs/progress (see free_courses_view).
+    path("free-courses/<str:kind>/<int:pk>/", free_courses_view.free_courses, name="learner-free-courses"),
+    path("free-courses/<str:kind>/<int:pk>/complete/", free_courses_view.complete_free_course_activity, name="learner-free-course-complete"),
+    path("free-courses/<str:kind>/<int:pk>/quiz/<str:component_id>/submit/", free_courses_view.submit_free_course_quiz, name="learner-free-course-quiz-submit"),
+    path("training-plan-dashboard/<str:kind>/<int:pk>/", training_plan_dashboard.training_plan_dashboard, name="training-plan-dashboard"),
+    path("certificates/verify/<uuid:token>/", certificates.verify_certificate, name="learner-certificate-verify"),
+    path("certificates/<str:kind>/<int:pk>/modules/<str:module_ref>/", certificates.learner_module_certificate_status, name="learner-module-certificate-status"),
+    path("certificates/<str:kind>/<int:pk>/modules/<str:module_ref>/issue/", certificates.issue_learner_module_certificate, name="learner-module-certificate-issue"),
+    path("certificates/<str:kind>/<int:pk>/template/", certificates.learner_certificate_template, name="learner-certificate-template"),
+    path("certificates/<str:kind>/<int:pk>/", certificates.learner_certificate_status, name="learner-certificate-status"),
+    path("certificates/<str:kind>/<int:pk>/issue/", certificates.issue_learner_certificate, name="learner-certificate-issue"),
+    path("kbc-lms/all-students-schema/", lms_schema.all_students_schema, name="kbc-lms-all-students-schema"),
+    path('student-activity/<str:kind>/<int:pk>/<int:group_id>/<int:activity_id>/files/<int:attachment_id>/', student_activity.subject_file, name='subject-file'),
+    path('student-activity/<str:kind>/<int:pk>/<int:group_id>/<int:activity_id>/source-file/', student_activity.source_material_file, name='source-material-file'),
+    path("media/google-drive/<str:file_id>/", media_proxy.google_drive_media, name="google-drive-media"),
+    # Imported LMS files: component settings, the slide renderer and the
+    # zero-byte placeholder fallback in curriculum uploads all link here.
+    path("media/legacy-attachment/<str:attachment_id>/", media_proxy.legacy_attachment_media, name="legacy-attachment-media"),
+    path("media/legacy-attachment/<str:attachment_id>/pdf-info/", media_proxy.legacy_attachment_pdf_info, name="legacy-attachment-pdf-info"),
+    path("media/legacy-attachment/<str:attachment_id>/pdf-page/<int:page_number>/", media_proxy.legacy_attachment_pdf_page, name="legacy-attachment-pdf-page"),
+    path("attendance/<str:kind>/<int:learner_id>/", attendance.learner_attendance, name="learner-attendance"),
+    path("learners/<int:pk>/coach/", views.learner_coach, name="learner-coach"),
+    # curriculum lookups for the training-plan builder
+    path("curriculum/programmes/", curriculum.programmes, name="curriculum-programmes"),
+    path("curriculum/cohorts/", curriculum.cohorts, name="curriculum-cohorts"),
+    path("curriculum/groups/", curriculum.groups, name="curriculum-groups"),
+    path("curriculum/modules/", curriculum.modules, name="curriculum-modules"),
+    path("curriculum/weeks/", curriculum.weeks, name="curriculum-weeks"),
+    path("curriculum/components/", curriculum.components, name="curriculum-components"),
+    path("curriculum/ksb-profile/", curriculum.ksb_profile, name="curriculum-ksb-profile"),
+    path("curriculum/legacy-otjh/", curriculum.legacy_otjh, name="curriculum-legacy-otjh"),
+    # Signed start time shared by quizzes and learning components.
+    path("time-tracking/start/", time_tracking.start_time_tracking, name="time-tracking-start"),
+    path("time-tracking/checkpoint/", time_tracking.checkpoint_time_tracking, name="time-tracking-checkpoint"),
+    path("time-tracking/observations/", reward_tracking.observations, name="reward-time-observations"),
+    path("time-tracking/clock/", reward_tracking.clock, name="reward-time-clock"),
+    path("working-hours/holidays/", working_hours_holidays.working_hours_holidays, name="working-hours-holidays"),
+    # quiz-taking
+    path("quizzes/<int:quiz_id>/", quizzes.quiz_detail, name="quiz-detail"),
+    path("quizzes/<int:quiz_id>/submit/", quizzes.submit_quiz_attempt, name="quiz-submit"),
+    path("quizzes/<int:quiz_id>/reading/", quiz_reading.quiz_reading, name="quiz-reading"),
+    # video-watching
+    path("videos/<str:component_id>/complete/", videos.submit_video_progress, name="video-complete"),
+    # generic component completion (podcast / reading / slides / reflection / …)
+    path("components/<str:component_id>/complete/", components.submit_component_progress, name="component-complete"),
+    # British-English voice reflection transcription, moderation and learning-scope check
+    path("reflection/transcribe/", reflection_ai.transcribe_reflection, name="reflection-transcribe"),
+    path("reflection/proofread/", reflection_ai.proofread_reflection, name="reflection-proofread"),
+    path("reflection/ksb-explanations/", ksb_generation.generate_ksb_explanations, name="ksb-explanations"),
+    path("reflection/monthly-reflections/", monthly_reflection_ai.generate_monthly_reflections, name="monthly-reflections"),
+    path("reflection/learning-statements/", reflection_ai.generate_learning_statements, name="learning-statements"),
+    path("reflection/submissions/", reflection_submissions.create_reflection_submission, name="reflection-submission-create"),
+    # The learner's end-of-month report: GET lists the months already submitted
+    # (or one month with ?month=YYYY-MM), POST submits/updates a month.
+    # Declared before the bare list route, which would otherwise never be
+    # reached for an attachment URL.
+    path(
+        "monthly-reports/<str:kind>/<int:pk>/attachments/<uuid:file_id>/",
+        monthly_reports.monthly_report_attachment,
+        name="learner-monthly-report-attachment",
+    ),
+    path("monthly-reports/<str:kind>/<int:pk>/", monthly_reports.monthly_reports, name="learner-monthly-reports"),
+    path("reflection/assignment/check/", monthly_assignment.check_assignment, name="monthly-assignment-check"),
+    path("reflection/assignment/ai-check/", assignment_ai_check, name="monthly-assignment-ai-check"),
+    path("reflection/assignment/legacy-document/<int:evidence_id>/", legacy_assignments.open_legacy_assignment_document, name="legacy-assignment-document"),
+    path("reflection/assignment/presentation-design/", presentation_design.upload_design, name="presentation-design"),
+    path("reflection/assignment/presentation/", monthly_assignment.export_presentation, name="monthly-assignment-presentation"),
+    # learner calendar (coaching sessions from Coach.coach_calendar_event)
+    path("review-sessions/<str:kind>/<int:pk>/", learner_review_sessions, name="learner-review-sessions"),
+    path("calendar/<str:kind>/<int:pk>/", calendar.learner_calendar, name="learner-calendar"),
+    path("review-history/<str:kind>/<int:pk>/", review_history.learner_review_history, name="learner-review-history"),
+    path("calendar/<str:kind>/<int:pk>/book/", calendar.learner_calendar_book, name="learner-calendar-book"),
+    path("calendar/<str:kind>/<int:pk>/reschedule/", calendar.learner_calendar_reschedule, name="learner-calendar-reschedule"),
+    path("calendar/<str:kind>/<int:pk>/cancel/", calendar.learner_calendar_cancel, name="learner-calendar-cancel"),
+    path("calendar/<str:kind>/<int:pk>/onboarding-reviews/", calendar.learner_onboarding_reviews, name="learner-onboarding-reviews"),
+    # The learner's own first session: whether it is booked, and whether the
+    # day has come. Drives both the booking screen and the access gate.
+    path("calendar/<str:kind>/<int:pk>/first-session/", calendar.learner_first_session, name="learner-first-session"),
+    path("calendar/<str:kind>/<int:pk>/events/<str:event_key>/artifacts/", calendar.learner_calendar_event_artifacts, name="learner-calendar-event-artifacts"),
+    path("calendar/<str:kind>/<int:pk>/events/<str:event_key>/artifacts/<str:artifact_type>/<str:artifact_id>/content/", calendar.learner_calendar_event_artifact_content, name="learner-calendar-event-artifact-content"),
+    path("calendar/<str:kind>/<int:pk>/events/<str:event_key>/sign/", calendar.learner_progress_review_sign, name="learner-progress-review-sign"),
+    # Read-only: the Curriculum Review form behind a scheduled occurrence.
+    path("calendar/<str:kind>/<int:pk>/events/<str:event_key>/review/", calendar.learner_calendar_event_review, name="learner-calendar-event-review"),
+    path("calendar/<str:kind>/<int:pk>/events/<str:event_key>/review/pdf/", calendar.learner_calendar_event_review_pdf, name="learner-calendar-event-review-pdf"),
+    # Declared before the <path:event_key> route below, which would otherwise
+    # never be reached for the bare list URL.
+    path("reviews/<str:kind>/<int:pk>/", review_form.enrolment_review_documents, name="enrolment-review-documents"),
+    # The four onboarding reviews, issued by the enrolment team (before the event-key routes below).
+    path("reviews/<str:kind>/<int:pk>/onboarding/", review_form.onboarding_reviews, name="enrolment-onboarding-reviews"),
+    path("reviews/<str:kind>/<int:pk>/issue/", review_form.issue_onboarding_review, name="enrolment-review-issue"),
+    # Before the <path:event_key> route below, which is greedy and would
+    # otherwise absorb the trailing "sign" into the event key.
+    path("reviews/<str:kind>/<int:pk>/<str:event_key>/sign/", review_form.enrolment_review_sign, name="enrolment-review-sign"),
+    # The enrolment review form. `path` matches an event key like
+    # "eligibility-review:31:1:2026-08-03" (colons, no slashes) but not the
+    # trailing segment, so <path:> is used to keep it intact.
+    path("reviews/<str:kind>/<int:pk>/<path:event_key>/", review_form.enrolment_review_form, name="enrolment-review-form"),
+    path("calendar-connections/<str:kind>/<int:learner_id>/", calendar_connections.connection_list, name="learner-calendar-connections"),
+    path("calendar-connections/<str:kind>/<int:learner_id>/availability/", calendar_connections.availability, name="learner-calendar-availability"),
+    path("calendar-connections/<str:kind>/<int:learner_id>/<str:provider>/oauth/", calendar_connections.oauth_start, name="learner-calendar-oauth"),
+    path("calendar-connections/<str:kind>/<int:learner_id>/<str:provider>/connect/", calendar_connections.credential_connect, name="learner-calendar-connect"),
+    path("calendar-connections/<str:kind>/<int:learner_id>/<str:provider>/disconnect/", calendar_connections.disconnect, name="learner-calendar-disconnect"),
+    path("absence-reports/<str:kind>/<int:learner_id>/", absence_reports.learner_absence_reports, name="learner-absence-reports"),
+    # learner evidence uploads (Azure Blob Storage backed)
+    path("evidence/<str:kind>/<int:pk>/upload/", evidence.upload_evidence, name="evidence-upload"),
+    path("evidence/<str:kind>/<int:pk>/", evidence.list_evidence, name="evidence-list"),
+    path("evidence/<str:kind>/<int:pk>/historical/", historical_evidence.list_historical_evidence, name="historical-evidence-list"),
+    path("evidence/<str:kind>/<int:pk>/historical/<str:source>/<str:source_id>/", historical_evidence.historical_evidence_detail, name="historical-evidence-detail"),
+    path("evidence/<str:kind>/<int:pk>/historical/<str:source>/<str:source_id>/open/", historical_evidence.open_historical_document, name="historical-evidence-open"),
+    path("evidence/<str:kind>/<int:pk>/<uuid:file_id>/download/", evidence.download_evidence, name="evidence-download"),
+    path("evidence/<str:kind>/<int:pk>/<uuid:file_id>/", evidence.delete_evidence, name="evidence-delete"),
+]

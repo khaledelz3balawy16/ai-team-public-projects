@@ -1,0 +1,486 @@
+from django.db import models
+
+
+class EventData(models.Model):
+	event_id = models.BigAutoField(primary_key=True, db_column='Event Id')
+	event_title = models.TextField(db_column='Event Title')
+	event_description = models.TextField(db_column='Event Description', blank=True, default='')
+	event_platform_or_meeting_link = models.TextField(db_column='Event latform / Meeting Link', blank=True, default='')
+	event_date = models.TextField(db_column='Event Date')
+	registration_link = models.TextField(db_column='registration link', blank=True, default='')
+	event_time = models.TextField(db_column='Event time', blank=True, default='')
+	event_type = models.TextField(db_column='event type', blank=True, default='online')
+	cover_image = models.TextField(db_column='Cover image', blank=True, default='')
+	more_images = models.TextField(db_column='More images', blank=True, default='')
+
+	class Meta:
+		db_table = 'Event_data'
+		managed = False
+
+
+class News(models.Model):
+	id = models.BigAutoField(primary_key=True, db_column='ID')
+	title = models.TextField(db_column='Title')
+	details = models.TextField(db_column='Details', blank=True, default='')
+	image_url = models.TextField(db_column='Image url', blank=True, default='')
+	publication_date = models.DateField(db_column='publication_date', null=True, blank=True)
+	audience = models.CharField(db_column='audience', max_length=100, blank=True, default='All Staff')
+	category = models.CharField(db_column='category', max_length=100, blank=True, default='General')
+	priority = models.CharField(db_column='priority', max_length=50, blank=True, default='general')
+	summary = models.TextField(db_column='summary', blank=True, default='')
+	full_article_content = models.TextField(db_column='full_article_content', blank=True, default='')
+	status = models.CharField(db_column='status', max_length=50, blank=True, default='pending_review')
+	created_at = models.DateTimeField(db_column='created_at', null=True, blank=True)
+	updated_at = models.DateTimeField(db_column='updated_at', null=True, blank=True)
+
+	class Meta:
+		db_table = 'News'
+		managed = False
+
+
+class TrainingPlan(models.Model):
+	id = models.BigAutoField(primary_key=True)
+	cohort_name = models.TextField(db_column='Cohort_name', blank=True, default='')
+	program = models.TextField(db_column='Program', blank=True, default='')
+	starting_date_lable = models.TextField(db_column='Starting_date_lable', blank=True, default='')
+	module_name = models.TextField(blank=True, default='')
+	group_name = models.TextField(blank=True, default='')
+	coach_name = models.TextField(blank=True, default='')
+	tutor_name = models.TextField(db_column='Tutor_name', blank=True, default='')
+	tutor_profile_id = models.BigIntegerField(null=True, blank=True)
+	start_date = models.TextField(blank=True, default='')
+	end_date = models.TextField(blank=True, default='')
+	sessions_number = models.TextField(blank=True, default='')
+	session_week_day = models.TextField(blank=True, default='')
+	session_start_time = models.TextField(blank=True, default='')
+	session_end_time = models.TextField(blank=True, default='')
+	session_ksb_json = models.TextField(blank=True, default='')
+	session_coverage_json = models.TextField(blank=True, default='')
+	ksb_profile_id = models.BigIntegerField(null=True, blank=True)
+	programme_display_order = models.IntegerField(null=True, blank=True)
+	cohort_display_order = models.IntegerField(null=True, blank=True)
+	is_archived = models.BooleanField(default=False)
+	archived_at = models.DateTimeField(null=True, blank=True)
+	archived_by = models.TextField(blank=True, default='')
+	archive_reason = models.TextField(blank=True, default='')
+	notes = models.TextField(blank=True, default='')
+
+	class Meta:
+		db_table = 'Training_plan'
+		managed = False
+
+
+class TrainingPlanLmsReference(models.Model):
+	"""Create-once LMS comparison data, independent of all live planning records."""
+	id = models.PositiveSmallIntegerField(primary_key=True, default=1, editable=False)
+	created_at = models.DateTimeField(auto_now_add=True)
+	created_by = models.JSONField()
+	records = models.JSONField()
+	content_sha256 = models.CharField(max_length=64)
+
+	class Meta:
+		db_table = 'training_plan_lms_reference'
+		constraints = [models.CheckConstraint(condition=models.Q(id=1), name='tp_lms_reference_singleton')]
+
+
+class TutorProfile(models.Model):
+	id = models.BigAutoField(primary_key=True)
+	name = models.CharField(max_length=255)
+	normalized_name = models.CharField(max_length=255, unique=True)
+	email = models.EmailField(blank=True, default='')
+	phone = models.CharField(max_length=80, blank=True, default='')
+	notes = models.TextField(blank=True, default='')
+	availability_notes = models.TextField(blank=True, default='')
+	is_active = models.BooleanField(default=True)
+	created_at = models.DateTimeField(auto_now_add=True)
+	updated_at = models.DateTimeField(auto_now=True)
+
+	class Meta:
+		db_table = 'tutor_profiles'
+		indexes = [
+			models.Index(fields=['is_active', 'name'], name='tutor_profi_is_acti_2d7e38_idx'),
+			models.Index(fields=['normalized_name'], name='tutor_profi_normali_34d7cb_idx'),
+		]
+
+
+class CoachProfile(models.Model):
+	id = models.BigAutoField(primary_key=True)
+	name = models.CharField(max_length=255)
+	normalized_name = models.CharField(max_length=255, unique=True)
+	email = models.EmailField(blank=True, default='')
+	phone = models.CharField(max_length=80, blank=True, default='')
+	notes = models.TextField(blank=True, default='')
+	availability_notes = models.TextField(blank=True, default='')
+	is_active = models.BooleanField(default=True)
+	created_at = models.DateTimeField(auto_now_add=True)
+	updated_at = models.DateTimeField(auto_now=True)
+
+	class Meta:
+		db_table = 'coach_profiles'
+		indexes = [
+			models.Index(fields=['is_active', 'name'], name='coach_profi_is_acti_58a4f2_idx'),
+			models.Index(fields=['normalized_name'], name='coach_profi_normali_7e2d41_idx'),
+		]
+
+
+class KsbProfile(models.Model):
+	id = models.BigAutoField(primary_key=True)
+	name = models.CharField(max_length=255)
+	programme_name = models.CharField(max_length=255, blank=True, default='')
+	description = models.TextField(blank=True, default='')
+	ksb_items = models.JSONField(default=list, blank=True)
+	knowledge_codes = models.JSONField(default=list, blank=True)
+	skill_codes = models.JSONField(default=list, blank=True)
+	behaviour_codes = models.JSONField(default=list, blank=True)
+	is_active = models.BooleanField(default=True)
+	created_by = models.TextField(blank=True, default='')
+	created_at = models.DateTimeField(auto_now_add=True)
+	updated_at = models.DateTimeField(auto_now=True)
+
+	class Meta:
+		db_table = 'ksb_profiles'
+		indexes = [
+			models.Index(fields=['is_active', 'name']),
+		]
+
+
+class TrainingPlanHoliday(models.Model):
+	id = models.BigAutoField(primary_key=True)
+	label = models.TextField(blank=True, default='')
+	start_date = models.DateField()
+	end_date = models.DateField()
+	type = models.CharField(max_length=50, blank=True, default='holiday')
+	color = models.CharField(max_length=32, blank=True, default='#FFFBEB')
+	created_at = models.DateTimeField(auto_now_add=True)
+	updated_at = models.DateTimeField(auto_now=True)
+
+	class Meta:
+		db_table = 'training_plan_holidays'
+
+
+class TrainingPlanModuleDefinition(models.Model):
+	id = models.BigAutoField(primary_key=True)
+	module_id = models.CharField(max_length=150, unique=True)
+	name = models.CharField(max_length=255)
+	default_sessions = models.PositiveIntegerField(default=1)
+	bg = models.CharField(max_length=32, default='#4A6DB0')
+	tx = models.CharField(max_length=32, default='#ffffff')
+	created_at = models.DateTimeField(auto_now_add=True)
+	updated_at = models.DateTimeField(auto_now=True)
+
+	class Meta:
+		db_table = 'training_plan_module_definitions'
+
+
+class TrainingPlanProgramConfig(models.Model):
+	id = models.BigAutoField(primary_key=True)
+	program_id = models.CharField(max_length=150, unique=True)
+	name = models.CharField(max_length=255)
+	sub = models.TextField(blank=True, default='')
+	color = models.CharField(max_length=32, default='#1B2A4A')
+	created_at = models.DateTimeField(auto_now_add=True)
+	updated_at = models.DateTimeField(auto_now=True)
+
+	class Meta:
+		db_table = 'training_plan_program_configs'
+
+
+class Module(models.Model):
+	module_id = models.BigAutoField(primary_key=True, db_column='Module ID')
+	module_name = models.TextField(db_column='Module_name', blank=True, default='')
+	module_colour = models.TextField(db_column='Module_colour', blank=True, default='')
+	number_of_sessions = models.TextField(db_column='Number of sessions', blank=True, default='')
+	notes = models.TextField(db_column='Notes', blank=True, default='')
+	session_name_1 = models.TextField(db_column='session_name_1', blank=True, default='')
+	session_name_2 = models.TextField(db_column='session_name_2', blank=True, default='')
+	session_name_3 = models.TextField(db_column='session_name_3', blank=True, default='')
+	session_name_4 = models.TextField(db_column='session_name_4', blank=True, default='')
+	session_name_5 = models.TextField(db_column='session_name_5', blank=True, default='')
+	session_name_6 = models.TextField(db_column='session_name_6', blank=True, default='')
+	session_name_7 = models.TextField(db_column='session_name_7', blank=True, default='')
+	session_name_8 = models.TextField(db_column='session_name_8', blank=True, default='')
+	session_name_9 = models.TextField(db_column='session_name_9', blank=True, default='')
+	session_name_10 = models.TextField(db_column='session_name_10', blank=True, default='')
+	session_name_11 = models.TextField(db_column='session_name_11', blank=True, default='')
+	session_name_12 = models.TextField(db_column='session_name_12', blank=True, default='')
+	session_name_13 = models.TextField(db_column='session_name_13', blank=True, default='')
+	session_name_14 = models.TextField(db_column='session_name_14', blank=True, default='')
+	session_name_15 = models.TextField(db_column='session_name_15', blank=True, default='')
+	session_name_16 = models.TextField(db_column='session_name_16', blank=True, default='')
+	session_name_17 = models.TextField(db_column='session_name_17', blank=True, default='')
+	session_name_18 = models.TextField(db_column='session_name_18', blank=True, default='')
+	session_name_19 = models.TextField(db_column='session_name_19', blank=True, default='')
+	session_name_20 = models.TextField(db_column='session_name_20', blank=True, default='')
+	session_name_21 = models.TextField(db_column='session_name_21', blank=True, default='')
+	session_name_22 = models.TextField(db_column='session_name_22', blank=True, default='')
+	session_name_23 = models.TextField(db_column='session_name_23', blank=True, default='')
+	session_name_24 = models.TextField(db_column='session_name_24', blank=True, default='')
+	session_name_25 = models.TextField(db_column='session_name_25', blank=True, default='')
+	session_name_26 = models.TextField(db_column='session_name_26', blank=True, default='')
+	session_name_27 = models.TextField(db_column='session_name_27', blank=True, default='')
+	session_name_28 = models.TextField(db_column='session_name_28', blank=True, default='')
+	session_name_29 = models.TextField(db_column='session_name_29', blank=True, default='')
+	session_name_30 = models.TextField(db_column='session_name_30', blank=True, default='')
+	session_ksb_json = models.TextField(db_column='session_ksb_json', blank=True, default='')
+	session_description_1 = models.TextField(db_column='session_description_1', blank=True, default='')
+	session_description_2 = models.TextField(db_column='session_description_2', blank=True, default='')
+	session_description_3 = models.TextField(db_column='session_description_3', blank=True, default='')
+	session_description_4 = models.TextField(db_column='session_description_4', blank=True, default='')
+	session_description_5 = models.TextField(db_column='session_description_5', blank=True, default='')
+	session_description_6 = models.TextField(db_column='session_description_6', blank=True, default='')
+	session_description_7 = models.TextField(db_column='session_description_7', blank=True, default='')
+	session_description_8 = models.TextField(db_column='session_description_8', blank=True, default='')
+	session_description_9 = models.TextField(db_column='session_description_9', blank=True, default='')
+	session_description_10 = models.TextField(db_column='session_description_10', blank=True, default='')
+	session_description_11 = models.TextField(db_column='session_description_11', blank=True, default='')
+	session_description_12 = models.TextField(db_column='session_description_12', blank=True, default='')
+	session_description_13 = models.TextField(db_column='session_description_13', blank=True, default='')
+	session_description_14 = models.TextField(db_column='session_description_14', blank=True, default='')
+	session_description_15 = models.TextField(db_column='session_description_15', blank=True, default='')
+	session_description_16 = models.TextField(db_column='session_description_16', blank=True, default='')
+	session_description_17 = models.TextField(db_column='session_description_17', blank=True, default='')
+	session_description_18 = models.TextField(db_column='session_description_18', blank=True, default='')
+	session_description_19 = models.TextField(db_column='session_description_19', blank=True, default='')
+	session_description_20 = models.TextField(db_column='session_description_20', blank=True, default='')
+	session_description_21 = models.TextField(db_column='session_description_21', blank=True, default='')
+	session_description_22 = models.TextField(db_column='session_description_22', blank=True, default='')
+	session_description_23 = models.TextField(db_column='session_description_23', blank=True, default='')
+	session_description_24 = models.TextField(db_column='session_description_24', blank=True, default='')
+	session_description_25 = models.TextField(db_column='session_description_25', blank=True, default='')
+	session_description_26 = models.TextField(db_column='session_description_26', blank=True, default='')
+	session_description_27 = models.TextField(db_column='session_description_27', blank=True, default='')
+	session_description_28 = models.TextField(db_column='session_description_28', blank=True, default='')
+	session_description_29 = models.TextField(db_column='session_description_29', blank=True, default='')
+	session_description_30 = models.TextField(db_column='session_description_30', blank=True, default='')
+	session_names_json = models.TextField(db_column='session_names_json', blank=True, default='')
+	session_descriptions_json = models.TextField(db_column='session_descriptions_json', blank=True, default='')
+
+	class Meta:
+		db_table = 'Modules'
+		managed = False
+
+
+class AptemAutoExtracting(models.Model):
+	row_number = models.BigIntegerField(db_column='row_number', null=True, blank=True)
+	learner_id = models.BigIntegerField(primary_key=True, db_column='ID')
+	full_name = models.TextField(db_column='FullName', blank=True, default='')
+	email = models.TextField(db_column='Email', blank=True, default='')
+	programme_name = models.TextField(db_column='Program Name', blank=True, default='')
+	program_status = models.TextField(db_column='Program-Status', blank=True, default='')
+	group = models.TextField(db_column='Group', blank=True, default='')
+	manager_name = models.TextField(db_column='ManagerName', blank=True, default='')
+	manager_email = models.TextField(db_column='ManagerEmail', blank=True, default='')
+	owner_name = models.TextField(db_column='OwnerName', blank=True, default='')
+	owner_email = models.TextField(db_column='OwnerEmail', blank=True, default='')
+	subprogramme = models.TextField(db_column='subprogramme', blank=True, default='')
+
+	class Meta:
+		db_table = 'aptem_auto_extracting'
+		managed = False
+
+
+class ModuleLearnerMapping(models.Model):
+	id = models.BigAutoField(primary_key=True)
+	cohort_id = models.CharField(max_length=150, blank=True, default='')
+	module_block_id = models.CharField(max_length=150, blank=True, default='')
+	module_catalogue_id = models.CharField(max_length=150)
+	subprogramme = models.TextField()
+	learner_identity = models.CharField(max_length=320)
+	learner_id = models.CharField(max_length=150, blank=True, default='')
+	learner_name = models.TextField(blank=True, default='')
+	learner_email = models.TextField(blank=True, default='')
+	selected_state = models.BooleanField(default=True)
+	sort_order = models.IntegerField(default=0)
+	created_at = models.DateTimeField(auto_now_add=True)
+	updated_at = models.DateTimeField(auto_now=True)
+
+	class Meta:
+		db_table = 'module_learner_mappings'
+		indexes = [
+			models.Index(fields=['cohort_id', 'module_block_id', 'subprogramme'], name='module_lear_scope_s_1d2b8c_idx'),
+			models.Index(fields=['cohort_id', 'module_block_id', 'learner_identity'], name='module_lear_scope_l_72d8b9_idx'),
+			models.Index(fields=['module_catalogue_id', 'subprogramme'], name='module_lear_module__f55f8b_idx'),
+			models.Index(fields=['module_catalogue_id', 'learner_identity'], name='module_lear_module__f3f64d_idx'),
+		]
+		unique_together = ('cohort_id', 'module_block_id', 'subprogramme', 'learner_identity')
+
+
+class UrgentNotice(models.Model):
+	id = models.BigAutoField(primary_key=True)
+	title = models.TextField(blank=True, default='')
+	body = models.TextField(blank=True, default='')
+	is_active = models.BooleanField(default=False)
+	publication_date = models.DateField(null=True, blank=True)
+	created_at = models.DateTimeField(auto_now_add=True)
+	updated_at = models.DateTimeField(auto_now=True)
+
+	class Meta:
+		db_table = 'urgent_notices'
+
+
+class LeadershipMessage(models.Model):
+	id = models.BigAutoField(primary_key=True)
+	card_title = models.TextField(blank=True, default='')
+	card_teaser = models.TextField(blank=True, default='')
+	author_name = models.CharField(max_length=150, blank=True, default='')
+	author_role = models.CharField(max_length=200, blank=True, default='')
+	is_active = models.BooleanField(default=False)
+	publication_date = models.DateField(null=True, blank=True)
+	body = models.TextField(blank=True, default='')
+	cover_image_url = models.TextField(blank=True, default='')
+	profile_image_url = models.TextField(blank=True, default='')
+	created_at = models.DateTimeField(auto_now_add=True)
+	updated_at = models.DateTimeField(auto_now=True)
+
+	class Meta:
+		db_table = 'leadership_messages'
+
+
+class Employee(models.Model):
+	full_name = models.TextField(db_column='Full name')
+	job_title = models.TextField(db_column='Job Title', blank=True, default='')
+	department = models.TextField(db_column='Department', blank=True, default='')
+	reports_to = models.TextField(db_column='Reports to', blank=True, null=True, default=None)
+	email = models.TextField(db_column='Email', blank=True, default='')
+	phone = models.TextField(db_column='Phone', blank=True, default='')
+
+	class Meta:
+		db_table = 'Table'
+		managed = False
+
+
+class SupportTicket(models.Model):
+	id = models.BigAutoField(primary_key=True)
+	wellbeing_record_id = models.BigIntegerField(null=True, blank=True)
+	ticket_type = models.TextField(blank=True, default='')
+	full_name = models.TextField(blank=True, default='')
+	email = models.TextField(blank=True, default='')
+	subject = models.TextField(blank=True, default='')
+	details = models.TextField(blank=True, default='')
+	urgency = models.TextField(blank=True, default='')
+	preferred_contact = models.TextField(blank=True, default='')
+	status = models.TextField(blank=True, default='')
+	created_at = models.DateTimeField(null=True, blank=True)
+	updated_at = models.DateTimeField(null=True, blank=True)
+	notes = models.JSONField(null=True, blank=True)
+	evidence = models.JSONField(null=True, blank=True)
+	created_by = models.TextField(blank=True, default='')
+	days_to_close = models.IntegerField(null=True, blank=True)
+	submitted_by = models.TextField(blank=True, default='')
+	is_archived = models.BooleanField(default=False)
+	assigned_owner = models.TextField(blank=True, default='')
+
+	class Meta:
+		db_table = 'support_tickets'
+		managed = False
+		app_label = 'api'
+
+
+class RiskRegisterItem(models.Model):
+	id = models.IntegerField(primary_key=True)
+	risk = models.TextField(db_column='Risk', blank=True, default='')
+	category = models.TextField(db_column='Category', blank=True, default='')
+	severity = models.TextField(db_column='Severity', blank=True, default='')
+	rag = models.TextField(db_column='RAG', blank=True, default='')
+	ofsted_area = models.TextField(db_column='Ofsted Area', blank=True, default='')
+	owner = models.TextField(db_column='Owner', blank=True, default='')
+	status = models.TextField(db_column='Status', blank=True, default='')
+
+	class Meta:
+		db_table = 'Risk register'
+		managed = False
+		app_label = 'api'
+
+
+class Feedback(models.Model):
+	id = models.BigAutoField(primary_key=True, db_column='Feedback ID')
+	username = models.TextField(db_column='Username', blank=True, default='')
+	email = models.TextField(db_column='Email', blank=True, default='')
+	category = models.TextField(db_column='Feedback category', blank=True, default='General Feedback')
+	department = models.TextField(db_column='Department', blank=True, default='')
+	priority = models.TextField(db_column='Priority', blank=True, default='normal')
+	anonymous = models.BooleanField(db_column='Anonymous', default=False)
+	details = models.TextField(db_column='Feedback details', blank=True, default='')
+	submitted_at = models.DateTimeField(db_column='Submitted_at', null=True, blank=True)
+
+	class Meta:
+		db_table = 'Feedback'
+		managed = False
+
+
+class UserActivitySession(models.Model):
+	id = models.BigAutoField(primary_key=True)
+	tracking_session_id = models.UUIDField(unique=True)
+	user_id = models.BigIntegerField(null=True, blank=True)
+	username = models.TextField(blank=True, default='')
+	email = models.TextField(blank=True, default='')
+	display_name = models.TextField(blank=True, default='')
+	auth_provider = models.CharField(max_length=50, blank=True, default='password')
+	login_at = models.DateTimeField()
+	logout_at = models.DateTimeField(null=True, blank=True)
+	last_seen_at = models.DateTimeField()
+	total_seconds = models.PositiveIntegerField(default=0)
+	page_count = models.PositiveIntegerField(default=0)
+	ip_address = models.GenericIPAddressField(null=True, blank=True)
+	user_agent = models.TextField(blank=True, default='')
+	logout_reason = models.CharField(max_length=80, blank=True, default='')
+	created_at = models.DateTimeField(auto_now_add=True)
+	updated_at = models.DateTimeField(auto_now=True)
+
+	class Meta:
+		db_table = 'user_activity_sessions'
+		indexes = [
+			models.Index(fields=['user_id', '-login_at']),
+			models.Index(fields=['email', '-login_at']),
+			models.Index(fields=['tracking_session_id']),
+		]
+
+
+class UserPageVisit(models.Model):
+	id = models.BigAutoField(primary_key=True)
+	session = models.ForeignKey(UserActivitySession, related_name='page_visits', on_delete=models.CASCADE)
+	path = models.TextField()
+	title = models.TextField(blank=True, default='')
+	first_seen_at = models.DateTimeField()
+	last_seen_at = models.DateTimeField()
+	duration_seconds = models.PositiveIntegerField(default=0)
+	view_count = models.PositiveIntegerField(default=1)
+	created_at = models.DateTimeField(auto_now_add=True)
+	updated_at = models.DateTimeField(auto_now=True)
+
+	class Meta:
+		db_table = 'user_page_visits'
+		unique_together = ('session', 'path')
+		indexes = [
+			models.Index(fields=['path']),
+			models.Index(fields=['-last_seen_at']),
+		]
+
+
+class AuditLog(models.Model):
+	id = models.BigAutoField(primary_key=True)
+	action = models.CharField(max_length=40)
+	entity = models.CharField(max_length=120)
+	object_id = models.TextField(blank=True, default='')
+	object_label = models.TextField(blank=True, default='')
+	user_id = models.BigIntegerField(null=True, blank=True)
+	username = models.TextField(blank=True, default='')
+	email = models.TextField(blank=True, default='')
+	display_name = models.TextField(blank=True, default='')
+	path = models.TextField(blank=True, default='')
+	method = models.CharField(max_length=16, blank=True, default='')
+	ip_address = models.GenericIPAddressField(null=True, blank=True)
+	user_agent = models.TextField(blank=True, default='')
+	before = models.JSONField(null=True, blank=True)
+	after = models.JSONField(null=True, blank=True)
+	metadata = models.JSONField(null=True, blank=True)
+	created_at = models.DateTimeField(auto_now_add=True)
+
+	class Meta:
+		db_table = 'audit_logs'
+		indexes = [
+			models.Index(fields=['-created_at']),
+			models.Index(fields=['entity', '-created_at']),
+			models.Index(fields=['email', '-created_at']),
+			models.Index(fields=['action', '-created_at']),
+		]

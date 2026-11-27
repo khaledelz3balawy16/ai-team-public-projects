@@ -1,0 +1,3829 @@
+import { LoadingControl, LoadingSkeleton } from '@/components/feature/LoadingSkeleton';
+import { ukOffsetForDate } from '@/lib/timeZones';
+import { canRescheduleReconciledReview, isImportedPersonalSupportPlan } from '../shared/resolvedReviewRows';
+import ImportedReviewBookingDialog from '../shared/ImportedReviewBookingDialog';
+import { useState, useMemo, useCallback, useEffect, useRef } from 'react';
+import { WorkspaceShell } from '@/components/feature/WorkspaceShell';
+import Swal from 'sweetalert2';
+import 'sweetalert2/dist/sweetalert2.min.css';
+import { useLocation, useNavigate } from 'react-router-dom';
+import { CalendarEventDialog } from '@/components/feature/CalendarEventDialog';
+import { BookingOnlyNotice } from '@/components/feature/BookingOnlyNotice';
+import { CalendarFilterScrollRow } from '@/components/feature/CalendarFilterScrollRow';
+import { PageContainer } from '@/components/ui/PageContainer';
+import { PageHeader } from '@/components/ui/PageHeader';
+import { Panel } from '@/components/ui/Panel';
+import { EmptyState } from '@/components/ui/EmptyState';
+import { ThemedSelect } from '@/components/feature/ThemedSelect';
+import { useCoachIdentity } from '@/hooks/useCoachIdentity';
+import { isImportedJoin, useImportedMeetingJoin } from '../shared/useImportedMeetingJoin';
+import { coachFetch } from '@/lib/coachFetch';
+import { initialsFor } from '@/lib/format';
+import { roleNavMap } from '@/mocks/navigation';
+import { coachSessionKey, readCoachSessionCache, writeCoachSessionCache } from '@/features/coach/shared/coachSessionCache';
+import ProgressReviewCompletionModal from '@/pages/coach/shared/ProgressReviewCompletionModal';
+import { reviewInstancePath, reviewInstanceRouteState } from '@/pages/coach/shared/reviewInstanceNavigation';
+import { createLearnerReviewAddition, fetchCoachReviewSlots, fetchLearnerAdditionReviewTemplates, markReviewInstanceInProgressManually, openReviewInstanceForEvent } from '@/api/reviewInstances';
+import type { LearnerAdditionReviewTemplate, LearnerAdditionReasonCode } from '@/api/reviewInstances';
+import {
+  buildCoachSourceOptions,
+  eventMatchesSourceFilter,
+  eventSourceLabel,
+  filterForScheduleIntent,
+  isSourceFilterValue,
+  NON_REVIEW_SOURCE_FILTER_LABELS,
+  type SourceFilter,
+} from './sourceFilters';
+import { buildReviewTypeLookup } from '@/lib/reviewTypeFilters';
+import {
+  bookCoachCalendarEvent,
+  navigateMeetingWindow,
+  openPendingMeetingWindow,
+  scheduleCoachCalendarEvent,
+  statusLabel,
+  statusPillClass,
+} from '@/pages/coach/shared/calendarEvents';
+import type { CoachCalendarEvent } from '@/pages/coach/shared/calendarEvents';
+import {
+  ModernDatePicker,
+  ModernDurationPicker,
+  ScheduleFieldLabel,
+  ScheduleTimeInput,
+} from '@/pages/coach/shared/ScheduleControls';
+import { LearnerAvatar, LearnerIdentity } from '@/pages/coach/shared/LearnerIdentity';
+import type { ProgressReviewResponses } from '@/pages/shared/progressReviewForm';
+import { EventDetailLine } from './components/EventDetailLine';
+import { EventDetailTile } from './components/EventDetailTile';
+import { TimetableSurfaceSkeleton } from './components/TimetableSurfaceSkeleton';
+import { CalendarColorPreferencesDrawer } from './components/CalendarColorPreferencesDrawer';
+import {
+  MEETING_TYPE_DEFINITIONS,
+  getCalendarStatusKey,
+  getMeetingTypeKey,
+  loadCalendarColors,
+  meetingTypeLabelForEvent,
+  saveCalendarColors,
+  type CalendarColorPreferences,
+  type MeetingTypeKey,
+} from './calendarColors';
+
+const coachNav = roleNavMap.coach;
+const API_ENDPOINT = '/coach_api/coach/timetable';
+const SCHEDULE_ENDPOINT = '/coach_api/coach/timetable/events/schedule';
+const ACTION_ENDPOINT = '/coach_api/coach/timetable/events/action';
+
+function isReviewDetailEvent(event: TimetableEvent) {
+  return event.type === 'review'
+    || event.source === 'progress-review'
+    || event.source === 'review'
+    || Boolean(event.reviewTemplateId);
+}
+
+function eventDetailsPath(event: TimetableEvent) {
+  if (event.bookingOnly) return null;
+  const key = event.eventKey || event.id;
+  if (!key) return null;
+  if (event.source === 'mcr' || event.source === 'catch-up' || event.source === 'student-support') {
+    return `/coach/meetings/${encodeURIComponent(key)}`;
+  }
+  if (isReviewDetailEvent(event)) return `/coach/reviews/${encodeURIComponent(key)}`;
+  return null;
+}
+
+/* â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+   Types
+   â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+interface TimetableEvent {
+  id: string;
+  bookingOnly?: boolean;
+  eventKey?: string;
+  title: string;
+  type: 'coaching' | 'live-session' | 'review' | 'employer-meeting' | 'welfare' | 'admin' | 'personal';
+  date?: string;
+  year: number;
+  dayOfWeek: 0 | 1 | 2 | 3 | 4 | 5 | 6;
+  dayOfMonth: number;
+  month: number;
+  startHour: number;
+  endHour: number;
+  timeLabel?: string;
+  isTimeEstimated?: boolean;
+  /** Server-derived once the booked time has passed: learner attended (completed) or not (ended). */
+  meetingOutcome?: 'ended' | 'completed' | null;
+  learner?: string;
+  email?: string;
+  employer?: string;
+  managerEmail?: string;
+  programme?: string;
+  tutor?: string;
+  location?: string;
+  platform?: string;
+  priority: 'normal' | 'urgent' | 'high';
+  status: 'completed' | 'scheduled' | 'in-progress' | 'awaiting-signature' | 'confirmed' | 'pending' | 'cancelled' | 'not-scheduled';
+  source?: 'mcr' | 'progress-review' | string;
+  reviewSource?: 'aptem' | 'curriculum' | string;
+  importedReviewType?: string | null;
+  calendarEventKey?: string | null;
+  reconciledReview?: boolean;
+  sourceStatus?: string;
+  sequence?: number;
+  rawPlanned?: string;
+  rawStatus?: string;
+  notes?: string;
+  cohort?: string;
+  group?: string;
+  learnerId?: string;
+  learnerType?: 'commercial' | 'apprenticeship' | null;
+  enrolmentId?: string | null;
+  ownerEmail?: string;
+  ownerName?: string;
+  targetDate?: string;
+  scheduledDate?: string | null;
+  scheduledTime?: string | null;
+  durationMinutes?: number;
+  meetingProvider?: string;
+  meetingLink?: string;
+  graphWebLink?: string;
+  syncWarning?: string;
+  reviewResponses?: Record<string, string>;
+  reviewCompletedAt?: string | null;
+  /** Set on every occurrence produced by a Curriculum Review template --
+   *  the stable identity of the Review, never its display name. */
+  reviewTemplateId?: string | null;
+  /** The Review's CLASSIFICATION, from curriculum.review_types. `source`
+   *  above stays the routing bucket (mcr / progress-review / review) that
+   *  scheduling, Teams, artifacts and theming key on; these decide which
+   *  Review filter the event appears under. Null on non-review events and on
+   *  a Review whose template has no type yet. */
+  reviewTypeId?: string | null;
+  reviewTypeCode?: string | null;
+  /** The FILTER label -- never the card title, which is `title` above. */
+  reviewTypeName?: string | null;
+  reviewTypeIsSystem?: boolean;
+  reviewInstanceId?: string | null;
+  occurrenceNumber?: number | null;
+  managerSignedAt?: string | null;
+  managerSignedBy?: string;
+  schedulerOnly?: boolean;
+}
+
+interface TimetableSummaryMetrics {
+  totalEvents: number;
+  completedEvents: number;
+  scheduledEvents: number;
+  inProgressEvents: number;
+  needsScheduling: number;
+  thisWeekEvents: number;
+  overdueEvents: number;
+  dueSoonEvents: number;
+  cancelledEvents: number;
+  completionRate: number;
+  coachingEvents: number;
+  reviewEvents: number;
+  supportEvents: number;
+}
+
+interface TimetableSummary extends TimetableSummaryMetrics {
+  timeAvailability?: string;
+  sourceBreakdown?: {
+    mcr: TimetableSummaryMetrics;
+    progressReview: TimetableSummaryMetrics;
+    catchUp: TimetableSummaryMetrics;
+    support?: TimetableSummaryMetrics;
+  };
+}
+
+interface TimetableResponse {
+  owner?: {
+    name?: string;
+    email?: string;
+  };
+  summary?: TimetableSummary;
+  events?: TimetableEvent[];
+  schedulerQueues?: {
+    catchUp?: TimetableEvent[];
+  };
+}
+
+interface ScheduleNavigationIntent {
+  source: SchedulableSource;
+  learnerId?: string;
+  targetDate?: string | null;
+  title?: string;
+}
+
+interface TimetableFocusIntent {
+  source?: string;
+  eventKey?: string;
+  date?: string | null;
+  title?: string;
+  scheduledTime?: string;
+  programme?: string;
+  cohort?: string;
+  group?: string;
+}
+
+type CoachBookableSessionType = 'catch-up' | 'student-support' | 'review';
+type ApiError = Error & { status?: number };
+
+const EMPTY_SUMMARY_METRICS: TimetableSummaryMetrics = {
+  totalEvents: 0,
+  completedEvents: 0,
+  scheduledEvents: 0,
+  inProgressEvents: 0,
+  needsScheduling: 0,
+  thisWeekEvents: 0,
+  overdueEvents: 0,
+  dueSoonEvents: 0,
+  cancelledEvents: 0,
+  completionRate: 0,
+  coachingEvents: 0,
+  reviewEvents: 0,
+  supportEvents: 0,
+};
+
+const EMPTY_SUMMARY: TimetableSummary = {
+  ...EMPTY_SUMMARY_METRICS,
+  sourceBreakdown: {
+    mcr: { ...EMPTY_SUMMARY_METRICS },
+    progressReview: { ...EMPTY_SUMMARY_METRICS },
+    catchUp: { ...EMPTY_SUMMARY_METRICS },
+    support: { ...EMPTY_SUMMARY_METRICS },
+  },
+};
+const UPCOMING_WINDOW_DAYS = 7;
+const TIMETABLE_LOAD_TIMEOUT_MS = 20000;
+const TIMETABLE_LOAD_TIMEOUT_MESSAGE = 'Timetable is taking too long to load. Please refresh or try again.';
+const LEARNER_UNAVAILABLE_MESSAGE = 'This learner is busy at that time. Choose another time.';
+const TEAMS_SYNC_PERMISSION_MESSAGE = 'Saved locally. Microsoft Calendar needs updated permissions before this can sync to Teams.';
+const TEAMS_SYNC_NOT_CONFIGURED_MESSAGE = 'Saved locally. Microsoft Calendar sync is not configured yet.';
+const TEAMS_SYNC_TEMPORARY_MESSAGE = 'Saved locally. Microsoft Calendar sync is temporarily unavailable; try again later or ask an admin to check Microsoft permissions.';
+const TEAMS_SYNC_LINK_MISSING_MESSAGE = 'The meeting time is saved, but Teams did not return a meeting link. Retry calendar sync after Microsoft access is available.';
+
+async function readApiJson<T>(response: Response): Promise<T> {
+  const data = await response.json().catch(() => ({})) as { detail?: unknown };
+  if (!response.ok) {
+    const message = typeof data.detail === 'string' && data.detail.trim()
+      ? data.detail
+      : `Request failed with ${response.status}`;
+    const error = new Error(message) as ApiError;
+    error.status = response.status;
+    throw error;
+  }
+  return data as T;
+}
+
+function isLearnerAvailabilityConflict(err: unknown) {
+  if (!(err instanceof Error)) return false;
+  const status = (err as ApiError).status;
+  return status === 409 && /learner.*busy|busy at that time|learner.*unavailable|not available/i.test(err.message);
+}
+
+function showLearnerUnavailableAlert(message = LEARNER_UNAVAILABLE_MESSAGE) {
+  return Swal.fire({
+    title: 'Learner unavailable',
+    text: message,
+    icon: 'warning',
+    width: 512,
+    confirmButtonText: 'Choose another time',
+    buttonsStyling: false,
+    customClass: {
+      popup: 'kbc-standard-swal-popup',
+      title: 'kbc-standard-swal-title',
+      htmlContainer: 'kbc-standard-swal-text',
+      actions: 'kbc-standard-swal-actions',
+      confirmButton: 'kbc-standard-swal-confirm',
+    },
+  });
+}
+
+function sanitizeCalendarSyncMessage(value?: string | null) {
+  const message = (value || '').trim().replace(/\s+/g, ' ');
+  if (!message) return '';
+  const lowered = message.toLowerCase();
+  if (lowered.includes('credentials are not configured')) return TEAMS_SYNC_NOT_CONFIGURED_MESSAGE;
+  if (lowered.includes('erroraccessdenied') || lowered.includes('access is denied') || /(^|\D)403(\D|$)/.test(lowered)) {
+    return TEAMS_SYNC_PERMISSION_MESSAGE;
+  }
+  if (lowered.includes('did not return a teams meeting link') || (lowered.includes('did not return') && lowered.includes('teams'))) {
+    return TEAMS_SYNC_LINK_MISSING_MESSAGE;
+  }
+  if (lowered.includes('microsoft graph') || lowered.includes('microsoft token')) return TEAMS_SYNC_TEMPORARY_MESSAGE;
+  return message;
+}
+
+function sanitizeEventNotes(value?: string | null) {
+  const message = (value || '').trim().replace(/\s+/g, ' ');
+  if (!message) return '';
+  const syncWarningMatch = message.match(/^(.*?)(?:\s*Microsoft sync warning:\s*)(.*)$/i);
+  if (syncWarningMatch) {
+    const prefix = syncWarningMatch[1].trim();
+    const warning = sanitizeCalendarSyncMessage(syncWarningMatch[2]);
+    return [prefix, warning ? `Microsoft sync warning: ${warning}` : ''].filter(Boolean).join(' ');
+  }
+  return sanitizeCalendarSyncMessage(message);
+}
+
+function formatMeetingLinkHost(value?: string | null) {
+  if (!value) return '';
+  try {
+    return new URL(value).hostname.replace(/^www\./, '');
+  } catch {
+    return value.replace(/^https?:\/\//, '').split('/')[0] || '';
+  }
+}
+
+function formatMeetingProviderLabel(
+  event?: Pick<TimetableEvent, 'meetingProvider' | 'platform'> | null,
+  host = '',
+) {
+  const CHANGE_MEProvider = [event?.meetingProvider, event?.platform]
+    .map(value => (value || '').trim())
+    .find(value => value && value !== '--');
+
+  if (CHANGE_MEProvider) return CHANGE_MEProvider;
+
+  const loweredHost = host.toLowerCase();
+  if (loweredHost.includes('teams')) return 'Microsoft Teams';
+  if (loweredHost.includes('zoom')) return 'Zoom';
+  if (loweredHost.includes('meet.google')) return 'Google Meet';
+  if (loweredHost.includes('webex')) return 'Webex';
+  return 'Online meeting';
+}
+
+/* â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+   Data â€” June 2026 (spans 4 weeks)
+   â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+const DAYS_OF_WEEK = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+const HOURS = Array.from({ length: 14 }, (_, i) => i + 7); // 07:00 â€“ 20:00
+
+// Fill kept at the -50/-700/-200 scale used across the workspace's status
+// colour, so a priority pill and a status pill never read as two different
+// visual languages next to each other.
+function priorityBadge(p: TimetableEvent['priority']) {
+  if (p === 'urgent') return 'bg-red-50 text-red-700 border-red-200';
+  if (p === 'high') return 'bg-rose-50 text-rose-700 border-rose-200';
+  return 'bg-background-50 text-foreground-500 border-background-200';
+}
+
+function formatTime(h: number) {
+  const hh = Math.floor(h);
+  const mm = Math.round((h - hh) * 60);
+  return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`;
+}
+
+function parseEventDate(event: Pick<TimetableEvent, 'date' | 'year' | 'month' | 'dayOfMonth'>) {
+  if (event.date) {
+    const parsed = new Date(event.date);
+    if (!Number.isNaN(parsed.getTime())) return parsed;
+  }
+  return new Date(event.year, event.month, event.dayOfMonth);
+}
+
+function parseDateOnly(value?: string | null) {
+  if (!value) return null;
+  const [datePart] = value.split('T');
+  const parts = datePart.split('-').map(Number);
+  if (parts.length !== 3 || parts.some(Number.isNaN)) return null;
+  return new Date(parts[0], parts[1] - 1, parts[2]);
+}
+
+function startOfDay(value = new Date()) {
+  return new Date(value.getFullYear(), value.getMonth(), value.getDate());
+}
+
+function currentWeekRange(referenceDate = new Date()) {
+  const today = startOfDay(referenceDate);
+  const day = today.getDay();
+  const mondayOffset = day === 0 ? -6 : 1 - day;
+  const start = new Date(today);
+  start.setDate(today.getDate() + mondayOffset);
+
+  const end = new Date(start);
+  end.setDate(start.getDate() + 4);
+  return { start, end };
+}
+
+function eventDisplayDateValue(event: TimetableEvent) {
+  return event.scheduledDate || event.date || event.targetDate || '';
+}
+
+function eventTargetDateValue(event: TimetableEvent) {
+  return event.targetDate || event.date || event.scheduledDate || '';
+}
+
+function getMetricDate(value: string, fallbackEvent: TimetableEvent) {
+  return parseDateOnly(value) || parseEventDate(fallbackEvent);
+}
+
+function isCompletedMetricEvent(event: TimetableEvent) {
+  return event.status === 'completed' || event.status === 'confirmed';
+}
+
+function isScheduledMetricEvent(event: TimetableEvent) {
+  return event.status === 'scheduled';
+}
+
+function isInProgressMetricEvent(event: TimetableEvent) {
+  return event.status === 'in-progress';
+}
+
+function needsSchedulingMetricEvent(event: TimetableEvent) {
+  return event.status === 'pending' || event.status === 'not-scheduled';
+}
+
+function isOverdueMetricEvent(event: TimetableEvent, referenceDate = new Date()) {
+  if (!needsSchedulingMetricEvent(event)) return false;
+  const targetDate = getMetricDate(eventTargetDateValue(event), event);
+  return targetDate.getTime() < startOfDay(referenceDate).getTime();
+}
+
+function isDueSoonMetricEvent(event: TimetableEvent, referenceDate = new Date(), daysAhead = 14) {
+  if (!needsSchedulingMetricEvent(event) || isOverdueMetricEvent(event, referenceDate)) return false;
+  const targetDate = getMetricDate(eventTargetDateValue(event), event);
+  const today = startOfDay(referenceDate);
+  const cutoff = new Date(today);
+  cutoff.setDate(today.getDate() + daysAhead);
+  return targetDate.getTime() >= today.getTime() && targetDate.getTime() <= cutoff.getTime();
+}
+
+function isThisWeekMetricEvent(event: TimetableEvent, referenceDate = new Date()) {
+  if (isCompletedMetricEvent(event)) return false;
+  const displayDate = getMetricDate(eventDisplayDateValue(event), event);
+  const { start, end } = currentWeekRange(referenceDate);
+  return displayDate.getTime() >= start.getTime() && displayDate.getTime() <= end.getTime();
+}
+
+function isCoachBookableEvent(event: TimetableEvent) {
+  return event.source === 'catch-up' || event.source === 'student-support';
+}
+
+function shouldRenderCalendarEvent(event: TimetableEvent) {
+  if (!isCoachBookableEvent(event)) return true;
+  return !event.schedulerOnly && Boolean(event.scheduledDate && event.scheduledTime);
+}
+
+function formatEventDateLabel(event: TimetableEvent) {
+  return `${DAYS_OF_WEEK[event.dayOfWeek]}, ${event.dayOfMonth} ${MONTH_NAMES[event.month]}`;
+}
+
+// Status pill fill and label now come from the shared coach calendar helper
+// (`@/pages/coach/shared/calendarEvents`) — the same module meetings/ and
+// progress-reviews/ read status from — instead of a third local copy at a
+// different fill scale. `statusDot` stays local: it is a solid marker for the
+// month/week grid, and the shared module has no dot export, only the pill.
+// Its hue split mirrors `statusPillClass` exactly (including the
+// pending/not-scheduled -> rose branch that this page used to fold into
+// "scheduled" purple) so the two never disagree on what colour a status is.
+function displayStatusLabel(status: TimetableEvent['status'], isOverdue: boolean, isDueSoon: boolean) {
+  const statusKey = getCalendarStatusKey(status, isOverdue, isDueSoon);
+  if (statusKey === 'missed-overdue') return 'Overdue';
+  if (statusKey === 'pending-due-soon') return 'Due Soon';
+  return statusLabel(status);
+}
+
+// An elapsed meeting shows Ended, or Completed once Teams shows the learner attended.
+// Display only: the stored status still drives actions and the review lifecycle.
+function meetingStatusKey(event: TimetableEvent) {
+  if (event.meetingOutcome === 'completed') return 'completed';
+  if (event.meetingOutcome === 'ended') return 'missed-overdue';
+  return getCalendarStatusKey(event.status, isOverdueMetricEvent(event), isDueSoonMetricEvent(event));
+}
+
+function eventStatusLabel(event: TimetableEvent) {
+  if (event.meetingOutcome === 'completed') return 'Completed';
+  if (event.meetingOutcome === 'ended') return 'Ended';
+  return displayStatusLabel(event.status, isOverdueMetricEvent(event), isDueSoonMetricEvent(event));
+}
+
+function buildSummaryMetrics(events: TimetableEvent[], referenceDate = new Date()): TimetableSummaryMetrics {
+  const totalEvents = events.length;
+  const completedEvents = events.filter(isCompletedMetricEvent).length;
+  const scheduledEvents = events.filter(isScheduledMetricEvent).length;
+  const inProgressEvents = events.filter(isInProgressMetricEvent).length;
+  const needsScheduling = events.filter(needsSchedulingMetricEvent).length;
+  const thisWeekEvents = events.filter(event => isThisWeekMetricEvent(event, referenceDate)).length;
+  const overdueEvents = events.filter(event => isOverdueMetricEvent(event, referenceDate)).length;
+  const dueSoonEvents = events.filter(event => isDueSoonMetricEvent(event, referenceDate)).length;
+  const cancelledEvents = events.filter(event => event.status === 'cancelled').length;
+
+  return {
+    totalEvents,
+    completedEvents,
+    scheduledEvents,
+    inProgressEvents,
+    needsScheduling,
+    thisWeekEvents,
+    overdueEvents,
+    dueSoonEvents,
+    cancelledEvents,
+    completionRate: totalEvents > 0 ? Math.round((completedEvents / totalEvents) * 100) : 0,
+    coachingEvents: events.filter(event => event.type === 'coaching').length,
+    reviewEvents: events.filter(event => event.type === 'review').length,
+    supportEvents: events.filter(event => event.type === 'welfare').length,
+  };
+}
+
+function buildFallbackSummary(events: TimetableEvent[], referenceDate = new Date()): TimetableSummary {
+  return {
+    ...buildSummaryMetrics(events, referenceDate),
+    sourceBreakdown: {
+      mcr: buildSummaryMetrics(events.filter(event => event.source === 'mcr'), referenceDate),
+      progressReview: buildSummaryMetrics(events.filter(event => event.source === 'progress-review'), referenceDate),
+      catchUp: buildSummaryMetrics(events.filter(event => event.source === 'catch-up'), referenceDate),
+      support: buildSummaryMetrics(events.filter(event => event.source === 'student-support'), referenceDate),
+    },
+  };
+}
+
+function normalizeSummary(summary: TimetableSummary, events: TimetableEvent[]): TimetableSummary {
+  const liveSummary = buildFallbackSummary(events);
+  return {
+    ...summary,
+    ...liveSummary,
+    timeAvailability: summary.timeAvailability,
+  };
+}
+
+/* â”€â”€â”€ Month calendar helpers â”€â”€â”€ */
+function getMonthData(year: number, month: number) {
+  const firstDay = new Date(year, month, 1);
+  const lastDay = new Date(year, month + 1, 0);
+  const startDow = firstDay.getDay();
+  const mondayOffset = startDow === 0 ? 6 : startDow - 1;
+  const totalDays = lastDay.getDate();
+  const cells: (number | null)[] = [];
+  for (let i = 0; i < mondayOffset; i++) cells.push(null);
+  for (let d = 1; d <= totalDays; d++) cells.push(d);
+  return cells;
+}
+
+function getWeekDates(year: number, month: number, CHANGE_MEDay: number) {
+  const date = new Date(year, month, CHANGE_MEDay);
+  const dayOfWeek = date.getDay();
+  const mondayOffset = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
+  const monday = new Date(date);
+  monday.setDate(date.getDate() - mondayOffset);
+  const week: { day: number; month: number; year: number; monthName: string }[] = [];
+  for (let i = 0; i < 7; i++) {
+    const d = new Date(monday);
+    d.setDate(monday.getDate() + i);
+    week.push({ day: d.getDate(), month: d.getMonth(), year: d.getFullYear(), monthName: MONTH_NAMES[d.getMonth()] });
+  }
+  return week;
+}
+
+function getDaysInMonth(year: number, month: number) {
+  return new Date(year, month + 1, 0).getDate();
+}
+
+function formatDateInputValue(year: number, month: number, day: number) {
+  const safeDay = Math.min(day, getDaysInMonth(year, month));
+  return `${year}-${String(month + 1).padStart(2, '0')}-${String(safeDay).padStart(2, '0')}`;
+}
+
+/* â”€â”€â”€ Donut Ring â”€â”€â”€ */
+type ViewMode = 'month' | 'week' | 'day';
+type StatusFilter = 'all' | 'overdue' | 'due-soon' | 'needs-schedule' | 'scheduled' | 'in-progress' | 'awaiting-signature' | 'ended' | 'completed' | 'cancelled';
+// Source filters (fixed non-review chips + dynamic Review Type buckets) live
+// in ./sourceFilters, which shares its Review bucketing with the learner
+// calendar via @/lib/reviewTypeFilters.
+//
+// Unchanged: these are SCHEDULING buckets, not filters. The schedule modal,
+// its copy and its icons are keyed on the routing `source`.
+type SchedulableSource = 'mcr' | 'progress-review' | 'review' | 'catch-up' | 'student-support' | 'lms-introduction';
+const STATUS_FILTER_ORDER: StatusFilter[] = ['all', 'overdue', 'due-soon', 'needs-schedule', 'scheduled', 'in-progress', 'awaiting-signature', 'ended', 'completed', 'cancelled'];
+
+const STATUS_FILTER_LABELS: Record<StatusFilter, string> = {
+  all: 'All',
+  overdue: 'Overdue',
+  'due-soon': 'Due Soon',
+  'needs-schedule': 'Not Scheduled',
+  scheduled: 'Scheduled',
+  'in-progress': 'In Progress',
+  'awaiting-signature': 'Awaiting Signature',
+  ended: 'Ended',
+  completed: 'Completed',
+  cancelled: 'Cancelled',
+};
+
+/** Filter on the same display outcome as the card, without changing the
+ * stored status used by booking actions, signatures or summary metrics. */
+function eventStatusFilter(event: TimetableEvent): StatusFilter {
+  if (event.meetingOutcome === 'completed') return 'completed';
+  if (event.meetingOutcome === 'ended') return 'ended';
+  if (event.status === 'cancelled') return 'cancelled';
+  const key = meetingStatusKey(event);
+  if (key === 'missed-overdue') return 'overdue';
+  if (key === 'pending-due-soon') return 'due-soon';
+  if (key === 'not-scheduled') return 'needs-schedule';
+  return key;
+}
+
+const SCHEDULABLE_SOURCE_ORDER: SchedulableSource[] = ['mcr', 'progress-review', 'review', 'catch-up', 'student-support', 'lms-introduction'];
+const SCHEDULABLE_SOURCE_META: Record<SchedulableSource, { description: string; icon: string; accent: string; surface: string }> = {
+  mcr: {
+    description: 'Monthly coaching reviews waiting for a slot.',
+    icon: 'ri-chat-1-line',
+    accent: 'text-primary-700',
+    surface: 'from-primary-500/10 via-primary-400/5 to-transparent',
+  },
+  'progress-review': {
+    description: 'Generated progress reviews that still need a date.',
+    icon: 'ri-file-chart-line',
+    accent: 'text-teal-700',
+    surface: 'from-teal-500/10 via-teal-400/5 to-transparent',
+  },
+  review: {
+    description: 'Curriculum reviews that still need a date.',
+    icon: 'ri-survey-line',
+    accent: 'text-secondary-700',
+    surface: 'from-secondary-500/10 via-secondary-400/5 to-transparent',
+  },
+  'catch-up': {
+    description: 'Catch-up sessions available for scheduling or rescheduling.',
+    icon: 'ri-timer-line',
+    accent: 'text-rose-700',
+    surface: 'from-rose-500/10 via-rose-400/5 to-transparent',
+  },
+  'student-support': {
+    description: 'Learner support sessions and available appointments.',
+    icon: 'ri-hand-heart-line',
+    accent: 'text-blue-700',
+    surface: 'from-blue-500/10 via-blue-400/5 to-transparent',
+  },
+  'lms-introduction': {
+    description: 'New learners asking for a one-to-one LMS introduction.',
+    icon: 'ri-user-voice-line',
+    accent: 'CHANGE_ME',
+    surface: 'from-emerald-500/10 via-emerald-400/5 to-transparent',
+  },
+};
+
+function isSchedulableSource(value?: string): value is SchedulableSource {
+  return value === 'mcr' || value === 'progress-review' || value === 'review' || value === 'catch-up' || value === 'student-support' || value === 'lms-introduction';
+}
+
+// Learner-made requests the coach approves by placing them (status not-scheduled).
+function isApprovalRequestSource(source?: string) {
+  return source === 'lms-introduction';
+}
+
+function parseScheduleNavigationIntent(value: unknown): ScheduleNavigationIntent | null {
+  if (!value || typeof value !== 'object') return null;
+
+  const source = typeof (value as { source?: unknown }).source === 'string'
+    ? (value as { source?: string }).source
+    : undefined;
+
+  if (!isSchedulableSource(source)) return null;
+
+  return {
+    source,
+    learnerId: typeof (value as { learnerId?: unknown }).learnerId === 'string'
+      ? (value as { learnerId?: string }).learnerId
+      : undefined,
+    targetDate: typeof (value as { targetDate?: unknown }).targetDate === 'string'
+      ? (value as { targetDate?: string }).targetDate
+      : undefined,
+    title: typeof (value as { title?: unknown }).title === 'string'
+      ? (value as { title?: string }).title
+      : undefined,
+  };
+}
+
+function parseTimetableFocusIntent(value: unknown): TimetableFocusIntent | null {
+  if (!value || typeof value !== 'object') return null;
+
+  const focus = value as Record<string, unknown>;
+  const source = typeof focus.source === 'string' ? focus.source : undefined;
+  const eventKey = typeof focus.eventKey === 'string' ? focus.eventKey : undefined;
+  const date = typeof focus.date === 'string' ? focus.date : undefined;
+  const title = typeof focus.title === 'string' ? focus.title : undefined;
+  const scheduledTime = typeof focus.scheduledTime === 'string' ? focus.scheduledTime : undefined;
+  const programme = typeof focus.programme === 'string' ? focus.programme : undefined;
+  const cohort = typeof focus.cohort === 'string' ? focus.cohort : undefined;
+  const group = typeof focus.group === 'string' ? focus.group : undefined;
+
+  if (!source && !eventKey && !date && !title) return null;
+
+  return {
+    source,
+    eventKey,
+    date,
+    title,
+    scheduledTime,
+    programme,
+    cohort,
+    group,
+  };
+}
+
+function eventIdentity(event: TimetableEvent) {
+  return event.eventKey || event.id;
+}
+
+function isLiveSessionEvent(event: TimetableEvent) {
+  return event.source === 'live-session' || event.type === 'live-session';
+}
+
+function normalizeNavigationText(value?: string | null) {
+  return (value || '')
+    .toLowerCase()
+    .replace(/[—–]/g, '-')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function eventMatchesFocusIntent(event: TimetableEvent, focus: TimetableFocusIntent) {
+  if (focus.eventKey && eventIdentity(event) === focus.eventKey) return true;
+  if (focus.source && focus.source !== event.source && focus.source !== event.type) return false;
+  if (focus.date) {
+    const eventDate = eventDisplayDateValue(event);
+    if (eventDate !== focus.date && eventTargetDateValue(event) !== focus.date) return false;
+  }
+  if (focus.title && normalizeNavigationText(event.title) !== normalizeNavigationText(focus.title)) return false;
+  if (focus.programme && normalizeNavigationText(event.programme) !== normalizeNavigationText(focus.programme)) return false;
+  if (focus.cohort && normalizeNavigationText(event.cohort) !== normalizeNavigationText(focus.cohort)) return false;
+  if (focus.group && normalizeNavigationText(event.group) !== normalizeNavigationText(focus.group)) return false;
+  if (focus.scheduledTime && !(event.timeLabel || '').startsWith(focus.scheduledTime)) return false;
+  return true;
+}
+
+function learnerIdentity(event: TimetableEvent) {
+  return event.learnerId || event.email || event.learner || eventIdentity(event);
+}
+
+function formatCompactDate(value?: string | null) {
+  const parsed = parseDateOnly(value);
+  if (!parsed) return 'Date TBC';
+  return new Intl.DateTimeFormat('en-GB', {
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric',
+  }).format(parsed);
+}
+
+function sourceSessionLabel(event: TimetableEvent) {
+  if (!isSchedulableSource(event.source)) return event.title;
+  const baseLabel = eventSourceLabel(event.source);
+  if (event.source === 'catch-up') return event.schedulerOnly ? 'New Catch-up Session' : baseLabel;
+  return event.sequence ? `${baseLabel} ${event.sequence}` : baseLabel;
+}
+
+function scheduleSessionOptionLabel(event: TimetableEvent) {
+  if (event.source === 'catch-up' && event.schedulerOnly) {
+    return `${event.learner || 'Learner'} · New Catch-up Session`;
+  }
+  return `${event.learner || 'Learner'} · ${sourceSessionLabel(event)} · due ${formatCompactDate(event.targetDate || event.date)}`;
+}
+
+function scheduleLearnerOptionLabel(event: TimetableEvent) {
+  return event.programme ? `${event.learner || 'Learner'} · ${event.programme}` : (event.learner || 'Learner');
+}
+
+function isSelectableScheduleEvent(event: TimetableEvent) {
+  if (event.bookingOnly) return false;
+  if (event.reviewSource === 'aptem') return canRescheduleReconciledReview(event);
+  if (!isSchedulableSource(event.source)) return false;
+  if (event.source === 'catch-up') {
+    return !['completed', 'confirmed', 'in-progress'].includes(event.status);
+  }
+  return needsSchedulingMetricEvent(event);
+}
+
+function canEditScheduleEvent(event: TimetableEvent | null | undefined): event is TimetableEvent {
+  if (event?.bookingOnly) return false;
+  if (event && isImportedPersonalSupportPlan(event)) return ['not-scheduled', 'scheduled'].includes(event.status);
+  if (event?.reviewSource === 'aptem') return canRescheduleReconciledReview(event);
+  if (!event || !isSchedulableSource(event.source)) return false;
+  return !['completed', 'confirmed', 'in-progress', 'awaiting-signature'].includes(event.status);
+}
+
+function scheduleActionLabel(event: TimetableEvent | null | undefined) {
+  if (!event) return 'Schedule';
+  if (event.status === 'cancelled') return 'Schedule Again';
+  if (event.status === 'scheduled') return 'Reschedule';
+  if (isApprovalRequestSource(event.source)) return 'Approve & Schedule';
+  return 'Schedule';
+}
+
+function compareSchedulablePriority(a: TimetableEvent, b: TimetableEvent) {
+  const aNeedsBooking = needsSchedulingMetricEvent(a) ? 0 : 1;
+  const bNeedsBooking = needsSchedulingMetricEvent(b) ? 0 : 1;
+  if (aNeedsBooking !== bNeedsBooking) return aNeedsBooking - bNeedsBooking;
+
+  const aTemplatePenalty = a.schedulerOnly ? 1 : 0;
+  const bTemplatePenalty = b.schedulerOnly ? 1 : 0;
+  if (aTemplatePenalty !== bTemplatePenalty) return aTemplatePenalty - bTemplatePenalty;
+
+  const aOverdue = isOverdueMetricEvent(a) ? 0 : 1;
+  const bOverdue = isOverdueMetricEvent(b) ? 0 : 1;
+  if (aOverdue !== bOverdue) return aOverdue - bOverdue;
+
+  const dateDelta = getMetricDate(eventTargetDateValue(a), a).getTime() - getMetricDate(eventTargetDateValue(b), b).getTime();
+  if (dateDelta !== 0) return dateDelta;
+
+  const sequenceDelta = (a.sequence || 0) - (b.sequence || 0);
+  if (sequenceDelta !== 0) return sequenceDelta;
+
+  const learnerDelta = (a.learner || '').localeCompare(b.learner || '');
+  if (learnerDelta !== 0) return learnerDelta;
+
+  return sourceSessionLabel(a).localeCompare(sourceSessionLabel(b));
+}
+
+function matchesSearchTerm(event: TimetableEvent, searchTerm: string) {
+  if (!searchTerm) return true;
+  const normalizedSearch = searchTerm.trim().toLowerCase();
+  if (!normalizedSearch) return true;
+
+  const searchableText = [
+    event.title,
+    event.reviewTypeName,
+    event.importedReviewType,
+    event.learner,
+    event.email,
+    event.learnerId,
+    event.employer,
+    event.managerEmail,
+    event.tutor,
+    event.programme,
+    event.cohort,
+    event.location,
+    event.notes,
+    event.timeLabel,
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+
+  return normalizedSearch
+    .split(/\s+/)
+    .filter(Boolean)
+    .every(token => searchableText.includes(token));
+}
+
+/* â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+   Page
+   â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+export default function CoachTimetablePage() {
+  const location = useLocation();
+  const navigate = useNavigate();
+  const coach = useCoachIdentity();
+  const calendarColorOwner = coach.email || 'default';
+  const now = new Date();
+  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const todayStartTime = todayStart.getTime();
+  const [viewMode, setViewMode] = useState<ViewMode>('month');
+  const [viewYear, setViewYear] = useState(now.getFullYear());
+  const [viewMonth, setViewMonth] = useState(now.getMonth());
+  const [CHANGE_MEDay, setSelectedDay] = useState(now.getDate());
+  const [expandedMonthDays, setExpandedMonthDays] = useState<Set<string>>(() => new Set());
+  const [CHANGE_MEEvent, setSelectedEvent] = useState<TimetableEvent | null>(null);
+  const [datePickerOpen, setDatePickerOpen] = useState(false);
+  const [filterStatus, setFilterStatus] = useState<StatusFilter>('all');
+  const [filterSource, setFilterSource] = useState<SourceFilter>('all');
+  const [searchTerm, setSearchTerm] = useState('');
+  const [calendarColors, setCalendarColors] = useState<CalendarColorPreferences>(() => loadCalendarColors(calendarColorOwner));
+  const [colorPreferencesOpen, setColorPreferencesOpen] = useState(false);
+  const cacheKey = coachSessionKey('timetable', coach.email);
+  const initialCache = readCoachSessionCache<{ events: TimetableEvent[]; schedulerCatchUpEvents: TimetableEvent[]; summary: TimetableSummary }>(cacheKey);
+  const [events, setEvents] = useState<TimetableEvent[]>(() => initialCache?.events || []);
+  const [schedulerCatchUpEvents, setSchedulerCatchUpEvents] = useState<TimetableEvent[]>(() => initialCache?.schedulerCatchUpEvents || []);
+  const [summary, setSummary] = useState<TimetableSummary>(() => initialCache?.summary || EMPTY_SUMMARY);
+  const [createSessionOpen, setCreateSessionOpen] = useState(false);
+  const [createSessionType, setCreateSessionType] = useState<CoachBookableSessionType>('catch-up');
+  const [createSessionLearnerId, setCreateSessionLearnerId] = useState('');
+  const [createSessionLearnerSearch, setCreateSessionLearnerSearch] = useState('');
+  const [createSessionLearnerPickerOpen, setCreateSessionLearnerPickerOpen] = useState(false);
+  const [createSessionDate, setCreateSessionDate] = useState('');
+  const [createSessionTime, setCreateSessionTime] = useState('09:00');
+  const [createReviewTimes, setCreateReviewTimes] = useState<string[]>([]);
+  const [createReviewAvailabilityLoading, setCreateReviewAvailabilityLoading] = useState(false);
+  const [createReviewAvailabilityError, setCreateReviewAvailabilityError] = useState('');
+  const [createReviewAvailabilityRevision, setCreateReviewAvailabilityRevision] = useState(0);
+  const [createSessionDuration, setCreateSessionDuration] = useState(60);
+  const [createSessionNotes, setCreateSessionNotes] = useState('');
+  const [createSessionBusy, setCreateSessionBusy] = useState(false);
+  const [createSessionError, setCreateSessionError] = useState<string | null>(null);
+  // Learner-specific additional Review (Create session -> Review). A
+  // dedicated canonical occurrence for ONE learner -- see
+  // createLearnerReviewAddition -- never a standalone calendar row.
+  const [createSessionReviewTemplates, setCreateSessionReviewTemplates] = useState<LearnerAdditionReviewTemplate[]>([]);
+  const [createSessionReviewTemplatesLoading, setCreateSessionReviewTemplatesLoading] = useState(false);
+  const [createSessionReviewPolicy, setCreateSessionReviewPolicy] = useState<{ learnerId: string; canAddReview: boolean; detail?: string } | null>(null);
+  const canAddLearnerReview = createSessionReviewPolicy?.learnerId === String(createSessionLearnerId)
+    && createSessionReviewPolicy.canAddReview && !createSessionReviewTemplatesLoading;
+  const [createSessionReviewTemplateId, setCreateSessionReviewTemplateId] = useState('');
+  const [createSessionReviewTargetDate, setCreateSessionReviewTargetDate] = useState('');
+  const [createSessionReviewReasonCode, setCreateSessionReviewReasonCode] = useState<LearnerAdditionReasonCode | ''>('');
+  const [createSessionReviewReason, setCreateSessionReviewReason] = useState('');
+  const [loading, setLoading] = useState(() => !initialCache);
+  const [error, setError] = useState<string | null>(null);
+  const [eventActionBusy, setEventActionBusy] = useState(false);
+  const [eventActionError, setEventActionError] = useState<string | null>(null);
+  const [eventActionNotice, setEventActionNotice] = useState<string | null>(null);
+  const [progressReviewCompletionEvent, setProgressReviewCompletionEvent] = useState<TimetableEvent | null>(null);
+  const [reviewFormBusy, setReviewFormBusy] = useState(false);
+  const [scheduleModalOpen, setScheduleModalOpen] = useState(false);
+  const [supportBookingEvent, setSupportBookingEvent] = useState<TimetableEvent | null>(null);
+  const [scheduleModalType, setScheduleModalType] = useState<SchedulableSource>('mcr');
+  const [scheduleModalLearnerKey, setScheduleModalLearnerKey] = useState('');
+  const [scheduleModalEventKey, setScheduleModalEventKey] = useState('');
+  const [scheduleModalDate, setScheduleModalDate] = useState('');
+  const [scheduleModalTime, setScheduleModalTime] = useState('09:00');
+  const [scheduleReviewTimes, setScheduleReviewTimes] = useState<string[]>([]);
+  const [scheduleReviewAvailabilityLoading, setScheduleReviewAvailabilityLoading] = useState(false);
+  const [scheduleReviewAvailabilityError, setScheduleReviewAvailabilityError] = useState('');
+  const [scheduleReviewAvailabilityRevision, setScheduleReviewAvailabilityRevision] = useState(0);
+  const [scheduleModalDuration, setScheduleModalDuration] = useState(60);
+  const [scheduleModalBusy, setScheduleModalBusy] = useState(false);
+  const [scheduleModalError, setScheduleModalError] = useState<string | null>(null);
+  const [scheduleModalNotice, setScheduleModalNotice] = useState<string | null>(null);
+  const [scheduleModalCompact, setScheduleModalCompact] = useState(false);
+  const [pendingScheduleIntent, setPendingScheduleIntent] = useState<ScheduleNavigationIntent | null>(() => (
+    parseScheduleNavigationIntent((location.state as { scheduleIntent?: unknown } | null)?.scheduleIntent)
+  ));
+  const [pendingFocusIntent, setPendingFocusIntent] = useState<TimetableFocusIntent | null>(() => (
+    parseTimetableFocusIntent((location.state as { focusEvent?: unknown } | null)?.focusEvent)
+  ));
+
+  const todayDay = now.getDate();
+  const todayMonth = now.getMonth();
+  const todayYear = now.getFullYear();
+  const currentHour = now.getHours();
+  const todayWeekdayLabel = DAYS_OF_WEEK[now.getDay() === 0 ? 6 : now.getDay() - 1].toUpperCase();
+  const todayMonthLabel = MONTH_NAMES[todayMonth].slice(0, 3).toUpperCase();
+  const coachWorkspaceReadOnly = coach.isViewingAsCoach;
+
+  useEffect(() => {
+    setCalendarColors(loadCalendarColors(calendarColorOwner));
+  }, [calendarColorOwner]);
+
+  const handleCalendarColorsSave = useCallback((nextColors: CalendarColorPreferences) => {
+    setCalendarColors(nextColors);
+    saveCalendarColors(calendarColorOwner, nextColors);
+    setColorPreferencesOpen(false);
+  }, [calendarColorOwner]);
+  const handleCloseColorPreferences = useCallback(() => setColorPreferencesOpen(false), []);
+
+  const isToday = useCallback((day: number, month: number, year: number) => {
+    return day === todayDay && month === todayMonth && year === todayYear;
+  }, [todayDay, todayMonth, todayYear]);
+
+  const applyEventsUpdate = useCallback((nextEvents: TimetableEvent[], nextSelectedEventId?: string | null) => {
+    setEvents(nextEvents);
+    setSummary(buildFallbackSummary(nextEvents));
+    if (nextSelectedEventId) {
+      const nextSelectedEvent = nextEvents.find(event => event.id === nextSelectedEventId) || null;
+      setSelectedEvent(nextSelectedEvent);
+      return nextSelectedEvent;
+    }
+    return null;
+  }, []);
+
+  const updateSingleEvent = useCallback((updatedEvent: TimetableEvent) => {
+    const existingIndex = events.findIndex(event => event.id === updatedEvent.id);
+    const nextEvents = existingIndex >= 0
+      ? events.map(event => event.id === updatedEvent.id ? updatedEvent : event)
+      : [...events, updatedEvent];
+    nextEvents.sort((a, b) => {
+      const dateDelta = parseEventDate(a).getTime() - parseEventDate(b).getTime();
+      if (dateDelta !== 0) return dateDelta;
+      const timeDelta = a.startHour - b.startHour;
+      if (timeDelta !== 0) return timeDelta;
+      return (a.learner || '').localeCompare(b.learner || '');
+    });
+
+    if (updatedEvent.source === 'catch-up') {
+      setSchedulerCatchUpEvents(current => {
+        const hasMatch = current.some(event => eventIdentity(event) === eventIdentity(updatedEvent));
+        if (hasMatch) {
+          return current.map(event => eventIdentity(event) === eventIdentity(updatedEvent) ? updatedEvent : event);
+        }
+        return [...current, updatedEvent];
+      });
+    }
+
+    const nextSelectedEvent = applyEventsUpdate(nextEvents, updatedEvent.id);
+    return nextSelectedEvent || updatedEvent;
+  }, [applyEventsUpdate, events]);
+
+  const loadTimetable = useCallback(async (staleGuard: { cancelled: boolean }, signal: AbortSignal, onTimeout: () => boolean) => {
+    if (!coach.isInitialized) return;
+
+    const cached = readCoachSessionCache<{ events: TimetableEvent[]; schedulerCatchUpEvents: TimetableEvent[]; summary: TimetableSummary }>(cacheKey);
+    if (cached) {
+      setEvents(cached.events);
+      setSchedulerCatchUpEvents(cached.schedulerCatchUpEvents);
+      setSummary(cached.summary);
+      setLoading(false);
+    } else setLoading(true);
+    setError(null);
+    if (!coach.email) {
+      setError('Coach access is required to load timetable data.');
+      setEvents([]);
+      setSchedulerCatchUpEvents([]);
+      setSummary(EMPTY_SUMMARY);
+      setLoading(false);
+      return;
+    }
+    try {
+      const response = await coachFetch(API_ENDPOINT, { signal });
+      if (!response.ok) throw new Error(`Request failed with ${response.status}`);
+
+      const data: TimetableResponse = await response.json();
+      if (staleGuard.cancelled) return;
+
+      const nextEvents = data.events || [];
+      const nextSummary = data.summary ? normalizeSummary(data.summary, nextEvents) : buildFallbackSummary(nextEvents);
+      const nextSchedulerCatchUpEvents = data.schedulerQueues?.catchUp || [];
+
+      writeCoachSessionCache(cacheKey, { events: nextEvents, schedulerCatchUpEvents: nextSchedulerCatchUpEvents, summary: nextSummary });
+      setEvents(nextEvents);
+      setSchedulerCatchUpEvents(nextSchedulerCatchUpEvents);
+      setSummary(nextSummary);
+      setSelectedEvent(currentSelectedEvent => {
+        if (!currentSelectedEvent) return null;
+        return nextEvents.find(event => event.id === currentSelectedEvent.id) || null;
+      });
+    } catch (err) {
+      if (staleGuard.cancelled) return;
+      const timedOut = onTimeout();
+      if (err instanceof DOMException && err.name === 'AbortError' && !timedOut) return;
+      if (cached) return;
+
+      setError(timedOut ? TIMETABLE_LOAD_TIMEOUT_MESSAGE : err instanceof Error ? err.message : 'Unable to load timetable data');
+      setEvents([]);
+      setSchedulerCatchUpEvents([]);
+      setSummary(EMPTY_SUMMARY);
+      setSelectedEvent(null);
+    } finally {
+      if (!staleGuard.cancelled) setLoading(false);
+    }
+  }, [cacheKey, coach.email, coach.isInitialized]);
+
+  useEffect(() => {
+    const staleGuard = { cancelled: false };
+    const controller = new AbortController();
+    let timedOut = false;
+    const timeoutId = window.setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, TIMETABLE_LOAD_TIMEOUT_MS);
+
+    loadTimetable(staleGuard, controller.signal, () => timedOut);
+
+    return () => {
+      staleGuard.cancelled = true;
+      window.clearTimeout(timeoutId);
+      controller.abort();
+    };
+  }, [loadTimetable]);
+
+  useEffect(() => {
+    const nextIntent = parseScheduleNavigationIntent((location.state as { scheduleIntent?: unknown } | null)?.scheduleIntent);
+    if (nextIntent) {
+      setPendingScheduleIntent(nextIntent);
+    }
+    const nextFocusIntent = parseTimetableFocusIntent((location.state as { focusEvent?: unknown } | null)?.focusEvent);
+    if (nextFocusIntent) {
+      setPendingFocusIntent(nextFocusIntent);
+    }
+  }, [location.key, location.state]);
+
+  useEffect(() => {
+    if (!CHANGE_MEEvent) {
+      setEventActionError(null);
+      setEventActionNotice(null);
+      return;
+    }
+
+    setEventActionError(null);
+    setEventActionNotice(sanitizeCalendarSyncMessage(CHANGE_MEEvent.syncWarning) || null);
+  }, [CHANGE_MEEvent]);
+
+  const todayInputValue = formatDateInputValue(todayYear, todayMonth, todayDay);
+
+  const createSessionLearnerOptions = useMemo(() => {
+    const learnerMap = new Map<string, { name: string; programme: string; cohort: string; email: string }>();
+    const registerLearner = (event: TimetableEvent) => {
+      if (!event.learnerId) return;
+      if (learnerMap.has(event.learnerId)) return;
+      learnerMap.set(event.learnerId, {
+        name: event.learner || 'Learner',
+        programme: event.programme || '--',
+        cohort: event.cohort || '--',
+        email: event.email || '--',
+      });
+    };
+
+    schedulerCatchUpEvents.forEach(registerLearner);
+    events.forEach(registerLearner);
+
+    return [...learnerMap.entries()]
+      .sort((a, b) => a[1].name.localeCompare(b[1].name))
+      .map(([value, learner]) => ({
+        value,
+        name: learner.name,
+        programme: learner.programme,
+        cohort: learner.cohort,
+        email: learner.email,
+        label: learner.programme && learner.programme !== '--'
+          ? `${learner.name} · ${learner.programme}`
+          : learner.name,
+      }));
+  }, [events, schedulerCatchUpEvents]);
+
+  const CHANGE_MECreateSessionLearner = useMemo(
+    () => createSessionLearnerOptions.find(option => option.value === createSessionLearnerId) || null,
+    [createSessionLearnerId, createSessionLearnerOptions],
+  );
+
+  const filteredCreateSessionLearners = useMemo(() => {
+    const term = createSessionLearnerSearch.trim().toLowerCase();
+    if (!term) return createSessionLearnerOptions;
+    return createSessionLearnerOptions.filter(option => (
+      `${option.name} ${option.programme} ${option.cohort} ${option.email}`.toLowerCase().includes(term)
+    ));
+  }, [createSessionLearnerOptions, createSessionLearnerSearch]);
+
+  const getDefaultCreateSessionDate = useCallback(() => {
+    const CHANGE_MEDate = new Date(viewYear, viewMonth, Math.min(CHANGE_MEDay, getDaysInMonth(viewYear, viewMonth)));
+    const CHANGE_MEDateAtStart = startOfDay(CHANGE_MEDate);
+    if (CHANGE_MEDateAtStart.getTime() < todayStartTime) return todayInputValue;
+    return formatDateInputValue(CHANGE_MEDate.getFullYear(), CHANGE_MEDate.getMonth(), CHANGE_MEDate.getDate());
+  }, [CHANGE_MEDay, todayInputValue, todayStartTime, viewMonth, viewYear]);
+
+  const schedulableEvents = useMemo(() => {
+    const nonCatchUpEvents = events.filter(event => event.source !== 'catch-up' && isSelectableScheduleEvent(event));
+    const catchUpEventMap = new Map<string, TimetableEvent>();
+
+    schedulerCatchUpEvents.forEach(event => {
+      catchUpEventMap.set(eventIdentity(event), event);
+    });
+
+    events
+      .filter(event => event.source === 'catch-up')
+      .forEach(event => {
+        catchUpEventMap.set(eventIdentity(event), event);
+      });
+
+    const catchUpScheduleEvents = [...catchUpEventMap.values()].filter(isSelectableScheduleEvent);
+    return [...nonCatchUpEvents, ...catchUpScheduleEvents].sort(compareSchedulablePriority);
+  }, [events, schedulerCatchUpEvents]);
+
+  const scheduleSourceCounts = useMemo(() => {
+    return SCHEDULABLE_SOURCE_ORDER.reduce((acc, source) => {
+      acc[source] = schedulableEvents.filter(event => event.source === source).length;
+      return acc;
+    }, {} as Record<SchedulableSource, number>);
+  }, [schedulableEvents]);
+
+  const scheduleTypeEvents = useMemo(() => {
+    const baseEvents = schedulableEvents.filter(event => event.source === scheduleModalType);
+    const directEvent = events.find(event => (
+      eventIdentity(event) === scheduleModalEventKey
+      && event.source === scheduleModalType
+      && canEditScheduleEvent(event)
+    ));
+
+    if (!directEvent || baseEvents.some(event => eventIdentity(event) === eventIdentity(directEvent))) {
+      return baseEvents;
+    }
+
+    return [directEvent, ...baseEvents].sort(compareSchedulablePriority);
+  }, [events, schedulableEvents, scheduleModalEventKey, scheduleModalType]);
+
+  const scheduleLearnerOptions = useMemo(() => {
+    const uniqueLearners = new Map<string, { value: string; label: string; event: TimetableEvent }>();
+
+    scheduleTypeEvents.forEach(event => {
+      const key = learnerIdentity(event);
+      const existing = uniqueLearners.get(key);
+      if (!existing || compareSchedulablePriority(event, existing.event) < 0) {
+        uniqueLearners.set(key, {
+          value: key,
+          label: scheduleLearnerOptionLabel(event),
+          event,
+        });
+      }
+    });
+
+    return [...uniqueLearners.values()]
+      .sort((a, b) => {
+        const priorityDelta = compareSchedulablePriority(a.event, b.event);
+        if (priorityDelta !== 0) return priorityDelta;
+        return a.label.localeCompare(b.label);
+      })
+      .map(({ value, label }) => ({ value, label }));
+  }, [scheduleTypeEvents]);
+
+  const scheduleEventOptions = useMemo(
+    () => scheduleTypeEvents.filter(event => !scheduleModalLearnerKey || learnerIdentity(event) === scheduleModalLearnerKey),
+    [scheduleModalLearnerKey, scheduleTypeEvents],
+  );
+
+  const scheduleEventSelectOptions = useMemo(
+    () => scheduleEventOptions.map(event => ({
+      value: eventIdentity(event),
+      label: scheduleSessionOptionLabel(event),
+    })),
+    [scheduleEventOptions],
+  );
+
+  const CHANGE_MEScheduleEvent = useMemo(() => {
+    return scheduleEventOptions.find(event => eventIdentity(event) === scheduleModalEventKey) || scheduleEventOptions[0] || null;
+  }, [scheduleEventOptions, scheduleModalEventKey]);
+  const isReviewSchedule = ['mcr', 'progress-review', 'review'].includes(scheduleModalType);
+
+  useEffect(() => {
+    setCreateReviewTimes([]);
+    setCreateReviewAvailabilityError('');
+    setCreateSessionTime('');
+    if (!createSessionOpen || createSessionType !== 'review' || !createSessionLearnerId || !createSessionDate) {
+      setCreateReviewAvailabilityLoading(false);
+      return;
+    }
+    const controller = new AbortController();
+    let active = true;
+    setCreateReviewAvailabilityLoading(true);
+    void fetchCoachReviewSlots(createSessionLearnerId, createSessionDate, createSessionDuration, { signal: controller.signal })
+      .then(times => {
+        if (!active) return;
+        setCreateReviewTimes(times);
+        setCreateSessionTime(current => current && times.includes(current) ? current : '');
+      })
+      .catch(error => {
+        if (active) setCreateReviewAvailabilityError(error instanceof Error ? error.message : 'Could not check coach availability. Retry before booking.');
+      })
+      .finally(() => { if (active) setCreateReviewAvailabilityLoading(false); });
+    return () => { active = false; controller.abort(); };
+  }, [createSessionOpen, createSessionType, createSessionLearnerId, createSessionDate, createSessionDuration, createReviewAvailabilityRevision]);
+
+  useEffect(() => {
+    setScheduleReviewTimes([]);
+    setScheduleReviewAvailabilityError('');
+    if (!scheduleModalOpen || !isReviewSchedule || !CHANGE_MEScheduleEvent?.learnerId || !scheduleModalDate) {
+      setScheduleReviewAvailabilityLoading(false);
+      return;
+    }
+    const controller = new AbortController();
+    let active = true;
+    setScheduleReviewAvailabilityLoading(true);
+    void fetchCoachReviewSlots(CHANGE_MEScheduleEvent.learnerId, scheduleModalDate, scheduleModalDuration, {
+      excludeEventKey: CHANGE_MEScheduleEvent.calendarEventKey || CHANGE_MEScheduleEvent.eventKey,
+      signal: controller.signal,
+    }).then(times => {
+      if (!active) return;
+      setScheduleReviewTimes(times);
+      setScheduleModalTime(current => current && times.includes(current) ? current : '');
+    }).catch(error => {
+      if (active) setScheduleReviewAvailabilityError(error instanceof Error ? error.message : 'Could not check coach availability. Retry before booking.');
+    }).finally(() => { if (active) setScheduleReviewAvailabilityLoading(false); });
+    return () => { active = false; controller.abort(); };
+  }, [scheduleModalOpen, isReviewSchedule, CHANGE_MEScheduleEvent?.learnerId, CHANGE_MEScheduleEvent?.eventKey, CHANGE_MEScheduleEvent?.calendarEventKey, scheduleModalDate, scheduleModalDuration, scheduleReviewAvailabilityRevision]);
+
+  useEffect(() => {
+    if (!scheduleModalOpen) return;
+    const currentLearnerStillAvailable = scheduleLearnerOptions.some(option => option.value === scheduleModalLearnerKey);
+    if (currentLearnerStillAvailable) return;
+    setScheduleModalLearnerKey(scheduleLearnerOptions[0]?.value || '');
+  }, [scheduleLearnerOptions, scheduleModalLearnerKey, scheduleModalOpen]);
+
+  useEffect(() => {
+    if (!scheduleModalOpen) return;
+    const currentEventStillAvailable = scheduleEventOptions.some(event => eventIdentity(event) === scheduleModalEventKey);
+    if (currentEventStillAvailable) return;
+    setScheduleModalEventKey(scheduleEventOptions[0] ? eventIdentity(scheduleEventOptions[0]) : '');
+  }, [scheduleEventOptions, scheduleModalEventKey, scheduleModalOpen]);
+
+  useEffect(() => {
+    if (!scheduleModalOpen) return;
+    if (!CHANGE_MEScheduleEvent) {
+      setScheduleModalDate('');
+      setScheduleModalTime('09:00');
+      setScheduleModalDuration(60);
+      setScheduleModalError(null);
+      setScheduleModalNotice(null);
+      return;
+    }
+
+    setScheduleModalDate(
+      CHANGE_MEScheduleEvent.scheduledDate
+      || CHANGE_MEScheduleEvent.targetDate
+      || CHANGE_MEScheduleEvent.date
+      || formatDateInputValue(viewYear, viewMonth, CHANGE_MEDay),
+    );
+    setScheduleModalTime(CHANGE_MEScheduleEvent.scheduledTime || '09:00');
+    setScheduleModalDuration(CHANGE_MEScheduleEvent.durationMinutes || (CHANGE_MEScheduleEvent.source === 'catch-up' ? 45 : 60));
+    setScheduleModalError(null);
+    setScheduleModalNotice(sanitizeCalendarSyncMessage(CHANGE_MEScheduleEvent.syncWarning) || null);
+  }, [scheduleModalOpen, CHANGE_MEDay, CHANGE_MEScheduleEvent, viewMonth, viewYear]);
+
+  useEffect(() => {
+    if (!scheduleModalOpen) return;
+
+    const previousOverflow = document.body.style.overflow;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && !scheduleModalBusy) {
+        setScheduleModalOpen(false);
+      }
+    };
+
+    document.body.style.overflow = 'hidden';
+    window.addEventListener('keydown', handleKeyDown);
+
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [scheduleModalBusy, scheduleModalOpen]);
+
+  useEffect(() => {
+    if (!createSessionOpen) return;
+
+    const previousOverflow = document.body.style.overflow;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && !createSessionBusy) {
+        setCreateSessionOpen(false);
+      }
+    };
+
+    document.body.style.overflow = 'hidden';
+    window.addEventListener('keydown', handleKeyDown);
+
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [createSessionBusy, createSessionOpen]);
+
+  const monthCells = useMemo(() => getMonthData(viewYear, viewMonth), [viewYear, viewMonth]);
+  const weekDates = useMemo(() => getWeekDates(viewYear, viewMonth, CHANGE_MEDay), [viewYear, viewMonth, CHANGE_MEDay]);
+  const calendarEvents = useMemo(
+    () => events.filter(shouldRenderCalendarEvent),
+    [events],
+  );
+  const visibleRangeEvents = useMemo(() => {
+    if (viewMode === 'day') {
+      return calendarEvents.filter(event => event.dayOfMonth === CHANGE_MEDay && event.month === viewMonth && event.year === viewYear);
+    }
+
+    if (viewMode === 'week') {
+      const weekKeys = new Set(weekDates.map(date => `${date.year}-${date.month}-${date.day}`));
+      return calendarEvents.filter(event => weekKeys.has(`${event.year}-${event.month}-${event.dayOfMonth}`));
+    }
+
+    return calendarEvents.filter(event => event.month === viewMonth && event.year === viewYear);
+  }, [calendarEvents, CHANGE_MEDay, viewMode, viewMonth, viewYear, weekDates]);
+
+  const normalizedSearchTerm = searchTerm.trim().toLowerCase();
+  const searchedVisibleRangeEvents = useMemo(() => {
+    return visibleRangeEvents.filter(event => matchesSearchTerm(event, normalizedSearchTerm));
+  }, [normalizedSearchTerm, visibleRangeEvents]);
+
+  // Chips come from every loaded event so a Review Type's chip stays put
+  // (reading 0) as the coach pages between months -- the same way the fixed
+  // chips have always behaved. Counts are over the searched visible range.
+  const reviewTypeLookup = useMemo(() => buildReviewTypeLookup(calendarEvents), [calendarEvents]);
+  const sourceFilterOptions = useMemo(
+    () => buildCoachSourceOptions(calendarEvents, searchedVisibleRangeEvents),
+    [calendarEvents, searchedVisibleRangeEvents],
+  );
+  useEffect(() => {
+    if (!sourceFilterOptions.some(option => option.value === filterSource)) setFilterSource('all');
+  }, [sourceFilterOptions, filterSource]);
+
+  const activeMeetingTypeKeys = useMemo<MeetingTypeKey[]>(() => (
+    Array.from(new Set(calendarEvents.map(event => getMeetingTypeKey(event))))
+  ), [calendarEvents]);
+
+  const sourceFilterColor = useCallback((source: SourceFilter) => {
+    if (source === 'all') return { accent: '#4F2D7F', background: '#F1ECF8' };
+    const matchingEvent = calendarEvents.find(event => eventMatchesSourceFilter(event, source, reviewTypeLookup));
+    const key = matchingEvent ? getMeetingTypeKey(matchingEvent) : source === 'live-session'
+      ? 'live-session'
+      : source === 'catch-up'
+        ? 'catch-up'
+        : source === 'student-support'
+          ? 'support'
+          : 'other';
+    return calendarColors.meetingTypes[key];
+  }, [calendarColors.meetingTypes, calendarEvents, reviewTypeLookup]);
+
+  const statusFilterColor = useCallback((status: StatusFilter) => {
+    const key = status === 'all'
+      ? 'all'
+      : status === 'overdue' || status === 'ended'
+        ? 'missed-overdue'
+      : status === 'due-soon'
+        ? 'pending-due-soon'
+        : status === 'needs-schedule'
+          ? 'not-scheduled'
+          : status === 'scheduled'
+            ? 'scheduled'
+            : status === 'in-progress'
+              ? 'in-progress'
+              : status === 'awaiting-signature'
+                ? 'awaiting-signature'
+                : status === 'completed'
+                  ? 'completed'
+                  : null;
+    return key ? calendarColors.statuses[key] : calendarColors.statuses['not-scheduled'];
+  }, [calendarColors.statuses]);
+
+  const sourceFilteredVisibleRangeEvents = useMemo(() => {
+    if (filterSource === 'all') return searchedVisibleRangeEvents;
+    return searchedVisibleRangeEvents.filter(event => eventMatchesSourceFilter(event, filterSource, reviewTypeLookup));
+  }, [filterSource, searchedVisibleRangeEvents, reviewTypeLookup]);
+
+  const filteredEvents = useMemo(() => sourceFilteredVisibleRangeEvents.filter(event => (
+    filterStatus === 'all' || eventStatusFilter(event) === filterStatus
+  )), [filterStatus, sourceFilteredVisibleRangeEvents]);
+
+  const CHANGE_MEDayEvents = useMemo(
+    () => filteredEvents.filter(ev => ev.dayOfMonth === CHANGE_MEDay && ev.month === viewMonth && ev.year === viewYear),
+    [filteredEvents, CHANGE_MEDay, viewMonth, viewYear],
+  );
+  const upcomingEvents = useMemo(() => {
+    const upcomingWindowEnd = new Date(todayStartTime);
+    upcomingWindowEnd.setDate(upcomingWindowEnd.getDate() + UPCOMING_WINDOW_DAYS);
+    const upcomingWindowEndTime = upcomingWindowEnd.getTime();
+
+    return events
+      .filter(ev => {
+        const evDate = parseEventDate(ev);
+        return (
+          evDate.getTime() >= todayStartTime
+          && evDate.getTime() < upcomingWindowEndTime
+          && ev.status !== 'completed'
+          && ev.status !== 'cancelled'
+        );
+      })
+      .sort((a, b) => {
+        const dateDelta = parseEventDate(a).getTime() - parseEventDate(b).getTime();
+        if (dateDelta !== 0) return dateDelta;
+        return a.startHour - b.startHour;
+      });
+  }, [events, todayStartTime]);
+  const statusFilterCounts = Object.fromEntries(STATUS_FILTER_ORDER.map(status => [status, 0])) as Record<StatusFilter, number>;
+  sourceFilteredVisibleRangeEvents.forEach(event => {
+    statusFilterCounts.all += 1;
+    statusFilterCounts[eventStatusFilter(event)] += 1;
+  });
+  const CHANGE_MEDayLabel = `${DAYS_OF_WEEK[new Date(viewYear, viewMonth, CHANGE_MEDay).getDay() === 0 ? 6 : new Date(viewYear, viewMonth, CHANGE_MEDay).getDay() - 1]}, ${CHANGE_MEDay} ${MONTH_NAMES[viewMonth]}`;
+  const activeSourceLabel = sourceFilterOptions.find(option => option.value === filterSource)?.longLabel
+    ?? NON_REVIEW_SOURCE_FILTER_LABELS.all;
+  const activeFilterLabel = filterSource === 'all'
+    ? STATUS_FILTER_LABELS[filterStatus]
+    : `${activeSourceLabel} / ${STATUS_FILTER_LABELS[filterStatus]}`;
+
+  const datePickerValue = formatDateInputValue(viewYear, viewMonth, CHANGE_MEDay);
+
+  const setCalendarDate = useCallback((year: number, month: number, day: number) => {
+    setViewYear(year);
+    setViewMonth(month);
+    setSelectedDay(Math.min(day, getDaysInMonth(year, month)));
+  }, []);
+
+  const focusEventOnCalendar = useCallback((event: TimetableEvent | null) => {
+    if (!event) {
+      setSelectedEvent(null);
+      return;
+    }
+    setCalendarDate(event.year, event.month, event.dayOfMonth);
+    setSelectedEvent(event);
+  }, [setCalendarDate]);
+
+  const handlePrev = () => {
+    if (viewMode === 'month') { if (viewMonth === 0) { setViewMonth(11); setViewYear(viewYear - 1); } else setViewMonth(viewMonth - 1); }
+    else if (viewMode === 'day') { const d = new Date(viewYear, viewMonth, CHANGE_MEDay); d.setDate(d.getDate() - 1); setViewYear(d.getFullYear()); setViewMonth(d.getMonth()); setSelectedDay(d.getDate()); }
+    else { const d = new Date(viewYear, viewMonth, CHANGE_MEDay); d.setDate(d.getDate() - 7); setViewYear(d.getFullYear()); setViewMonth(d.getMonth()); setSelectedDay(d.getDate()); }
+  };
+  const handleNext = () => {
+    if (viewMode === 'month') { if (viewMonth === 11) { setViewMonth(0); setViewYear(viewYear + 1); } else setViewMonth(viewMonth + 1); }
+    else if (viewMode === 'day') { const d = new Date(viewYear, viewMonth, CHANGE_MEDay); d.setDate(d.getDate() + 1); setViewYear(d.getFullYear()); setViewMonth(d.getMonth()); setSelectedDay(d.getDate()); }
+    else { const d = new Date(viewYear, viewMonth, CHANGE_MEDay); d.setDate(d.getDate() + 7); setViewYear(d.getFullYear()); setViewMonth(d.getMonth()); setSelectedDay(d.getDate()); }
+  };
+  const handleToday = () => { setViewYear(todayYear); setViewMonth(todayMonth); setSelectedDay(todayDay); };
+
+  const handleMonthPickerChange = (month: number) => {
+    setCalendarDate(viewYear, month, CHANGE_MEDay);
+  };
+
+  const handleYearPickerChange = (year: number) => {
+    if (!Number.isFinite(year) || year < 1900 || year > 2200) return;
+    setCalendarDate(year, viewMonth, CHANGE_MEDay);
+  };
+
+  const handleDatePickerChange = (value: string) => {
+    const parsedDate = parseDateOnly(value);
+    if (!parsedDate) return;
+    setCalendarDate(parsedDate.getFullYear(), parsedDate.getMonth(), parsedDate.getDate());
+    setDatePickerOpen(false);
+  };
+
+  const handleDayClick = (day: number) => {
+    setSelectedDay(day);
+  };
+
+  const openCreateSessionModal = useCallback(() => {
+    if (coachWorkspaceReadOnly) {
+      void Swal.fire({
+        icon: 'info',
+        title: 'Read-only coach workspace',
+        text: 'You are viewing another coach workspace. Switch to the coach account to create sessions.',
+        confirmButtonColor: '#6d28d9',
+      });
+      return;
+    }
+    const preferredLearnerId = CHANGE_MEEvent?.learnerId && createSessionLearnerOptions.some(option => option.value === CHANGE_MEEvent.learnerId)
+      ? CHANGE_MEEvent.learnerId
+      : (createSessionLearnerOptions[0]?.value || '');
+    const preferredType: CoachBookableSessionType = CHANGE_MEEvent?.source === 'student-support' || CHANGE_MEEvent?.type === 'welfare'
+      ? 'student-support'
+      : 'catch-up';
+
+    setCreateSessionType(preferredType);
+    setCreateSessionLearnerId(preferredLearnerId);
+    setCreateSessionDate(getDefaultCreateSessionDate());
+    setCreateSessionTime('09:00');
+    setCreateSessionDuration(60);
+    setCreateSessionNotes('');
+    setCreateSessionError(null);
+    setCreateSessionLearnerSearch('');
+    setCreateSessionLearnerPickerOpen(false);
+    setCreateSessionReviewTemplates([]);
+    setCreateSessionReviewTemplateId('');
+    setCreateSessionReviewTargetDate('');
+    setCreateSessionReviewReasonCode('');
+    setCreateSessionReviewReason('');
+    setCreateSessionOpen(true);
+  }, [coachWorkspaceReadOnly, createSessionLearnerOptions, getDefaultCreateSessionDate, CHANGE_MEEvent]);
+
+  // Enabled Review templates for the CURRENTLY CHANGE_ME learner only -- the
+  // coach can only pick from what that learner's own programme offers (see
+  // coach_review_learner_addition_templates); refetched whenever the
+  // learner or session type changes so a stale list never leaks between
+  // learners.
+  useEffect(() => {
+    if (!createSessionOpen || createSessionType !== 'review' || !createSessionLearnerId) {
+      return;
+    }
+    let cancelled = false;
+    const controller = new AbortController();
+    setCreateSessionReviewPolicy(null);
+    setCreateSessionReviewTemplates([]);
+    setCreateSessionReviewTemplatesLoading(true);
+    setCreateSessionReviewTemplateId('');
+    fetchLearnerAdditionReviewTemplates(createSessionLearnerId, controller.signal)
+      .then(body => {
+        if (cancelled) return;
+        setCreateSessionReviewPolicy({ learnerId: String(body.learnerId), canAddReview: body.canAddReview === true, detail: body.detail });
+        setCreateSessionReviewTemplates(body.canAddReview === true ? body.templates : []);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setCreateSessionReviewTemplates([]);
+          setCreateSessionReviewPolicy({ learnerId: String(createSessionLearnerId), canAddReview: false, detail: 'Review availability could not be checked. Please try again.' });
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setCreateSessionReviewTemplatesLoading(false);
+      });
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [createSessionOpen, createSessionType, createSessionLearnerId]);
+
+  const closeCreateSessionModal = useCallback(() => {
+    if (createSessionBusy) return;
+    setCreateSessionOpen(false);
+    setCreateSessionLearnerSearch('');
+    setCreateSessionLearnerPickerOpen(false);
+    setCreateSessionError(null);
+  }, [createSessionBusy]);
+
+  const openScheduleModal = useCallback((presetEvent?: TimetableEvent | null) => {
+    if (presetEvent && isImportedPersonalSupportPlan(presetEvent)) {
+      setSupportBookingEvent(presetEvent);
+      setSelectedEvent(null);
+      return;
+    }
+    setScheduleModalError(null);
+    setScheduleModalNotice(null);
+
+    if (canEditScheduleEvent(presetEvent)) {
+      setScheduleModalType(presetEvent.source as SchedulableSource);
+      setScheduleModalLearnerKey(learnerIdentity(presetEvent));
+      setScheduleModalEventKey(eventIdentity(presetEvent));
+      setScheduleModalCompact(true);
+    } else {
+      const preferredEvent = schedulableEvents[0];
+      setScheduleModalCompact(false);
+
+      if (preferredEvent) {
+        setScheduleModalType(preferredEvent.source as SchedulableSource);
+        setScheduleModalLearnerKey(learnerIdentity(preferredEvent));
+        setScheduleModalEventKey(eventIdentity(preferredEvent));
+      } else {
+        setScheduleModalLearnerKey('');
+        setScheduleModalEventKey('');
+      }
+    }
+
+    setScheduleModalOpen(true);
+  }, [schedulableEvents]);
+
+  const closeScheduleModal = useCallback(() => {
+    if (scheduleModalBusy) return;
+    setScheduleModalOpen(false);
+    setScheduleModalError(null);
+    setScheduleModalNotice(null);
+  }, [scheduleModalBusy]);
+
+  useEffect(() => {
+    if (!pendingScheduleIntent || loading) return;
+
+    setViewMode('month');
+    setFilterStatus('needs-schedule');
+    // A legacy `?source=mcr` deep-link now resolves to whichever Review Type
+    // bucket those events landed in -- see filterForScheduleIntent.
+    setFilterSource(filterForScheduleIntent(pendingScheduleIntent.source, calendarEvents));
+    setSearchTerm('');
+    setScheduleModalOpen(false);
+    setScheduleModalError(null);
+    setScheduleModalNotice(null);
+
+    const sourceEvents = schedulableEvents.filter((event) => event.source === pendingScheduleIntent.source);
+    const learnerEvents = pendingScheduleIntent.learnerId
+      ? sourceEvents.filter((event) => event.learnerId === pendingScheduleIntent.learnerId)
+      : sourceEvents;
+    const preferredPool = learnerEvents.length ? learnerEvents : sourceEvents;
+    const preferredEvent = preferredPool.find((event) => {
+      if (!pendingScheduleIntent.targetDate) return false;
+      return (
+        eventTargetDateValue(event) === pendingScheduleIntent.targetDate
+        || event.date === pendingScheduleIntent.targetDate
+        || event.scheduledDate === pendingScheduleIntent.targetDate
+      );
+    }) || preferredPool[0] || null;
+
+    const anchorDate = parseDateOnly(pendingScheduleIntent.targetDate)
+      || (preferredEvent ? getMetricDate(eventTargetDateValue(preferredEvent), preferredEvent) : null);
+
+    if (anchorDate) {
+      setCalendarDate(anchorDate.getFullYear(), anchorDate.getMonth(), anchorDate.getDate());
+    }
+
+    if (preferredEvent) {
+      focusEventOnCalendar(preferredEvent);
+    } else {
+      focusEventOnCalendar(null);
+    }
+
+    setPendingScheduleIntent(null);
+  }, [focusEventOnCalendar, loading, pendingScheduleIntent, schedulableEvents, setCalendarDate, calendarEvents]);
+
+  useEffect(() => {
+    if (!pendingFocusIntent || loading) return;
+
+    setViewMode('month');
+    setFilterStatus('all');
+    setFilterSource(isSourceFilterValue(pendingFocusIntent.source) ? pendingFocusIntent.source : 'all');
+    setSearchTerm('');
+    setScheduleModalOpen(false);
+    setScheduleModalError(null);
+    setScheduleModalNotice(null);
+
+    const preferredEvent = events.find((event) => eventMatchesFocusIntent(event, pendingFocusIntent)) || null;
+    const anchorDate = parseDateOnly(pendingFocusIntent.date)
+      || (preferredEvent ? parseEventDate(preferredEvent) : null);
+
+    if (anchorDate) {
+      setCalendarDate(anchorDate.getFullYear(), anchorDate.getMonth(), anchorDate.getDate());
+    }
+
+    focusEventOnCalendar(preferredEvent);
+    setPendingFocusIntent(null);
+  }, [events, focusEventOnCalendar, loading, pendingFocusIntent, setCalendarDate]);
+
+  const handleCreateSession = useCallback(async () => {
+    if (!createSessionLearnerId || !createSessionDate || !createSessionTime) return;
+
+    setCreateSessionBusy(true);
+    setCreateSessionError(null);
+    try {
+      const data = await bookCoachCalendarEvent({
+        learnerId: createSessionLearnerId,
+        sessionType: createSessionType,
+        scheduledDate: createSessionDate,
+        scheduledTime: createSessionTime,
+        durationMinutes: createSessionDuration,
+        timezoneOffsetMinutes: ukOffsetForDate(createSessionDate),
+        notes: createSessionNotes,
+      });
+
+      const createdEvent = data.event as TimetableEvent;
+      updateSingleEvent(createdEvent);
+      if (createdEvent.source === 'catch-up') {
+        setSchedulerCatchUpEvents(current => {
+          const filtered = current.filter(event => event.learnerId !== createdEvent.learnerId);
+          return [...filtered, createdEvent].sort(compareSchedulablePriority);
+        });
+      }
+
+      setFilterSource('all');
+      setFilterStatus('all');
+      setViewMode('day');
+      focusEventOnCalendar(createdEvent);
+      setEventActionError(null);
+      setEventActionNotice(sanitizeCalendarSyncMessage(data.warning) || null);
+      setCreateSessionOpen(false);
+      setCreateSessionLearnerSearch('');
+      setCreateSessionLearnerPickerOpen(false);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Unable to create session';
+      if (isLearnerAvailabilityConflict(err)) {
+        void showLearnerUnavailableAlert(message);
+      }
+      setCreateSessionError(message);
+    } finally {
+      setCreateSessionBusy(false);
+    }
+  }, [
+    createSessionDate,
+    createSessionDuration,
+    createSessionLearnerId,
+    createSessionNotes,
+    createSessionTime,
+    createSessionType,
+    focusEventOnCalendar,
+    updateSingleEvent,
+  ]);
+
+  // "Add Review" / "Add & Schedule" -- Create session -> Review. Always
+  // creates the canonical learner-specific occurrence first (never a
+  // standalone calendar row); scheduling is a second, separate step that
+  // reuses the SAME scheduleCoachCalendarEvent helper any other generated
+  // Review occurrence is booked through -- no duplicated Graph logic here.
+  const handleAddLearnerReview = useCallback(async (alsoSchedule: boolean) => {
+    if (!canAddLearnerReview || !createSessionLearnerId || !createSessionReviewTemplateId || !createSessionReviewTargetDate) return;
+    if (alsoSchedule && (!createSessionDate || !createSessionTime || createReviewAvailabilityLoading
+      || createReviewAvailabilityError || !createReviewTimes.includes(createSessionTime))) return;
+
+    setCreateSessionBusy(true);
+    setCreateSessionError(null);
+    try {
+      const addition = await createLearnerReviewAddition({
+        learnerId: createSessionLearnerId,
+        reviewTemplateId: createSessionReviewTemplateId,
+        targetDate: createSessionReviewTargetDate,
+        reasonCode: createSessionReviewReasonCode,
+        reason: createSessionReviewReason,
+      });
+
+      if (alsoSchedule) {
+        const { event: scheduledEvent, warning } = await scheduleCoachCalendarEvent(
+          { eventKey: addition.eventKey } as CoachCalendarEvent,
+          { date: createSessionDate, time: createSessionTime, durationMinutes: createSessionDuration },
+        );
+        updateSingleEvent(scheduledEvent as unknown as TimetableEvent);
+        focusEventOnCalendar(scheduledEvent as unknown as TimetableEvent);
+        setEventActionNotice(sanitizeCalendarSyncMessage(warning) || 'Review added and scheduled.');
+      } else {
+        setEventActionNotice(`${addition.reviewName || 'Review'} added for this learner -- Not Scheduled.`);
+        // No CoachCalendarEvent exists yet for a not-scheduled addition (see
+        // handleAddLearnerReview's docstring) -- there is nothing to merge
+        // into `events` via updateSingleEvent, so reload the timetable the
+        // same way the initial mount effect does.
+        await loadTimetable({ cancelled: false }, new AbortController().signal, () => false);
+      }
+
+      setEventActionError(null);
+      setCreateSessionOpen(false);
+      setCreateSessionLearnerSearch('');
+      setCreateSessionLearnerPickerOpen(false);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Unable to add this review';
+      setCreateSessionError(message);
+    } finally {
+      setCreateSessionBusy(false);
+    }
+  }, [
+    canAddLearnerReview,
+    createSessionDate,
+    createSessionDuration,
+    createSessionLearnerId,
+    createSessionReviewReason,
+    createSessionReviewReasonCode,
+    createSessionReviewTargetDate,
+    createSessionReviewTemplateId,
+    createSessionTime,
+    createReviewAvailabilityError,
+    createReviewAvailabilityLoading,
+    createReviewTimes,
+    focusEventOnCalendar,
+    loadTimetable,
+    updateSingleEvent,
+  ]);
+
+  const handleModalScheduleSave = useCallback(async () => {
+    if (!CHANGE_MEScheduleEvent?.eventKey) return;
+    if (isReviewSchedule && (scheduleReviewAvailabilityLoading || scheduleReviewAvailabilityError
+      || !scheduleReviewTimes.includes(scheduleModalTime))) return;
+
+    setScheduleModalBusy(true);
+    setScheduleModalError(null);
+    setScheduleModalNotice(null);
+    try {
+      const response = await coachFetch(SCHEDULE_ENDPOINT, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          eventKey: CHANGE_MEScheduleEvent.calendarEventKey || CHANGE_MEScheduleEvent.eventKey,
+          scheduledDate: scheduleModalDate,
+          scheduledTime: scheduleModalTime,
+          durationMinutes: scheduleModalDuration,
+          timezoneOffsetMinutes: ukOffsetForDate(scheduleModalDate),
+        }),
+      });
+      const data = await readApiJson<{ event: TimetableEvent; warning?: string }>(response);
+
+      const updatedEvent = data.event as TimetableEvent;
+      updateSingleEvent(updatedEvent);
+      setViewMode('day');
+      focusEventOnCalendar(updatedEvent);
+      setEventActionError(null);
+      setEventActionNotice(sanitizeCalendarSyncMessage(data.warning) || null);
+      setScheduleModalOpen(false);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Unable to schedule event';
+      if (isLearnerAvailabilityConflict(err)) {
+        void showLearnerUnavailableAlert(message);
+      }
+      setScheduleModalError(message);
+    } finally {
+      setScheduleModalBusy(false);
+    }
+  }, [
+    focusEventOnCalendar,
+    scheduleModalDate,
+    scheduleModalDuration,
+    scheduleModalTime,
+    isReviewSchedule,
+    scheduleReviewAvailabilityError,
+    scheduleReviewAvailabilityLoading,
+    scheduleReviewTimes,
+    CHANGE_MEScheduleEvent,
+    updateSingleEvent,
+  ]);
+
+  const openReviewForm = useCallback(async (event: TimetableEvent) => {
+    if (!event.eventKey) return;
+    setEventActionError(null);
+    setEventActionNotice(null);
+    if (event.reviewSource === 'aptem' && event.eventKey.startsWith('imported-review:')) {
+      navigate(reviewInstancePath(event.eventKey), {
+        state: reviewInstanceRouteState(event, `${location.pathname}${location.search}`),
+      });
+      return;
+    }
+    setReviewFormBusy(true);
+    try {
+      const { instanceId } = await openReviewInstanceForEvent(event.eventKey);
+      navigate(reviewInstancePath(instanceId), {
+        state: reviewInstanceRouteState(event, `${location.pathname}${location.search}`),
+      });
+    } catch (err) {
+      setEventActionError(err instanceof Error ? err.message : 'Unable to open this review form.');
+    } finally {
+      setReviewFormBusy(false);
+    }
+  }, [location.pathname, location.search, navigate]);
+
+  const markReviewInProgress = useCallback(async (event: TimetableEvent) => {
+    if (!event.eventKey) return;
+    const confirmation = await Swal.fire({
+      icon: 'question',
+      title: 'Mark review in progress?',
+      text: 'Use this when the meeting has started but Teams attendance cannot confirm it automatically.',
+      showCancelButton: true,
+      confirmButtonText: 'OK',
+      cancelButtonText: 'Cancel',
+      confirmButtonColor: '#6d28d9',
+    });
+    if (!confirmation.isConfirmed) return;
+    setEventActionError(null);
+    setEventActionNotice(null);
+    setEventActionBusy(true);
+    try {
+      const instanceId = event.reviewInstanceId || (await openReviewInstanceForEvent(event.eventKey)).instanceId;
+      const updated = await markReviewInstanceInProgressManually(instanceId, {
+        reasonCode: 'coach-confirmed-live-start',
+      });
+      updateSingleEvent({ ...event, reviewInstanceId: instanceId, status: updated.instance.status as TimetableEvent['status'] });
+    } catch (err) {
+      setEventActionError(err instanceof Error ? err.message : 'Unable to mark this review in progress.');
+    } finally {
+      setEventActionBusy(false);
+    }
+  }, [updateSingleEvent]);
+
+  const handleProgressReviewSubmit = useCallback(async (responses: ProgressReviewResponses) => {
+    if (!progressReviewCompletionEvent?.eventKey) return;
+
+    setEventActionBusy(true);
+    setEventActionError(null);
+    setEventActionNotice(null);
+    try {
+      const response = await coachFetch(ACTION_ENDPOINT, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          eventKey: progressReviewCompletionEvent.eventKey,
+          action: 'complete',
+          reviewResponses: responses,
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || `Request failed with ${response.status}`);
+      const updatedEvent = data.event as TimetableEvent;
+      updateSingleEvent(updatedEvent);
+      setProgressReviewCompletionEvent(null);
+      setEventActionNotice(sanitizeCalendarSyncMessage(data.warning) || null);
+    } catch (err) {
+      setEventActionError(err instanceof Error ? err.message : 'Unable to submit progress review');
+    } finally {
+      setEventActionBusy(false);
+    }
+  }, [progressReviewCompletionEvent, updateSingleEvent]);
+
+  const joinMeeting = useImportedMeetingJoin({
+    contextKey: `${coach.email}:${coach.isViewingAsCoach}:${CHANGE_MEEvent?.eventKey || CHANGE_MEEvent?.id}`,
+    readOnly: coach.isViewingAsCoach, onError: setEventActionError,
+    onStarted: () => { if (CHANGE_MEEvent) updateSingleEvent({ ...CHANGE_MEEvent, status: 'in-progress' }); },
+  });
+  const handleJoinSelectedMeeting = useCallback((navigate = true) => {
+    if (!CHANGE_MEEvent) return;
+    const url = CHANGE_MEEvent.meetingLink || CHANGE_MEEvent.graphWebLink;
+    if (!url) {
+      setEventActionError(
+        isLiveSessionEvent(CHANGE_MEEvent)
+          ? 'This live session does not have a launch link yet.'
+          : 'This event does not have a meeting link yet. Schedule it again first.',
+      );
+      return;
+    }
+    if (CHANGE_MEEvent.bookingOnly) {
+      if (navigate) window.open(url, '_blank', 'noopener,noreferrer');
+      return;
+    }
+    joinMeeting(CHANGE_MEEvent, navigate);
+  }, [CHANGE_MEEvent, joinMeeting]);
+
+  const handleEventAction = useCallback(async (action: 'start' | 'complete' | 'sign' | 'cancel') => {
+    if (!CHANGE_MEEvent?.eventKey) return;
+    if (action === 'complete' && CHANGE_MEEvent.source === 'progress-review') {
+      setEventActionError(null);
+      setEventActionNotice(null);
+      setProgressReviewCompletionEvent(CHANGE_MEEvent);
+      return;
+    }
+    const startUrl = action === 'start' ? CHANGE_MEEvent.meetingLink || CHANGE_MEEvent.graphWebLink || '' : '';
+    if (startUrl) window.open(startUrl, '_blank', 'noopener,noreferrer');
+    const meetingWindow = action === 'start' && !startUrl ? openPendingMeetingWindow() : null;
+
+    setEventActionBusy(true);
+    setEventActionError(null);
+    setEventActionNotice(null);
+    try {
+      const response = await coachFetch(ACTION_ENDPOINT, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          eventKey: CHANGE_MEEvent.eventKey,
+          action,
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || `Request failed with ${response.status}`);
+      const updatedEvent = data.event as TimetableEvent;
+      const nextSelectedEvent = updateSingleEvent(updatedEvent);
+      setEventActionNotice(sanitizeCalendarSyncMessage(data.warning) || null);
+      if (action === 'start' && !startUrl && (nextSelectedEvent.meetingLink || nextSelectedEvent.graphWebLink)) {
+        navigateMeetingWindow(meetingWindow, nextSelectedEvent.meetingLink || nextSelectedEvent.graphWebLink);
+      }
+      if (action === 'start' && !startUrl && !(nextSelectedEvent.meetingLink || nextSelectedEvent.graphWebLink) && meetingWindow && !meetingWindow.closed) {
+        meetingWindow.close();
+      }
+    } catch (err) {
+      if (meetingWindow && !meetingWindow.closed) meetingWindow.close();
+      const message = err instanceof Error ? err.message : 'Unable to update event';
+      if (!(action === 'start' && startUrl && message === 'Only a scheduled event can be started.')) {
+        setEventActionError(message);
+      }
+    } finally {
+      setEventActionBusy(false);
+    }
+  }, [CHANGE_MEEvent, updateSingleEvent]);
+
+  const titleLabel = viewMode === 'month'
+    ? `${MONTH_NAMES[viewMonth]} ${viewYear}`
+    : viewMode === 'week'
+      ? `${weekDates[0].monthName} ${weekDates[0].day} - ${weekDates[6].monthName} ${weekDates[6].day}, ${viewYear}`
+      : `${CHANGE_MEDay} ${MONTH_NAMES[viewMonth]} ${viewYear}`;
+  const navigationSkeletonMode = pendingScheduleIntent
+    ? 'schedule'
+    : pendingFocusIntent
+      ? 'focus'
+      : 'loading';
+  const showNavigationSkeleton = loading || pendingScheduleIntent !== null || pendingFocusIntent !== null;
+  const CHANGE_MEEventMeetingUrl = CHANGE_MEEvent?.meetingLink || CHANGE_MEEvent?.graphWebLink || '';
+  const CHANGE_MEEventMeetingHost = formatMeetingLinkHost(CHANGE_MEEventMeetingUrl);
+  const CHANGE_MEEventMeetingProvider = formatMeetingProviderLabel(CHANGE_MEEvent, CHANGE_MEEventMeetingHost);
+  const CHANGE_MEEventNotes = sanitizeEventNotes(CHANGE_MEEvent?.notes);
+  const CHANGE_MEEventFeedback = sanitizeCalendarSyncMessage(eventActionError || eventActionNotice);
+  const CHANGE_MEEventDetailsPath = CHANGE_MEEvent ? eventDetailsPath(CHANGE_MEEvent) : null;
+  const CHANGE_MEScheduleEventNotes = sanitizeEventNotes(CHANGE_MEScheduleEvent?.notes);
+  const scheduleModalFeedback = sanitizeCalendarSyncMessage(scheduleModalError || scheduleModalNotice);
+  const scheduleNeedsApproval = isApprovalRequestSource(CHANGE_MEScheduleEvent?.source)
+    && CHANGE_MEScheduleEvent.status === 'not-scheduled';
+  const scheduleModalTitle = scheduleModalCompact
+    ? scheduleActionLabel(CHANGE_MEScheduleEvent)
+    : scheduleNeedsApproval ? 'Approve and place session' : 'Schedule session';
+  const scheduleModalDescription = scheduleModalCompact
+    ? 'Choose the new calendar slot for this event.'
+    : scheduleNeedsApproval
+      ? 'Choose source, select item, then approve the final calendar slot.'
+      : 'Choose the calendar slot for this session.';
+
+  const openSelectedEventDetails = () => {
+    if (!CHANGE_MEEventDetailsPath) return;
+    navigate(CHANGE_MEEventDetailsPath, {
+      state: { returnTo: `${location.pathname}${location.search}` },
+    });
+  };
+
+  return (
+    <WorkspaceShell
+      role="coach" roleLabel={coachNav.label} navItems={coachNav.items} workspaceLabel={coachNav.workspaceLabel}
+      pageTitle="Calendar" pageSubtitle="Your coaching schedule, sessions, and meetings - all in one place"
+      userName={coach.name} userRole="Progress Coach"
+    >
+      <PageContainer className="coach-calendar-page">
+
+        <PageHeader
+          icon="ri-calendar-2-line"
+          title="My Calendar"
+          description="Plan coaching reviews, progress reviews, catch-up sessions, and learner support from one scheduling workspace."
+          className="calendar-page-header"
+          decoration={(
+            <div className="calendar-hero-art">
+              <span className="calendar-hero-art__dots" />
+              <span className="calendar-hero-art__sprig" />
+              <span className="calendar-hero-art__back-page" />
+              <div className="calendar-hero-art__calendar">
+                <span className="calendar-hero-art__ring calendar-hero-art__ring--one" />
+                <span className="calendar-hero-art__ring calendar-hero-art__ring--two" />
+                <span className="calendar-hero-art__ring calendar-hero-art__ring--three" />
+                <span className="calendar-hero-art__ring calendar-hero-art__ring--four" />
+                <span className="calendar-hero-art__ring calendar-hero-art__ring--five" />
+                <span className="calendar-hero-art__calendar-top" />
+                <span className="calendar-hero-art__calendar-grid" />
+                <span className="calendar-hero-art__today-month">{todayMonthLabel}</span>
+                <span className="calendar-hero-art__today-day">{String(todayDay).padStart(2, '0')}</span>
+              </div>
+            </div>
+          )}
+          meta={(
+            <>
+              <span className="inline-flex items-center gap-1.5 text-[12px] font-medium text-foreground-500">
+                <AppIcon className="ri-time-line text-[13px] text-foreground-400"></AppIcon>
+                {todayWeekdayLabel}, {todayMonthLabel} {String(todayDay).padStart(2, '0')}
+              </span>
+              <span className="inline-flex items-center gap-1.5 text-[12px] font-medium text-foreground-500">
+                <AppIcon className="ri-calendar-event-line text-[13px] text-foreground-400"></AppIcon>
+                Viewing {MONTH_NAMES[viewMonth]} {viewYear}
+              </span>
+            </>
+          )}
+          actions={(
+            <button
+              type="button"
+              onClick={openCreateSessionModal}
+              title={coachWorkspaceReadOnly ? 'Read-only while viewing another coach workspace' : 'Create session'}
+              className={`inline-flex items-center gap-2 rounded-lg bg-white px-3.5 py-2 text-[13px] font-semibold shadow-sm transition-smooth focus:outline-none focus:ring-2 focus:ring-primary-200 ${
+                coachWorkspaceReadOnly
+                  ? 'cursor-not-allowed text-foreground-400'
+                  : 'cursor-pointer text-primary-700 hover:bg-primary-50'
+              }`}
+            >
+              <AppIcon className="ri-add-circle-line text-base"></AppIcon>
+              Create session
+            </button>
+          )}
+        />
+
+        {showNavigationSkeleton && (
+          <Panel padding="md">
+            <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+              <div className="flex items-start gap-3">
+                <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-primary-500 text-white">
+                  <LoadingSkeleton />
+                </span>
+                <div>
+                  <p className="text-[12px] font-semibold uppercase tracking-[0.18em] text-primary-500">Syncing timetable</p>
+                  <p className="mt-1 text-sm font-heading font-semibold text-foreground-900">
+                    {navigationSkeletonMode === 'schedule'
+                      ? 'Opening the scheduling queue'
+                      : navigationSkeletonMode === 'focus'
+                        ? 'Opening the CHANGE_ME event'
+                        : <LoadingSkeleton label="Loading your coaching calendar" variant="text" />}
+                  </p>
+                  <p className="mt-1 text-[12px] leading-5 text-foreground-500">
+                    {navigationSkeletonMode === 'schedule'
+                      ? 'Matching the learner and session before showing the calendar.'
+                      : navigationSkeletonMode === 'focus'
+                        ? 'Preparing the calendar and centering the requested session.'
+                        : 'Preparing sessions, reviews, catch-up, and support events for the current view.'}
+                  </p>
+                </div>
+              </div>
+              <div className="grid grid-cols-3 gap-2 md:min-w-[240px]">
+                {[0, 1, 2].map(index => (
+                  <div key={index} className="h-14 rounded-lg border border-primary-100/80 bg-white/70 animate-pulse"></div>
+                ))}
+              </div>
+            </div>
+          </Panel>
+        )}
+
+        {error && (
+          <div className="rounded-lg border border-red-200/70 bg-red-50 px-4 py-3 text-sm text-red-800">
+            {error}
+          </div>
+        )}
+
+        <div className="relative">
+          {showNavigationSkeleton && <TimetableSurfaceSkeleton />}
+          <div
+            className={`${showNavigationSkeleton ? 'pointer-events-none select-none opacity-0' : ''} calendar-layout-grid grid grid-cols-1 items-start gap-5 xl:gap-4`}
+            aria-hidden={showNavigationSkeleton}
+          >
+        <div className="calendar-filter-host min-w-0 rounded-2xl border border-background-200 bg-white p-3 shadow-sm ring-1 ring-black/[0.02]">
+          <div className="grid gap-3 xl:grid-cols-[auto_minmax(420px,1fr)] xl:items-center xl:justify-between">
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="flex items-center gap-1 rounded-lg bg-background-100 p-1">
+                {([
+                  { key: 'month' as ViewMode, label: 'Month', icon: 'ri-calendar-2-line' },
+                  { key: 'week' as ViewMode, label: 'Week', icon: 'ri-calendar-view' },
+                  { key: 'day' as ViewMode, label: 'Day', icon: 'ri-calendar-line' },
+                ]).map(v => (
+                  <button
+                    key={v.key}
+                    aria-pressed={viewMode === v.key}
+                    data-timetable-view-active={viewMode === v.key ? 'true' : 'false'}
+                    onClick={() => { setViewMode(v.key); if (v.key === 'month') setSelectedDay(todayDay); }}
+                    className={`inline-flex h-9 items-center justify-center gap-1.5 rounded-lg px-3 text-[12px] font-bold transition-smooth whitespace-nowrap cursor-pointer focus:outline-none focus:ring-2 focus:ring-primary-200 ${
+                      viewMode === v.key
+                        ? 'bg-primary-600 text-[#ffffff] shadow-sm'
+                        : 'text-foreground-600 hover:bg-white hover:text-foreground-900'
+                    }`}
+                  >
+                    <AppIcon className={`${v.icon} h-3.5 w-3.5 shrink-0`}></AppIcon>{v.label}
+                  </button>
+                ))}
+              </div>
+              <div className="flex items-center gap-1.5 rounded-lg border border-background-200 bg-background-50 p-1">
+                <button
+                  onClick={handlePrev}
+                  className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-primary-600 transition-smooth cursor-pointer hover:bg-primary-50 hover:text-primary-700 hover:shadow-sm focus:outline-none focus:ring-2 focus:ring-primary-200"
+                  aria-label="Previous period"
+                >
+                  <AppIcon className="ri-arrow-left-s-line h-4 w-4 shrink-0"></AppIcon>
+                </button>
+                <button onClick={handleToday} className="inline-flex h-9 items-center justify-center rounded-lg bg-primary-50 px-3 text-[12px] font-bold text-primary-700 transition-smooth cursor-pointer whitespace-nowrap hover:bg-primary-100 focus:outline-none focus:ring-2 focus:ring-primary-200">Today</button>
+                <div className="relative">
+                  <button
+                    type="button"
+                    onClick={() => setDatePickerOpen(open => !open)}
+                    className="inline-flex h-9 min-w-[154px] items-center justify-center gap-1.5 rounded-lg px-3 text-[12px] font-heading font-bold text-primary-700 transition-smooth cursor-pointer hover:bg-primary-50 hover:text-primary-800 whitespace-nowrap focus:outline-none focus:ring-2 focus:ring-primary-200"
+                    title="Change calendar date"
+                  >
+                    {titleLabel}
+                    <AppIcon className={`ri-arrow-down-s-line h-4 w-4 shrink-0 transition-transform ${datePickerOpen ? 'rotate-180' : ''}`}></AppIcon>
+                  </button>
+                  {datePickerOpen && (
+                    <div className="absolute left-1/2 top-full z-30 mt-2 w-72 -translate-x-1/2 rounded-2xl border border-background-200 bg-background-50 p-3 shadow-sm">
+                      <div className="mb-3 flex items-center justify-between gap-3">
+                        <div>
+                          <p className="text-xs font-heading font-bold text-foreground-900">Jump to date</p>
+                          <p className="text-[12px] text-foreground-400">
+                            {viewMode === 'month' ? 'Choose month and year' : 'Choose a specific day'}
+                          </p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setDatePickerOpen(false)}
+                          className="flex h-7 w-7 items-center justify-center rounded-lg text-foreground-400 transition-smooth hover:bg-background-100 hover:text-foreground-700"
+                          aria-label="Close date picker"
+                        >
+                          <AppIcon className="ri-close-line"></AppIcon>
+                        </button>
+                      </div>
+                      {viewMode === 'month' ? (
+                        <div className="grid grid-cols-[1fr_96px] gap-2">
+                          <label className="block">
+                            <span className="mb-1 block text-[12px] font-semibold uppercase tracking-wide text-foreground-400">Month</span>
+                            <select
+                              value={viewMonth}
+                              onChange={(event) => handleMonthPickerChange(Number(event.target.value))}
+                              className="w-full rounded-lg border border-background-200 bg-background-50 px-3 py-2 text-xs font-semibold text-foreground-900 focus:outline-none focus:ring-2 focus:ring-primary-200"
+                            >
+                              {MONTH_NAMES.map((monthName, index) => (
+                                <option key={monthName} value={index}>{monthName}</option>
+                              ))}
+                            </select>
+                          </label>
+                          <label className="block">
+                            <span className="mb-1 block text-[12px] font-semibold uppercase tracking-wide text-foreground-400">Year</span>
+                            <input
+                              type="number"
+                              value={viewYear}
+                              min={1900}
+                              max={2200}
+                              onChange={(event) => handleYearPickerChange(Number(event.target.value))}
+                              className="w-full rounded-lg border border-background-200 bg-background-50 px-3 py-2 text-xs font-semibold text-foreground-900 focus:outline-none focus:ring-2 focus:ring-primary-200"
+                            />
+                          </label>
+                        </div>
+                      ) : (
+                        <label className="block">
+                          <span className="mb-1 block text-[12px] font-semibold uppercase tracking-wide text-foreground-400">Date</span>
+                          <input
+                            type="date"
+                            value={datePickerValue}
+                            onChange={(event) => handleDatePickerChange(event.target.value)}
+                            className="w-full rounded-lg border border-background-200 bg-background-50 px-3 py-2 text-xs font-semibold text-foreground-900 focus:outline-none focus:ring-2 focus:ring-primary-200"
+                          />
+                        </label>
+                      )}
+                    </div>
+                  )}
+                </div>
+                <button
+                  onClick={handleNext}
+                  className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-primary-600 transition-smooth cursor-pointer hover:bg-primary-50 hover:text-primary-700 hover:shadow-sm focus:outline-none focus:ring-2 focus:ring-primary-200"
+                  aria-label="Next period"
+                >
+                  <AppIcon className="ri-arrow-right-s-line h-4 w-4 shrink-0"></AppIcon>
+                </button>
+              </div>
+            </div>
+            <div className="flex w-full min-w-0 flex-col gap-2 sm:flex-row sm:items-center">
+              <div className="relative min-w-0 flex-1">
+                <AppIcon className="ri-search-line absolute left-3 top-1/2 -translate-y-1/2 text-foreground-400 text-xs"></AppIcon>
+                <input
+                  type="text" placeholder="Search events or learner names..." value={searchTerm}
+                  onChange={(e) => setSearchTerm(e.target.value)}
+                  className="h-9 w-full rounded-lg border border-background-200 bg-background-50 pl-9 pr-3 text-[11px] font-medium text-foreground-900 placeholder:text-foreground-400 transition-all focus:outline-none focus:ring-2 focus:ring-primary-200"
+                />
+              </div>
+              <button
+                type="button"
+                onClick={() => setColorPreferencesOpen(true)}
+                className="inline-flex h-9 shrink-0 items-center justify-center gap-1.5 rounded-lg border-0 bg-[#F1ECF8] px-2.5 text-[11px] font-bold text-[#4F2D7F] shadow-sm transition hover:bg-[#E8DDF3] focus:outline-none focus:ring-2 focus:ring-[#4F2D7F]/25"
+              >
+                <AppIcon className="ri-palette-fill text-[13px]" />
+                Customise colours
+              </button>
+            </div>
+          </div>
+
+          <div className="calendar-filter-layout mt-3 min-w-0">
+            <section className="calendar-filter-card flex min-w-0 flex-col overflow-hidden rounded-2xl border border-[#E8DDF3] bg-white shadow-[0_4px_18px_rgba(79,45,127,0.06)]" aria-labelledby="calendar-source-filters-title">
+              <div>
+                <h3 id="calendar-source-filters-title" className="text-sm font-heading font-bold text-slate-900">Filter by source</h3>
+                <p className="mt-0.5 text-[11px] text-slate-500">View meetings by source.</p>
+              </div>
+              <CalendarFilterScrollRow ariaLabel="Source filters">
+                {sourceFilterOptions.filter(option => option.value !== 'other').map(option => {
+                  const isActive = filterSource === option.value;
+                  const sourceColor = sourceFilterColor(option.value);
+                  return (
+                    <button
+                      key={`menu-${option.value}`}
+                      type="button"
+                      onClick={() => setFilterSource(option.value)}
+                      aria-pressed={isActive}
+                      title={`${option.longLabel} (${option.count})`}
+                      className={`calendar-filter-pill inline-flex items-center gap-2 rounded-xl border text-[11px] font-semibold transition focus:outline-none focus:ring-2 focus:ring-[#4F2D7F]/20 ${isActive ? 'border-[#C9B9DD] bg-[#F7F3FB] text-[#4F2D7F] shadow-sm' : 'border-slate-200 bg-white text-slate-700 hover:border-[#D8CCE8] hover:bg-slate-50'}`}
+                    >
+                      <span className="h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: isActive ? '#4F2D7F' : sourceColor.accent }} />
+                      <span>{option.value === 'all' ? 'All Sources' : option.label}</span>
+                      <span className={`rounded-full px-1.5 py-0.5 text-[10px] font-bold ${isActive ? 'bg-[#E8DDF3] text-[#4F2D7F]' : 'bg-slate-100 text-slate-500'}`}>{option.count}</span>
+                    </button>
+                  );
+                })}
+              </CalendarFilterScrollRow>
+            </section>
+
+            <section className="calendar-filter-card flex min-w-0 flex-col overflow-hidden rounded-2xl border border-[#E8DDF3] bg-white shadow-[0_4px_18px_rgba(79,45,127,0.06)]" aria-labelledby="calendar-status-colours-title">
+              <div>
+                <h3 id="calendar-status-colours-title" className="text-sm font-heading font-bold text-slate-900">Status colours</h3>
+                <p className="mt-0.5 text-[11px] text-slate-500">Track meeting status at a glance.</p>
+              </div>
+              <CalendarFilterScrollRow ariaLabel="Status filters">
+                {STATUS_FILTER_ORDER.map(status => {
+                  const isActive = filterStatus === status;
+                  const statusColor = statusFilterColor(status);
+                  return (
+                    <button
+                      key={status}
+                      type="button"
+                      onClick={() => setFilterStatus(isActive ? 'all' : status)}
+                      title={`${STATUS_FILTER_LABELS[status]} (${statusFilterCounts[status]})`}
+                      aria-pressed={isActive}
+                      className="calendar-filter-pill inline-flex items-center gap-2 rounded-xl text-[11px] font-bold shadow-sm transition hover:brightness-[0.98] focus:outline-none focus:ring-2 focus:ring-[#4F2D7F]/20"
+                      style={{
+                        backgroundColor: isActive ? '#4F2D7F' : statusColor.background,
+                        color: isActive ? '#FFFFFF' : statusColor.accent,
+                      }}
+                    >
+                      <span className="h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: isActive ? '#FFFFFF' : statusColor.accent }} />
+                      <span>{STATUS_FILTER_LABELS[status]}</span>
+                      <span className={`rounded-full px-1.5 py-0.5 text-[10px] font-bold ${isActive ? 'bg-white/20 text-white' : 'bg-white/70'}`}>{statusFilterCounts[status]}</span>
+                    </button>
+                  );
+                })}
+              </CalendarFilterScrollRow>
+            </section>
+          </div>
+        </div>
+
+        {/* â•â•â•â•â•â•â•â•â•â•â• MAIN CONTENT â•â•â•â•â•â•â•â•â•â•â• */}
+        <div className="calendar-main-grid grid grid-cols-1 gap-5 xl:contents">
+          {/* â”€â”€ Calendar Area (2/3) â”€â”€ */}
+          <div className="calendar-column space-y-4">
+
+            {/* MONTH VIEW */}
+            {viewMode === 'month' && (
+              <div className="overflow-hidden rounded-2xl border border-background-200 bg-white shadow-sm ring-1 ring-black/[0.02]">
+                <div className="grid grid-cols-7 border-b border-background-200 bg-background-100/70">
+                  {DAYS_OF_WEEK.map(d => (
+                    <div key={d} className="px-2 py-3 text-center">
+                      <span className="text-[12px] font-bold uppercase tracking-[0.18em] text-foreground-500">{d}</span>
+                    </div>
+                  ))}
+                </div>
+                <div className="grid grid-cols-7">
+                  {monthCells.map((day, idx) => {
+                    if (day === null) {
+                      return (
+                        <div
+                          key={`empty-${idx}`}
+                          className="min-h-[104px] border-b border-r border-slate-200 bg-slate-50/50 xl:min-h-[112px]"
+                        />
+                      );
+                    }
+                    const eventsForDay = filteredEvents.filter(e => e.dayOfMonth === day && e.month === viewMonth && e.year === viewYear);
+                    const dayKey = formatDateInputValue(viewYear, viewMonth, day);
+                    const isExpanded = expandedMonthDays.has(dayKey);
+                    const dayEventsId = `coach-day-events-${dayKey}`;
+                    const isSel = day === CHANGE_MEDay;
+                    const isTdy = isToday(day, viewMonth, viewYear);
+                    const dateValue = new Date(viewYear, viewMonth, day).getTime();
+                    const isPast = dateValue < todayStart.getTime();
+                    const isWeekend = [0, 6].includes(new Date(viewYear, viewMonth, day).getDay());
+                    const hasEvents = eventsForDay.length > 0;
+                    return (
+                      <div
+                        key={`d-${day}`}
+                        onClick={() => handleDayClick(day)}
+                        className={`group relative flex min-h-[104px] flex-col border-b border-r p-2.5 text-left transition-all duration-200 ease-out xl:min-h-[112px] ${
+                          isSel
+                            ? 'z-10 border-primary-300 bg-primary-50/60 ring-1 ring-inset ring-primary-300'
+                            : isWeekend
+                              ? 'border-slate-200 bg-slate-50/25 hover:bg-[#F7F3FB]'
+                              : 'border-slate-200 bg-white hover:bg-[#FBF9FD]'
+                        }`}
+                      >
+                        <div className="mb-2 flex items-center justify-between gap-2">
+                          <button type="button" aria-label={`Select ${day} ${MONTH_NAMES[viewMonth]} ${viewYear}`} className={`flex h-7 min-w-7 items-center justify-center rounded-full px-2 text-sm font-bold transition-all duration-200 ${
+                            isTdy
+                              ? 'bg-primary-500 text-white shadow-sm'
+                              : isSel
+                                ? 'bg-primary-100 text-primary-800'
+                                : isPast
+                                  ? 'text-foreground-400'
+                                  : 'text-foreground-800'
+                          }`}>
+                            {day}
+                          </button>
+                          {hasEvents && (
+                            <span className="rounded-full bg-background-100 px-2 py-0.5 text-[12px] font-semibold text-foreground-500">
+                              {eventsForDay.length}
+                            </span>
+                          )}
+                        </div>
+                        <div id={dayEventsId} className="flex w-full flex-1 flex-col gap-1.5 overflow-hidden">
+                          {(isExpanded ? eventsForDay : eventsForDay.slice(0, 3)).map(ev => {
+                            const meetingType = calendarColors.meetingTypes[getMeetingTypeKey(ev)];
+                            const eventStatusKey = meetingStatusKey(ev);
+                            const eventStatus = calendarColors.statuses[eventStatusKey];
+                            return (
+                              <button
+                                type="button"
+                                aria-haspopup="dialog"
+                                key={ev.id}
+                                onClick={(e) => { e.stopPropagation(); focusEventOnCalendar(ev); }}
+                                className="w-full min-w-0 rounded-lg border border-l-[3px] px-2 py-1.5 text-left text-[11px] font-semibold shadow-sm transition-all duration-150 hover:-translate-y-0.5"
+                                style={{ backgroundColor: meetingType.background, borderColor: `${meetingType.accent}55`, borderLeftColor: meetingType.accent, color: meetingType.accent }}
+                                title={ev.title}
+                              >
+                                <div className="flex min-w-0 items-center gap-1.5">
+                                  <span className="h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: meetingType.accent }}></span>
+                                  <span className="shrink-0 tabular-nums">{formatTime(ev.startHour)}</span>
+                                  <span className="truncate leading-tight">{ev.title}</span>
+                                  <span className="ml-auto shrink-0 rounded-full px-1.5 py-0.5 text-[9px] font-bold leading-none" style={{ backgroundColor: eventStatus.background, color: eventStatus.accent }} title={eventStatusLabel(ev)}>{eventStatusLabel(ev)}</span>
+                                </div>
+                                {(ev.learner || ev.programme) && (
+                                  <p className="mt-0.5 truncate text-[10px] font-medium opacity-75">
+                                    {ev.learner || ev.programme}
+                                  </p>
+                                )}
+                              </button>
+                            );
+                          })}
+                          {eventsForDay.length > 3 && (
+                            <button
+                              type="button"
+                              aria-expanded={isExpanded}
+                              aria-controls={dayEventsId}
+                              aria-label={`${isExpanded ? 'Show fewer' : `Show all ${eventsForDay.length}`} events for ${day} ${MONTH_NAMES[viewMonth]} ${viewYear}`}
+                              onClick={event => {
+                                event.stopPropagation();
+                                handleDayClick(day);
+                                setExpandedMonthDays(previous => {
+                                  const next = new Set(previous);
+                                  if (next.has(dayKey)) next.delete(dayKey);
+                                  else next.add(dayKey);
+                                  return next;
+                                });
+                              }}
+                              className="rounded-md bg-background-100 px-2 py-1 text-left text-[12px] font-semibold text-foreground-500 transition-colors hover:bg-primary-100 hover:text-primary-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-500"
+                            >
+                              {isExpanded ? 'Show less' : `+${eventsForDay.length - 3} more`}
+                            </button>
+                          )}
+                        </div>
+                        {!hasEvents && (
+                          <span className="pointer-events-none mt-auto h-1 w-8 rounded-full bg-background-100 opacity-0 transition-opacity group-hover:opacity-100"></span>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* WEEK VIEW */}
+            {viewMode === 'week' && (
+              <div className="coach-week-scroll bg-background-50 rounded-lg border border-foreground-200/60">
+                <div className="grid grid-cols-8 border-b border-foreground-200/60">
+                  <div className="px-2 py-2.5 bg-background-100/50"></div>
+                  {weekDates.map(wd => {
+                    const isTdy = isToday(wd.day, wd.month, wd.year);
+                    const isSel = wd.day === CHANGE_MEDay && wd.month === viewMonth && wd.year === viewYear;
+                    const weekdayIdx = new Date(wd.year, wd.month, wd.day).getDay();
+                    const mappedDow = weekdayIdx === 0 ? 6 : weekdayIdx - 1;
+                    return (
+                      <button
+                        key={`wh-${wd.day}-${wd.month}`}
+                        onClick={() => { setSelectedDay(wd.day); setViewMonth(wd.month); setViewYear(wd.year); }}
+                        className={`px-2 py-2.5 text-center cursor-pointer transition-smooth ${isSel ? 'bg-primary-50/60' : 'hover:bg-background-100/50'}`}
+                      >
+                        <span className="text-xs font-semibold text-foreground-400 block">{DAYS_OF_WEEK[mappedDow]}</span>
+                        <span className={`text-sm font-bold inline-flex items-center justify-center w-7 h-7 rounded-full mt-0.5 ${isTdy ? 'bg-primary-500 text-white' : isSel ? 'text-primary-700' : 'text-foreground-700'}`}>
+                          {wd.day}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+                <div className="overflow-y-auto max-h-[600px]">
+                  {HOURS.map(hour => {
+                    const isCurrentRow = currentHour === hour && weekDates.some(wd => isToday(wd.day, wd.month, wd.year));
+                    return (
+                      <div key={`h-${hour}`} className={`grid grid-cols-8 border-b border-background-100/50 min-h-[56px] ${isCurrentRow ? 'bg-primary-50/20' : ''}`}>
+                        <div className="px-3 py-2 text-right border-r border-background-100/50">
+                          <span className="text-[12px] font-semibold text-foreground-400">{hour.toString().padStart(2, '0')}:00</span>
+                        </div>
+                        {weekDates.map(wd => {
+                          const eventsInSlot = filteredEvents.filter(ev => {
+                            if (ev.dayOfMonth !== wd.day || ev.month !== wd.month || ev.year !== wd.year) return false;
+                            const startH = ev.startHour;
+                            return startH >= hour && startH < hour + 1;
+                          });
+                          const isSel = wd.day === CHANGE_MEDay && wd.month === viewMonth && wd.year === viewYear;
+                          return (
+                            <div
+                              key={`ws-${wd.day}-${wd.month}-${hour}`}
+                              className={`p-1 border-r border-background-100/50 cursor-pointer transition-smooth hover:bg-primary-50/15 ${isSel ? 'bg-primary-50/30' : ''}`}
+                              onClick={() => { setSelectedDay(wd.day); setViewMonth(wd.month); setViewYear(wd.year); }}
+                            >
+                              {eventsInSlot.map(ev => {
+                                const meetingType = calendarColors.meetingTypes[getMeetingTypeKey(ev)];
+                                const eventStatusKey = meetingStatusKey(ev);
+                                const eventStatus = calendarColors.statuses[eventStatusKey];
+                                const duration = ev.endHour - ev.startHour;
+                                const heightPx = Math.max(24, duration * 48);
+                                return (
+                                  <button type="button" aria-haspopup="dialog"
+                                    key={ev.id}
+                                    onClick={(e) => { e.stopPropagation(); focusEventOnCalendar(ev); }}
+                                    className="mb-0.5 w-full rounded-md border border-l-[3px] px-1.5 py-1 text-left transition-all duration-150 hover:brightness-95"
+                                    style={{ backgroundColor: meetingType.background, borderColor: `${meetingType.accent}55`, borderLeftColor: meetingType.accent, minHeight: `${heightPx}px` }}
+                                  >
+                                    <p className="truncate text-[12px] font-semibold leading-tight" style={{ color: meetingType.accent }}>{ev.title}</p>
+                                    <p className="flex items-center gap-1.5 text-[12px] text-foreground-400 truncate">
+                                      <span>{formatTime(ev.startHour)} - {formatTime(ev.endHour)}</span>
+                                      <span className="rounded-full px-1 py-0.5 text-[9px] font-bold" style={{ backgroundColor: eventStatus.background, color: eventStatus.accent }}>{eventStatusLabel(ev)}</span>
+                                    </p>
+                                    {ev.learner && <p className="text-[12px] text-foreground-400 truncate font-medium">{ev.learner}</p>}
+                                    {ev.priority !== 'normal' && (
+                                      <span className={`text-[12px] px-1 py-0.5 rounded-full border font-semibold ${priorityBadge(ev.priority)}`}>
+                                        {ev.priority === 'urgent' ? '!' : 'High'}
+                                      </span>
+                                    )}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* DAY VIEW */}
+            {viewMode === 'day' && (
+              <div className="bg-background-50 rounded-lg border border-foreground-200/60 overflow-hidden">
+                <div className="px-4 py-3 border-b border-foreground-200/60 flex items-center gap-3">
+                  <span className={`w-10 h-10 rounded-full flex items-center justify-center text-sm font-bold ${isToday(CHANGE_MEDay, viewMonth, viewYear) ? 'bg-primary-500 text-white' : 'bg-primary-100 text-primary-700'}`}>
+                    {CHANGE_MEDay}
+                  </span>
+                  <div>
+                    <p className="text-sm font-heading font-bold text-foreground-900">
+                      {DAYS_OF_WEEK[new Date(viewYear, viewMonth, CHANGE_MEDay).getDay() === 0 ? 6 : new Date(viewYear, viewMonth, CHANGE_MEDay).getDay() - 1]}, {MONTH_NAMES[viewMonth]} {CHANGE_MEDay}
+                    </p>
+                    <p className="text-[12px] text-foreground-400">{CHANGE_MEDayEvents.length} events</p>
+                  </div>
+                </div>
+                <div className="overflow-y-auto max-h-[600px]">
+                  {HOURS.map(hour => {
+                    const eventsInSlot = CHANGE_MEDayEvents.filter(ev => {
+                      const startH = ev.startHour;
+                      return startH >= hour && startH < hour + 1;
+                    });
+                    const isCurrentRow = currentHour === hour && isToday(CHANGE_MEDay, viewMonth, viewYear);
+                    return (
+                      <div key={`dh-${hour}`} className={`flex items-start border-b border-background-100/50 min-h-[64px] ${isCurrentRow ? 'bg-primary-50/20' : ''}`}>
+                        <div className="w-16 shrink-0 px-3 py-3 text-right border-r border-background-100/50">
+                          <span className="text-[12px] font-semibold text-foreground-400">{hour.toString().padStart(2, '0')}:00</span>
+                        </div>
+                        <div className="flex-1 py-2 px-3 relative">
+                          {isCurrentRow && <div className="absolute left-0 top-0 bottom-0 w-0.5 bg-primary-400 rounded-full" />}
+                          <div className="space-y-1.5">
+                            {eventsInSlot.map(ev => {
+                              const meetingType = calendarColors.meetingTypes[getMeetingTypeKey(ev)];
+                              const eventStatusKey = meetingStatusKey(ev);
+                              const eventStatus = calendarColors.statuses[eventStatusKey];
+                              return (
+                                <button type="button" aria-haspopup="dialog"
+                                  key={ev.id}
+                                  onClick={() => focusEventOnCalendar(ev)}
+                                  className={`w-full cursor-pointer rounded-lg border border-l-[3px] p-3 text-left transition-smooth hover:shadow-sm hover:brightness-95 ${CHANGE_MEEvent?.id === ev.id ? 'ring-2 ring-primary-400 ring-offset-1' : ''}`}
+                                  style={{ backgroundColor: meetingType.background, borderColor: `${meetingType.accent}55`, borderLeftColor: meetingType.accent }}
+                                >
+                                  <div className="flex items-center justify-between mb-1">
+                                    <span className="text-sm font-semibold" style={{ color: meetingType.accent }}>{ev.title}</span>
+                                    <div className="flex items-center gap-1.5">
+                                      {ev.priority !== 'normal' && (
+                                        <span className={`text-[12px] font-semibold px-1.5 py-0.5 rounded-full border ${priorityBadge(ev.priority)}`}>
+                                          {ev.priority === 'urgent' ? 'Urgent' : 'High'}
+                                        </span>
+                                      )}
+                                      <span className="rounded-full px-1.5 py-0.5 text-[12px] font-semibold" style={{ backgroundColor: eventStatus.background, color: eventStatus.accent }}>
+                                        {eventStatusLabel(ev)}
+                                      </span>
+                                    </div>
+                                  </div>
+                                  <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-foreground-500">
+                                    <span><AppIcon className="ri-time-line mr-0.5"></AppIcon>{formatTime(ev.startHour)} - {formatTime(ev.endHour)}</span>
+                                    {ev.platform && <span><AppIcon className="ri-video-line mr-0.5"></AppIcon>{ev.platform}</span>}
+                                    {ev.location && <span><AppIcon className="ri-map-pin-line mr-0.5"></AppIcon>{ev.location}</span>}
+                                    {ev.learner && <span className="font-medium text-foreground-600">{ev.learner}</span>}
+                                    {ev.employer && <span className="font-medium text-foreground-600">{ev.employer}</span>}
+                                    {ev.cohort && <span className="text-foreground-400">{ev.cohort}</span>}
+                                  </div>
+                                </button>
+                              );
+                            })}
+                            {eventsInSlot.length === 0 && isCurrentRow && (
+                              <div className="py-1 px-2">
+                                <span className="text-[12px] text-primary-500 font-medium">Now</span>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* â”€â”€ Day events list when in month view â”€â”€ */}
+            {viewMode === 'month' && CHANGE_MEDayEvents.length === 0 && (
+              <div className="flex flex-col gap-3 rounded-2xl border border-background-200 bg-white px-4 py-3 shadow-sm sm:flex-row sm:items-center sm:justify-between">
+                <div className="flex items-center gap-3">
+                  <span className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary-50 text-primary-600">
+                    <AppIcon className="ri-calendar-2-line"></AppIcon>
+                  </span>
+                  <div>
+                    <p className="text-sm font-heading font-bold text-foreground-950">{CHANGE_MEDayLabel}</p>
+                    <p className="text-[12px] font-medium text-foreground-400">No events scheduled</p>
+                  </div>
+                </div>
+                <button onClick={() => setViewMode('day')} className="inline-flex items-center gap-1.5 text-[12px] font-bold text-primary-600 transition-smooth hover:text-primary-700 cursor-pointer whitespace-nowrap">
+                  Day view <AppIcon className="ri-arrow-right-line text-primary-600"></AppIcon>
+                </button>
+              </div>
+            )}
+
+            {viewMode === 'month' && CHANGE_MEDayEvents.length > 0 && (
+              <div className="rounded-2xl border border-background-200 bg-white p-4 shadow-sm md:p-5">
+                <div className="flex items-center justify-between mb-3">
+                  <h3 className="text-sm font-heading font-bold text-foreground-950">
+                    {CHANGE_MEDayLabel}
+                  </h3>
+                  <button onClick={() => setViewMode('day')} className="inline-flex items-center gap-1.5 text-[12px] font-bold text-primary-600 transition-smooth hover:text-primary-700 cursor-pointer whitespace-nowrap">
+                    Day view <AppIcon className="ri-arrow-right-line text-primary-600"></AppIcon>
+                  </button>
+                </div>
+                <div className="space-y-2">
+                  {CHANGE_MEDayEvents.sort((a, b) => a.startHour - b.startHour).map(ev => {
+                    const meetingType = calendarColors.meetingTypes[getMeetingTypeKey(ev)];
+                    const eventStatusKey = meetingStatusKey(ev);
+                    const eventStatus = calendarColors.statuses[eventStatusKey];
+                    return (
+                      <button type="button" aria-haspopup="dialog"
+                        key={ev.id}
+                        onClick={() => focusEventOnCalendar(ev)}
+                        className={`flex w-full cursor-pointer items-center gap-3 rounded-lg border border-l-[3px] p-3 text-left transition-smooth hover:-translate-y-0.5 hover:shadow-sm ${CHANGE_MEEvent?.id === ev.id ? 'ring-2 ring-primary-400 ring-offset-1' : ''}`}
+                        style={{ backgroundColor: meetingType.background, borderColor: `${meetingType.accent}55`, borderLeftColor: meetingType.accent }}
+                      >
+                        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-white/70" style={{ color: meetingType.accent }}>
+                          <AppIcon className={MEETING_TYPE_DEFINITIONS.find(item => item.key === getMeetingTypeKey(ev))?.icon || 'ri-calendar-line'}></AppIcon>
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-bold" style={{ color: meetingType.accent }}>{ev.title}</p>
+                          <div className="flex items-center gap-2 mt-0.5 text-[12px] text-foreground-500">
+                            <span>{formatTime(ev.startHour)} - {formatTime(ev.endHour)}</span>
+                            {ev.learner && <span className="truncate text-foreground-400">· {ev.learner}</span>}
+                            {ev.employer && <span className="truncate text-foreground-400">· {ev.employer}</span>}
+                          </div>
+                        </div>
+                        <span className="shrink-0 rounded-full px-2 py-0.5 text-[12px] font-semibold" style={{ backgroundColor: eventStatus.background, color: eventStatus.accent }}>
+                          {eventStatusLabel(ev)}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* â”€â”€ Sidebar (1/3) â”€â”€ */}
+          <div className="space-y-4">
+            {CHANGE_MEEvent && !scheduleModalOpen && !createSessionOpen && !progressReviewCompletionEvent && (
+              <CalendarEventDialog
+                title={CHANGE_MEEvent.title}
+                onClose={() => { if (!eventActionBusy) setSelectedEvent(null); }}
+                badges={<>
+                  <span className="rounded-full px-2.5 py-1" style={{ backgroundColor: calendarColors.meetingTypes[getMeetingTypeKey(CHANGE_MEEvent)].background, color: calendarColors.meetingTypes[getMeetingTypeKey(CHANGE_MEEvent)].accent }}>{meetingTypeLabelForEvent(CHANGE_MEEvent)}</span>
+                  <span className="rounded-full px-2.5 py-1" style={{ backgroundColor: calendarColors.statuses[meetingStatusKey(CHANGE_MEEvent)].background, color: calendarColors.statuses[meetingStatusKey(CHANGE_MEEvent)].accent }}>{eventStatusLabel(CHANGE_MEEvent)}</span>
+                  {CHANGE_MEEvent.priority !== 'normal' && <span className={`rounded-full border px-2.5 py-1 ${priorityBadge(CHANGE_MEEvent.priority)}`}>{CHANGE_MEEvent.priority === 'urgent' ? 'Urgent' : 'High'}</span>}
+                </>}
+                headerAction={CHANGE_MEEventDetailsPath && (
+                  <button
+                    type="button"
+                    onClick={openSelectedEventDetails}
+                    disabled={eventActionBusy}
+                    className="inline-flex h-9 items-center justify-center gap-2 rounded-lg bg-primary-600 px-3.5 text-[12px] font-bold text-white shadow-sm transition-smooth hover:bg-primary-700 disabled:cursor-not-allowed disabled:opacity-60 whitespace-nowrap"
+                  >
+                    <AppIcon className="ri-arrow-right-up-line"></AppIcon>
+                    View details
+                  </button>
+                )}
+                actions={<>
+                  {!isLiveSessionEvent(CHANGE_MEEvent) && canEditScheduleEvent(CHANGE_MEEvent) && (
+                        <button
+                          onClick={() => openScheduleModal(CHANGE_MEEvent)}
+                          disabled={eventActionBusy}
+                          className="rounded-lg bg-primary-500 px-3.5 py-2.5 text-[12px] font-bold text-white shadow-sm transition-smooth hover:bg-primary-600 disabled:cursor-not-allowed disabled:opacity-60 cursor-pointer whitespace-nowrap"
+                        >
+                          <AppIcon className="ri-calendar-check-line mr-1"></AppIcon>
+                          {scheduleActionLabel(CHANGE_MEEvent)}
+                        </button>
+                  )}
+                  {CHANGE_MEEventMeetingUrl && <a href={CHANGE_MEEventMeetingUrl} onClick={() => handleJoinSelectedMeeting(false)} onAuxClick={e => { if (e.button === 1) handleJoinSelectedMeeting(false); }} target="_blank" rel="noreferrer" className="meeting-join-action inline-flex items-center gap-2 rounded-lg px-4 py-2.5 text-sm font-semibold"><AppIcon className="ri-video-chat-line" />Join meeting</a>}
+                </>}
+              >
+                  {CHANGE_MEEvent.bookingOnly && <BookingOnlyNotice />}
+                  <div className="mb-4 overflow-hidden rounded-2xl border border-background-200 bg-white">
+                    <div className="grid grid-cols-2 gap-2">
+                        <EventDetailTile icon="ri-calendar-line" label="Date" value={formatEventDateLabel(CHANGE_MEEvent)} />
+                        <EventDetailTile
+                          icon="ri-time-line"
+                          label="Time"
+                          value={`${formatTime(CHANGE_MEEvent.startHour)} - ${formatTime(CHANGE_MEEvent.endHour)}`}
+                          sub={`${CHANGE_MEEvent.endHour - CHANGE_MEEvent.startHour}h duration`}
+                        />
+                      </div>
+                  </div>
+
+                  <div className="space-y-2">
+                    {CHANGE_MEEvent.targetDate && (
+                      <EventDetailLine icon="ri-flag-line">
+                        Target date: <span className="font-bold text-foreground-900">{formatCompactDate(CHANGE_MEEvent.targetDate)}</span>
+                      </EventDetailLine>
+                    )}
+                    {CHANGE_MEEvent.scheduledDate && CHANGE_MEEvent.scheduledTime && (
+                      <EventDetailLine icon="ri-calendar-schedule-line">
+                        Scheduled: <span className="font-bold text-foreground-900">{formatCompactDate(CHANGE_MEEvent.scheduledDate)} at {CHANGE_MEEvent.scheduledTime.slice(0, 5)}</span>
+                      </EventDetailLine>
+                    )}
+                    {CHANGE_MEEvent.learner && (
+                      <div className="rounded-lg border border-background-100 bg-white px-3 py-2">
+                        <LearnerIdentity
+                          name={CHANGE_MEEvent.learner}
+                          programme={CHANGE_MEEvent.programme}
+                          size="sm"
+                          meta={CHANGE_MEEvent.platform && CHANGE_MEEvent.platform !== '--'
+                            ? [CHANGE_MEEvent.platform, CHANGE_MEEvent.location && CHANGE_MEEvent.location !== '--' ? CHANGE_MEEvent.location : null]
+                                .filter(Boolean)
+                                .join(' · ')
+                            : undefined}
+                        />
+                      </div>
+                    )}
+                    {CHANGE_MEEvent.employer && (
+                      <EventDetailLine icon="ri-building-2-line">
+                        <span className="font-bold text-foreground-900">{CHANGE_MEEvent.employer}</span>
+                      </EventDetailLine>
+                    )}
+                    {CHANGE_MEEvent.tutor && (
+                      <EventDetailLine icon="ri-user-settings-line">
+                        Tutor: <span className="font-bold text-foreground-900">{CHANGE_MEEvent.tutor}</span>
+                      </EventDetailLine>
+                    )}
+                    {/* When there is a learner, the platform is already shown as the
+                        LearnerIdentity block's meta line above, so it is not repeated here. */}
+                    {!CHANGE_MEEvent.learner && CHANGE_MEEvent.platform && CHANGE_MEEvent.platform !== '--' && (
+                      <EventDetailLine icon="ri-video-line">
+                        <span className="font-bold text-foreground-900">{CHANGE_MEEvent.platform}</span>
+                        {CHANGE_MEEvent.location && CHANGE_MEEvent.location !== '--' && <span className="text-foreground-400"> · {CHANGE_MEEvent.location}</span>}
+                      </EventDetailLine>
+                    )}
+                    {CHANGE_MEEvent.cohort && (
+                      <EventDetailLine icon="ri-group-line">
+                        <span className="font-bold text-foreground-900">{CHANGE_MEEvent.cohort}</span>
+                      </EventDetailLine>
+                    )}
+                    {CHANGE_MEEventMeetingUrl && (
+                      <a
+                        href={CHANGE_MEEventMeetingUrl}
+                        onClick={() => handleJoinSelectedMeeting(false)}
+                        onAuxClick={e => { if (e.button === 1) handleJoinSelectedMeeting(false); }}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="group flex items-center justify-between gap-3 rounded-lg border border-primary-100 bg-gradient-to-r from-primary-50 via-white to-background-50 px-3.5 py-3 text-left transition-smooth hover:-translate-y-0.5 hover:border-primary-200 hover:shadow-sm"
+                      >
+                        <div className="flex min-w-0 items-center gap-3">
+                          <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary-100 text-primary-700 ring-1 ring-primary-100 transition-smooth group-hover:bg-primary-600 group-hover:text-[#ffffff]">
+                            <AppIcon className="ri-video-chat-line h-4 w-4"></AppIcon>
+                          </span>
+                          <div className="min-w-0">
+                            <p className="truncate text-[12px] font-bold text-foreground-950">
+                              Join {CHANGE_MEEventMeetingProvider}
+                            </p>
+                            <p className="mt-0.5 truncate text-[12px] font-medium text-foreground-500">
+                              {CHANGE_MEEventMeetingHost ? `${CHANGE_MEEventMeetingHost} · opens in a new tab` : 'Opens in a new tab'}
+                            </p>
+                          </div>
+                        </div>
+                        <span className="inline-flex h-8 shrink-0 items-center gap-1 rounded-lg border border-primary-200 bg-white px-2.5 text-[12px] font-bold text-primary-700 transition-smooth group-hover:border-primary-600 group-hover:bg-primary-600 group-hover:text-[#ffffff]">
+                          Open
+                          <AppIcon className="ri-external-link-line h-3.5 w-3.5"></AppIcon>
+                        </span>
+                      </a>
+                    )}
+                    {CHANGE_MEEventNotes && (
+                      <div className="rounded-lg border border-background-100 bg-background-50 p-3">
+                        <p className="mb-1 flex items-center gap-1.5 text-[12px] font-bold uppercase tracking-wide text-foreground-400">
+                          <AppIcon className="ri-sticky-note-line"></AppIcon>
+                          Notes
+                        </p>
+                        <p className="text-[12px] leading-5 text-foreground-700">{CHANGE_MEEventNotes}</p>
+                      </div>
+                    )}
+                  </div>
+                  {CHANGE_MEEventFeedback && (
+                    <div className={`mt-4 rounded-lg border px-3 py-2 text-[12px] ${eventActionError ? 'border-red-200 bg-red-50 text-red-700' : 'border-amber-200 bg-amber-50 text-amber-800'}`}>
+                      {CHANGE_MEEventFeedback}
+                    </div>
+                  )}
+                  {isLiveSessionEvent(CHANGE_MEEvent) && (
+                    <div className="mt-4 rounded-2xl border border-primary-200 bg-primary-50 px-4 py-3">
+                      <p className="text-[12px] text-primary-800">
+                        Live sessions are managed from the curriculum delivery schedule, so they cannot be rescheduled from the coach timetable.
+                      </p>
+                      {(CHANGE_MEEvent.meetingLink || CHANGE_MEEvent.graphWebLink) && (
+                        <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-primary-200/70 pt-3">
+                          <button
+                            onClick={() => handleJoinSelectedMeeting()}
+                            disabled={eventActionBusy || Boolean(CHANGE_MEEvent.meetingOutcome)}
+                            title={CHANGE_MEEvent.meetingOutcome ? 'This session has ended.' : undefined}
+                            className="meeting-join-action rounded-lg px-3.5 py-2.5 text-[12px] font-bold shadow-sm transition-smooth cursor-pointer whitespace-nowrap disabled:cursor-not-allowed disabled:opacity-60"
+                          >
+                            <i className="ri-play-circle-line mr-1"></i>Join Session
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  {!CHANGE_MEEvent.bookingOnly && (CHANGE_MEEvent.reviewTemplateId || CHANGE_MEEvent.reviewSource === 'aptem') && (
+                    <div className="mt-4 flex flex-col gap-3 rounded-2xl border border-secondary-200 bg-secondary-50 p-4 sm:flex-row sm:items-center">
+                      <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-secondary-100 text-secondary-700">
+                        <AppIcon className="ri-survey-line"></AppIcon>
+                      </span>
+                      <div className="flex-1">
+                        <p className="text-xs font-bold text-secondary-900">{CHANGE_MEEvent.title} form</p>
+                        <p className="mt-1 text-[12px] text-secondary-700">{CHANGE_MEEvent.reviewSource === 'aptem' ? 'Open this migrated review to book its LMS meeting and work on the approved form.' : 'The questions for this review come from Curriculum. Answers save as you go and can be finished later.'}</p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => openReviewForm(CHANGE_MEEvent)}
+                        disabled={eventActionBusy || reviewFormBusy}
+                        className="whitespace-nowrap rounded-lg bg-secondary-600 px-4 py-2.5 text-[12px] font-bold text-white transition hover:bg-secondary-700 disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        <AppIcon className={`${reviewFormBusy ? 'ri-loader-4-line animate-spin' : 'ri-file-edit-line'} mr-1.5`}></AppIcon>Open form
+                      </button>
+                    </div>
+                  )}
+                  {!isLiveSessionEvent(CHANGE_MEEvent) && canEditScheduleEvent(CHANGE_MEEvent) && !isImportedPersonalSupportPlan(CHANGE_MEEvent) && (
+                    <div className="mt-4 rounded-2xl border border-background-200 bg-white p-4 shadow-sm">
+                      <div className="mb-3 flex items-center justify-between gap-3">
+                        <h4 className="flex items-center gap-2 text-[12px] font-bold uppercase tracking-wide text-foreground-700">
+                          <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-primary-50 text-primary-600">
+                            <AppIcon className="ri-calendar-schedule-line"></AppIcon>
+                          </span>
+                          {CHANGE_MEEvent.status === 'not-scheduled' && isApprovalRequestSource(CHANGE_MEEvent.source) ? 'Approve & Schedule' : 'Schedule Meeting'}
+                        </h4>
+                        {CHANGE_MEEvent.status === 'not-scheduled' && (
+                          <span className="rounded-full bg-red-50 px-2.5 py-1 text-[12px] font-bold text-red-700">Needs scheduling</span>
+                        )}
+                      </div>
+                      <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+                        <div className="rounded-lg border border-background-200 bg-background-50 px-3 py-2.5">
+                          <p className="text-[11px] font-semibold uppercase tracking-wide text-foreground-400">Date</p>
+                          <p className="mt-1 text-[12px] font-bold text-foreground-900">
+                            {formatCompactDate(CHANGE_MEEvent.scheduledDate || CHANGE_MEEvent.targetDate || CHANGE_MEEvent.date)}
+                          </p>
+                        </div>
+                        <div className="rounded-lg border border-background-200 bg-background-50 px-3 py-2.5">
+                          <p className="text-[11px] font-semibold uppercase tracking-wide text-foreground-400">Time</p>
+                          <p className="mt-1 text-[12px] font-bold text-foreground-900">
+                            {CHANGE_MEEvent.scheduledTime || CHANGE_MEEvent.timeLabel || formatTime(CHANGE_MEEvent.startHour)}
+                          </p>
+                        </div>
+                        <div className="rounded-lg border border-background-200 bg-background-50 px-3 py-2.5">
+                          <p className="text-[11px] font-semibold uppercase tracking-wide text-foreground-400">Duration</p>
+                          <p className="mt-1 text-[12px] font-bold text-foreground-900">
+                            {CHANGE_MEEvent.durationMinutes || Math.max(30, Math.round((CHANGE_MEEvent.endHour - CHANGE_MEEvent.startHour) * 60))} min
+                          </p>
+                        </div>
+                      </div>
+                      {CHANGE_MEEvent.status === 'scheduled' && CHANGE_MEEvent.reviewTemplateId && CHANGE_MEEvent.scheduledDate && CHANGE_MEEvent.scheduledTime
+                        && new Date(`${CHANGE_MEEvent.scheduledDate}T${CHANGE_MEEvent.scheduledTime}`).getTime() < Date.now() && (
+                        <div className="mt-3 flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[12px] text-amber-800">
+                          <AppIcon className="ri-time-line"></AppIcon>
+                          {/* Derived, display-only: the scheduled time has passed and no Teams attendance has moved
+                              this to In Progress yet -- backend status stays "scheduled" (see Phase 3/4 report);
+                              this is not a new lifecycle status. */}
+                          Meeting time has passed and no attendance has been detected yet.
+                        </div>
+                      )}
+                      <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-background-100 pt-3">
+
+                        {CHANGE_MEEvent.status === 'scheduled' && (
+                        <button
+                          onClick={() => {
+                            if (CHANGE_MEEvent.reviewTemplateId || isImportedJoin(CHANGE_MEEvent)) {
+                              handleJoinSelectedMeeting();
+                              return;
+                            }
+                            handleEventAction('start');
+                          }}
+                          // The booked time has passed: joining is closed.
+                          disabled={eventActionBusy || Boolean(CHANGE_MEEvent.meetingOutcome) || (CHANGE_MEEvent.source !== 'catch-up' && !(CHANGE_MEEvent.meetingLink || CHANGE_MEEvent.graphWebLink))}
+                          title={CHANGE_MEEvent.meetingOutcome ? 'This meeting has ended.' : undefined}
+                          className="rounded-lg bg-emerald-500 px-3.5 py-2.5 text-[12px] font-bold text-white shadow-sm transition-smooth hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-60 cursor-pointer whitespace-nowrap"
+                        >
+                          <AppIcon className="ri-play-circle-line mr-1"></AppIcon>{CHANGE_MEEvent.reviewTemplateId || isImportedJoin(CHANGE_MEEvent) ? 'Join' : 'Start'}
+                          </button>
+                        )}
+                        {CHANGE_MEEvent.status === 'scheduled' && CHANGE_MEEvent.reviewTemplateId && (
+                          <button
+                            type="button"
+                            onClick={() => { void markReviewInProgress(CHANGE_MEEvent); }}
+                            disabled={eventActionBusy || reviewFormBusy}
+                            className="rounded-lg border border-amber-300 bg-amber-50 px-3.5 py-2.5 text-[12px] font-bold text-amber-800 shadow-sm transition hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-60 whitespace-nowrap"
+                          >
+                            <AppIcon className="ri-flashlight-line mr-1"></AppIcon>Mark In Progress
+                          </button>
+                        )}
+                        {CHANGE_MEEvent.status === 'in-progress' && (CHANGE_MEEvent.meetingLink || CHANGE_MEEvent.graphWebLink) && (
+                          <button
+                            onClick={() => handleJoinSelectedMeeting()}
+                            disabled={eventActionBusy || Boolean(CHANGE_MEEvent.meetingOutcome)}
+                            title={CHANGE_MEEvent.meetingOutcome ? 'This meeting has ended.' : undefined}
+                            className="meeting-join-action rounded-lg px-3.5 py-2.5 text-[12px] font-bold shadow-sm transition-smooth cursor-pointer whitespace-nowrap disabled:cursor-not-allowed disabled:opacity-60"
+                          >
+                            <AppIcon className="ri-video-on-line mr-1"></AppIcon>Join
+                          </button>
+                        )}
+                        {/* A row with a reviewTemplateId is (or will be, once opened) linked to a
+                            Curriculum-driven review_instance -- its "Open form" button above is the
+                            canonical way to finish and complete it. This legacy button, which posts
+                            the hard-coded reviewResponses payload, stays only for rows that are not
+                            (yet) linked; the backend applies the same rule (coach_timetable_event_action). */}
+                        {CHANGE_MEEvent.status === 'in-progress' && !CHANGE_MEEvent.reviewTemplateId && (
+                          <button
+                            onClick={() => handleEventAction('complete')}
+                            disabled={eventActionBusy}
+                            className="rounded-lg bg-secondary-500 px-3.5 py-2.5 text-[12px] font-bold text-white shadow-sm transition-smooth hover:bg-secondary-600 disabled:cursor-not-allowed disabled:opacity-60 cursor-pointer whitespace-nowrap"
+                          >
+                            <AppIcon className={`${CHANGE_MEEvent.source === 'progress-review' ? 'ri-file-edit-line' : 'ri-check-double-line'} mr-1`}></AppIcon>
+                            {CHANGE_MEEvent.source === 'progress-review' ? 'Open review form' : 'Complete'}
+                          </button>
+                        )}
+                        {(CHANGE_MEEvent.status === 'scheduled' || CHANGE_MEEvent.status === 'in-progress') && (
+                          <button
+                            onClick={() => handleEventAction('cancel')}
+                            disabled={eventActionBusy}
+                            className="rounded-lg border border-red-200 bg-white px-3.5 py-2.5 text-[12px] font-bold text-red-700 transition-smooth hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-60 cursor-pointer whitespace-nowrap"
+                          >
+                            <AppIcon className="ri-close-circle-line mr-1"></AppIcon>Cancel
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                  {!CHANGE_MEEvent.bookingOnly && CHANGE_MEEvent.status === 'awaiting-signature' && CHANGE_MEEvent.source === 'progress-review' && (
+                    <div className="mt-4 flex flex-col gap-3 rounded-2xl border border-violet-200 bg-violet-50 p-4 sm:flex-row sm:items-center">
+                      <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-violet-100 text-violet-700">
+                        <AppIcon className="ri-pen-nib-line"></AppIcon>
+                      </span>
+                      <div className="flex-1">
+                        <p className="text-xs font-bold text-violet-900">Waiting for line manager signature</p>
+                        <p className="mt-1 text-[12px] text-violet-700">The review form has been submitted. Confirm the manager signature to complete this PR.</p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => handleEventAction('sign')}
+                        disabled={eventActionBusy}
+                        className="whitespace-nowrap rounded-lg bg-violet-700 px-4 py-2.5 text-[12px] font-bold text-white transition hover:bg-violet-800 disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        <AppIcon className="ri-quill-pen-line mr-1.5"></AppIcon>Confirm Signature
+                      </button>
+                    </div>
+                  )}
+              </CalendarEventDialog>
+            )}
+
+            {/* Upcoming Events */}
+            <div className="overflow-hidden rounded-2xl border border-background-200 bg-white shadow-sm ring-1 ring-black/[0.02]">
+              <div className="flex items-center justify-between gap-3 border-b border-background-100 bg-background-50/80 px-4 py-3 md:px-5">
+                <h3 className="flex items-center gap-2 text-sm font-heading font-bold text-foreground-950">
+                  <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary-600 text-white">
+                    <AppIcon className="ri-calendar-todo-line"></AppIcon>
+                  </span>
+                  Upcoming events
+                </h3>
+                <span className="rounded-full bg-white px-2.5 py-1 text-[12px] font-semibold text-foreground-500 shadow-sm">
+                  {upcomingEvents.length}
+                </span>
+              </div>
+              <div className="grid max-h-[36rem] gap-2 overflow-y-auto p-3 sm:grid-cols-2 md:p-4 xl:grid-cols-3">
+                {upcomingEvents
+                  .map(ev => {
+                    const meetingType = calendarColors.meetingTypes[getMeetingTypeKey(ev)];
+                    const eventStatus = calendarColors.statuses[meetingStatusKey(ev)];
+                    const sourceLabel = ev.source && isSchedulableSource(ev.source)
+                      ? eventSourceLabel(ev.source)
+                      : meetingTypeLabelForEvent(ev);
+                    return (
+                      <button
+                        key={ev.id}
+                        onClick={() => focusEventOnCalendar(ev)}
+                        className={`group flex w-full items-stretch gap-3 rounded-lg border border-l-[3px] p-2.5 text-left transition-all duration-200 hover:-translate-y-0.5 hover:shadow-sm ${
+                          CHANGE_MEEvent?.id === ev.id
+                            ? 'border-primary-300 bg-primary-50/60 ring-2 ring-primary-100'
+                            : 'border-slate-200 bg-white hover:border-primary-200 hover:bg-primary-50/20'
+                        }`}
+                        style={{ backgroundColor: meetingType.background, borderColor: `${meetingType.accent}55`, borderLeftColor: meetingType.accent }}
+                      >
+                        <div className="flex w-12 shrink-0 flex-col overflow-hidden rounded-lg border border-background-200 bg-background-50 text-center">
+                          <span className="bg-background-100 px-1 py-1 text-[12px] font-bold uppercase tracking-wide text-foreground-500">
+                            {MONTH_NAMES[ev.month].slice(0, 3)}
+                          </span>
+                          <span className="px-1 py-1.5 text-lg font-heading font-bold leading-none text-foreground-950">
+                            {ev.dayOfMonth}
+                          </span>
+                        </div>
+                        {ev.learner ? (
+                          <LearnerAvatar name={ev.learner} size="sm" className="mt-0.5 shrink-0" />
+                        ) : null}
+                        <div className="min-w-0 flex-1">
+                          <div className="mb-1 flex items-center gap-1.5">
+                            <span className="h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: meetingType.accent }}></span>
+                            <span className="rounded-full px-2 py-0.5 text-[12px] font-bold" style={{ backgroundColor: meetingType.background, color: meetingType.accent }}>
+                              {sourceLabel}
+                            </span>
+                            <span className="rounded-full px-2 py-0.5 text-[12px] font-semibold" style={{ backgroundColor: eventStatus.background, color: eventStatus.accent }}>
+                              {eventStatusLabel(ev)}
+                            </span>
+                          </div>
+                          <p className="truncate text-[12px] font-heading font-bold leading-tight text-foreground-950">{ev.title}</p>
+                          <p className="mt-1 flex min-w-0 items-center gap-1.5 text-[12px] font-medium text-foreground-500">
+                            <AppIcon className="ri-time-line text-foreground-400"></AppIcon>
+                            <span className="shrink-0">{formatTime(ev.startHour)}</span>
+                            {(ev.learner || ev.programme) && (
+                              <>
+                                <span className="text-foreground-300">·</span>
+                                <span className="truncate">{ev.learner || ev.programme}</span>
+                              </>
+                            )}
+                          </p>
+                        </div>
+                        <span className="mt-1 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-primary-600 transition-smooth group-hover:bg-primary-50 group-hover:text-primary-700">
+                          <AppIcon className="ri-arrow-right-s-line"></AppIcon>
+                        </span>
+                      </button>
+                    );
+                  })}
+                {upcomingEvents.length === 0 && (
+                  <EmptyState
+                    size="sm"
+                    icon="ri-calendar-check-line"
+                    title="No upcoming events in the next 7 days"
+                    description="Nothing is scheduled over the next 7 days."
+                  />
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {createSessionOpen && (
+        <div className="fixed inset-0 z-[95] flex items-center justify-center bg-black/55 p-4 backdrop-blur-sm" onClick={closeCreateSessionModal}>
+          <div
+            className="w-full max-w-[700px] max-h-[90vh] overflow-y-auto rounded-2xl border border-background-200 bg-background-50 shadow-sm"
+            onClick={event => event.stopPropagation()}
+          >
+            <div className="border-b border-background-200/70 bg-background-50 px-4 py-4 md:px-5">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <div className="mb-2 inline-flex items-center gap-2 rounded-full border border-primary-200 bg-primary-50 px-3 py-1 text-[12px] font-semibold text-primary-700">
+                    <AppIcon className="ri-user-star-line"></AppIcon>
+                    Coach Calendar
+                  </div>
+                  <h2 className="text-[21px] font-heading font-bold tracking-tight text-foreground-950">Schedule Coach Session</h2>
+                  <p className="mt-1 text-[13px] leading-5 text-foreground-500">
+                    Book a learner session and add it to both calendars.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={closeCreateSessionModal}
+                  className="flex h-9 w-9 items-center justify-center rounded-lg border border-background-200 text-foreground-400 transition-smooth hover:bg-background-100 hover:text-foreground-700 cursor-pointer"
+                  aria-label="Close create session modal"
+                >
+                  <AppIcon className="ri-close-line text-base"></AppIcon>
+                </button>
+              </div>
+            </div>
+
+            <div className="space-y-5 px-4 py-4 md:px-5 md:py-5">
+              <section>
+                <div className="mb-2 flex items-center justify-between gap-3">
+                  <div>
+                    <p className="text-[12px] font-semibold uppercase tracking-[0.18em] text-foreground-400">Learner</p>
+                    <p className="mt-1 text-[12px] text-foreground-500">Choose who this session is for.</p>
+                  </div>
+                  <span className="rounded-full bg-background-100 px-2.5 py-1 text-[12px] font-semibold text-foreground-500">
+                    {createSessionLearnerOptions.length} learner{createSessionLearnerOptions.length === 1 ? '' : 's'}
+                  </span>
+                </div>
+                <div className="relative">
+                  <div className={`rounded-lg border bg-white shadow-sm transition-smooth ${
+                    createSessionLearnerPickerOpen
+                      ? 'border-primary-300 ring-4 ring-primary-100/80'
+                      : 'border-background-200 hover:border-primary-200'
+                  }`}>
+                    <div className="flex min-h-[56px] items-center gap-3 px-3 py-2">
+                      {CHANGE_MECreateSessionLearner ? (
+                        <LearnerAvatar name={CHANGE_MECreateSessionLearner.name} size="md" />
+                      ) : (
+                        <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary-50 text-primary-700 ring-1 ring-primary-100">
+                          <AppIcon className="ri-search-line text-base"></AppIcon>
+                        </span>
+                      )}
+                      <input
+                        type="text"
+                        value={createSessionLearnerPickerOpen ? createSessionLearnerSearch : (CHANGE_MECreateSessionLearner?.label || '')}
+                        onFocus={() => {
+                          if (createSessionLearnerOptions.length === 0) return;
+                          setCreateSessionLearnerPickerOpen(true);
+                          setCreateSessionLearnerSearch('');
+                        }}
+                        onChange={event => {
+                          setCreateSessionLearnerPickerOpen(true);
+                          setCreateSessionLearnerSearch(event.target.value);
+                        }}
+                        onBlur={() => {
+                          window.setTimeout(() => setCreateSessionLearnerPickerOpen(false), 120);
+                        }}
+                        placeholder="Search learner name, email, programme..."
+                        disabled={createSessionLearnerOptions.length === 0}
+                        className="min-w-0 flex-1 appearance-none border-0 bg-transparent p-0 text-sm font-semibold text-foreground-900 shadow-none outline-none ring-0 placeholder:font-medium placeholder:text-foreground-400 focus:border-0 focus:outline-none focus:ring-0 focus-visible:outline-none disabled:cursor-not-allowed"
+                      />
+                      {createSessionLearnerSearch && createSessionLearnerPickerOpen ? (
+                        <button
+                          type="button"
+                          onMouseDown={event => event.preventDefault()}
+                          onClick={() => setCreateSessionLearnerSearch('')}
+                          className="flex h-7 w-7 items-center justify-center rounded-lg text-foreground-400 transition-smooth hover:bg-background-100 hover:text-foreground-700 cursor-pointer"
+                          aria-label="Clear learner search"
+                        >
+                          <AppIcon className="ri-close-line text-base"></AppIcon>
+                        </button>
+                      ) : null}
+                      <button
+                        type="button"
+                        onMouseDown={event => event.preventDefault()}
+                        onClick={() => {
+                          if (createSessionLearnerOptions.length === 0) return;
+                          setCreateSessionLearnerPickerOpen(current => !current);
+                          setCreateSessionLearnerSearch('');
+                        }}
+                        disabled={createSessionLearnerOptions.length === 0}
+                        className="flex h-7 w-7 items-center justify-center rounded-lg text-foreground-400 transition-smooth hover:bg-background-100 hover:text-foreground-700 disabled:cursor-not-allowed disabled:opacity-40 cursor-pointer"
+                        aria-label="Toggle learner list"
+                      >
+                        <AppIcon className={`ri-arrow-down-s-line text-lg transition-transform ${createSessionLearnerPickerOpen ? 'rotate-180' : ''}`}></AppIcon>
+                      </button>
+                    </div>
+                  </div>
+
+                  {createSessionLearnerPickerOpen && (
+                    <div className="absolute left-0 right-0 top-[calc(100%+8px)] z-[110] overflow-hidden rounded-lg border border-background-200 bg-white shadow-sm">
+                      <div className="max-h-[260px] overflow-y-auto p-2">
+                        {filteredCreateSessionLearners.length > 0 ? (
+                          filteredCreateSessionLearners.map(option => {
+                            const isSelected = option.value === createSessionLearnerId;
+                            return (
+                              <button
+                                key={option.value}
+                                type="button"
+                                onMouseDown={event => event.preventDefault()}
+                                onClick={() => {
+                                  setCreateSessionLearnerId(option.value);
+                                  setCreateSessionLearnerSearch('');
+                                  setCreateSessionLearnerPickerOpen(false);
+                                }}
+                                className={`flex w-full items-center gap-3 rounded-2xl px-3 py-2.5 text-left transition-smooth cursor-pointer ${
+                                  isSelected ? 'bg-primary-50 text-primary-800' : 'text-foreground-800 hover:bg-background-100'
+                                }`}
+                              >
+                                <LearnerAvatar
+                                  name={option.name}
+                                  size="md"
+                                  className={isSelected ? 'bg-primary-100 text-primary-700 ring-primary-200' : 'bg-background-100 text-foreground-600 ring-transparent'}
+                                />
+                                <span className="min-w-0 flex-1">
+                                  <span className="block truncate text-sm font-semibold">{option.name}</span>
+                                  <span className="mt-0.5 block truncate text-[12px] text-foreground-500">
+                                    {[option.programme, option.cohort, option.email].filter(value => value && value !== '--').join(' · ') || 'No extra details'}
+                                  </span>
+                                </span>
+                                {isSelected && <AppIcon className="ri-check-line text-base text-primary-600"></AppIcon>}
+                              </button>
+                            );
+                          })
+                        ) : (
+                          <div className="px-4 py-8 text-center">
+                            <span className="mx-auto mb-3 flex h-10 w-10 items-center justify-center rounded-lg bg-background-100 text-foreground-300">
+                              <AppIcon className="ri-search-line text-lg"></AppIcon>
+                            </span>
+                            <p className="text-sm font-semibold text-foreground-800">No learners found</p>
+                            <p className="mt-1 text-[12px] text-foreground-500">Try another name, email, or programme.</p>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+                {createSessionLearnerOptions.length === 0 && (
+                  <p className="mt-2 text-[12px] text-rose-700">No active learners are available in this coach caseload right now.</p>
+                )}
+              </section>
+
+              <section>
+                <p className="text-[12px] font-semibold uppercase tracking-[0.18em] text-foreground-400">Session Type</p>
+                <p className="mt-1 text-[12px] text-foreground-500">Choose the kind of session you want to create.</p>
+                <div className="mt-3 grid gap-3 md:grid-cols-2">
+                  {[
+                    { value: 'catch-up' as CoachBookableSessionType, label: 'Catch-up', icon: 'ri-chat-3-line', description: 'Quick progress check-in' },
+                    { value: 'student-support' as CoachBookableSessionType, label: 'Support', icon: 'ri-heart-2-line', description: 'Extra support for learner needs' },
+                    { value: 'review' as CoachBookableSessionType, label: 'Review', icon: 'ri-file-list-3-line', description: 'Add an extra Review for this learner' },
+                  ].map((sessionType) => {
+                    const isActive = createSessionType === sessionType.value;
+                    return (
+                      <button
+                        key={sessionType.value}
+                        type="button"
+                        onClick={() => setCreateSessionType(sessionType.value)}
+                        className={`rounded-2xl border px-4 py-4 text-left transition-smooth cursor-pointer ${
+                          isActive
+                            ? 'border-primary-300 bg-primary-50 shadow-sm ring-2 ring-primary-100'
+                            : 'border-background-200 bg-white hover:border-primary-200 hover:bg-primary-50/40'
+                        }`}
+                      >
+                        <span className={`mb-3 flex h-10 w-10 items-center justify-center rounded-lg ${isActive ? 'bg-primary-100 text-primary-600' : 'bg-background-100 text-foreground-500'}`}>
+                          <AppIcon className={`${sessionType.icon} text-base`}></AppIcon>
+                        </span>
+                        <p className="text-[18px] font-heading font-semibold text-foreground-950">{sessionType.label}</p>
+                        <p className="mt-1 text-[12px] leading-5 text-foreground-500">{sessionType.description}</p>
+                      </button>
+                    );
+                  })}
+                </div>
+              </section>
+
+              {createSessionType === 'review' && (
+                <section className="grid gap-3 md:grid-cols-2">
+                  <label className="block">
+                    <span className="mb-2 block text-[12px] font-semibold uppercase tracking-[0.16em] text-foreground-400">Review</span>
+                    {<LoadingControl loading={(createSessionReviewTemplatesLoading)}><select
+                      value={createSessionReviewTemplateId}
+                      onChange={event => setCreateSessionReviewTemplateId(event.target.value)}
+                      disabled={createSessionReviewTemplatesLoading || !createSessionReviewTemplates.length}
+                      className="w-full rounded-lg border border-background-200 bg-white px-4 py-2.5 text-sm font-medium text-foreground-900 shadow-sm focus:outline-none focus:ring-2 focus:ring-primary-200 disabled:opacity-60"
+                    >
+                      <option value="">
+                        {createSessionReviewTemplatesLoading
+                          ? 'Loading…'
+                          : createSessionReviewTemplates.length
+                            ? 'Select a Review template'
+                            : 'No Review templates configured for this learner’s programme'}
+                      </option>
+                      {createSessionReviewTemplates.map(template => (
+                        <option key={template.id} value={template.id}>{template.name}</option>
+                      ))}
+                    </select></LoadingControl>}
+                  </label>
+
+                  <label className="block">
+                    <span className="mb-2 block text-[12px] font-semibold uppercase tracking-[0.16em] text-foreground-400">Target date</span>
+                    <input
+                      type="date"
+                      value={createSessionReviewTargetDate}
+                      onChange={event => setCreateSessionReviewTargetDate(event.target.value)}
+                      className="w-full rounded-lg border border-background-200 bg-white px-4 py-2.5 text-sm font-medium text-foreground-900 shadow-sm focus:outline-none focus:ring-2 focus:ring-primary-200"
+                    />
+                  </label>
+
+                  <label className="block">
+                    <span className="mb-2 block text-[12px] font-semibold uppercase tracking-[0.16em] text-foreground-400">Reason (Optional)</span>
+                    <select
+                      value={createSessionReviewReasonCode}
+                      onChange={event => setCreateSessionReviewReasonCode(event.target.value as LearnerAdditionReasonCode | '')}
+                      className="w-full rounded-lg border border-background-200 bg-white px-4 py-2.5 text-sm font-medium text-foreground-900 shadow-sm focus:outline-none focus:ring-2 focus:ring-primary-200"
+                    >
+                      <option value="">Select a reason</option>
+                      <option value="additional-coaching">Additional coaching required</option>
+                      <option value="learner-request">Learner request</option>
+                      <option value="employer-request">Employer request</option>
+                      <option value="performance-concern">Performance concern</option>
+                      <option value="safeguarding-follow-up">Safeguarding follow-up</option>
+                      <option value="other">Other</option>
+                    </select>
+                  </label>
+
+                  <label className="block md:col-span-2">
+                    <span className="mb-2 block text-[12px] font-semibold uppercase tracking-[0.16em] text-foreground-400">Note (Optional)</span>
+                    <textarea
+                      value={createSessionReviewReason}
+                      onChange={event => setCreateSessionReviewReason(event.target.value.slice(0, 1000))}
+                      placeholder="Add any context for this additional Review..."
+                      rows={2}
+                      className="w-full rounded-lg border border-background-200 bg-white px-4 py-3 text-sm font-medium text-foreground-900 shadow-sm placeholder:text-foreground-400 focus:outline-none focus:ring-2 focus:ring-primary-200 resize-none"
+                    />
+                  </label>
+                </section>
+              )}
+
+              {createSessionType === 'review' && (
+                <p className="text-[12px] text-foreground-500">
+                  Fill in the meeting date/time below only if you want to schedule the Teams meeting now with
+                  <span className="font-semibold"> Add &amp; Schedule</span>. Otherwise, use
+                  <span className="font-semibold"> Add Review</span> to add it as Not Scheduled.
+                </p>
+              )}
+
+              <section className="grid gap-3 md:grid-cols-2">
+                <label className="block">
+                  <span className="mb-2 block text-[12px] font-semibold uppercase tracking-[0.16em] text-foreground-400">
+                    {createSessionType === 'review' ? 'Meeting date (for Add & Schedule)' : 'Date'}
+                  </span>
+                  <input
+                    type="date"
+                    value={createSessionDate}
+                    min={todayInputValue}
+                    onChange={event => setCreateSessionDate(event.target.value)}
+                    className="w-full rounded-lg border border-background-200 bg-white px-4 py-2.5 text-sm font-medium text-foreground-900 shadow-sm focus:outline-none focus:ring-2 focus:ring-primary-200"
+                  />
+                </label>
+
+                <label className="block">
+                  <span className="mb-2 block text-[12px] font-semibold uppercase tracking-[0.16em] text-foreground-400">
+                    {createSessionType === 'review' ? 'Meeting time (for Add & Schedule)' : 'Time'}
+                  </span>
+                  {createSessionType === 'review' ? (
+                    <>
+                      <select
+                        aria-label="Meeting time (UK time, Europe/London)"
+                        value={createSessionTime}
+                        disabled={createReviewAvailabilityLoading || Boolean(createReviewAvailabilityError) || !createReviewTimes.length}
+                        onChange={event => setCreateSessionTime(event.target.value)}
+                        className="w-full rounded-lg border border-background-200 bg-white px-4 py-2.5 text-sm font-medium text-foreground-900 shadow-sm focus:outline-none focus:ring-2 focus:ring-primary-200"
+                      >
+                        <option value="">{createReviewAvailabilityLoading ? 'Checking coach availability…' : 'Select an available UK time'}</option>
+                        {createReviewTimes.map(time => <option key={time} value={time}>{time}</option>)}
+                      </select>
+                      <span className="mt-1 block text-xs text-foreground-500">UK time (Europe/London)</span>
+                      {createReviewAvailabilityError && <span role="alert" className="mt-1 block text-xs text-red-700">{createReviewAvailabilityError} <button type="button" className="font-semibold underline" onClick={() => setCreateReviewAvailabilityRevision(value => value + 1)}>Retry</button></span>}
+                      {!createReviewAvailabilityLoading && !createReviewAvailabilityError && createSessionDate && !createReviewTimes.length && <span role="status" className="mt-1 block text-xs text-foreground-500">No available Review times for this date and duration.</span>}
+                    </>
+                  ) : (
+                    <input
+                      type="time"
+                      value={createSessionTime}
+                      onChange={event => setCreateSessionTime(event.target.value)}
+                      className="w-full rounded-lg border border-background-200 bg-white px-4 py-2.5 text-sm font-medium text-foreground-900 shadow-sm focus:outline-none focus:ring-2 focus:ring-primary-200"
+                    />
+                  )}
+                </label>
+              </section>
+
+              <section>
+                <label className="block">
+                  <span className="mb-2 block text-[12px] font-semibold uppercase tracking-[0.16em] text-foreground-400">Duration</span>
+                  <select
+                    value={createSessionDuration}
+                    onChange={event => setCreateSessionDuration(Number(event.target.value))}
+                    className="w-full rounded-lg border border-background-200 bg-white px-4 py-2.5 text-sm font-medium text-foreground-900 shadow-sm focus:outline-none focus:ring-2 focus:ring-primary-200"
+                  >
+                    {[30, 45, 60, 90].map(minutes => (
+                      <option key={minutes} value={minutes}>{minutes === 60 ? '1 hour' : `${minutes} minutes`}</option>
+                    ))}
+                  </select>
+                </label>
+              </section>
+
+              {createSessionType !== 'review' && (
+                <section>
+                  <label className="block">
+                    <span className="mb-2 block text-[12px] font-semibold uppercase tracking-[0.16em] text-foreground-400">Notes (Optional)</span>
+                    <textarea
+                      value={createSessionNotes}
+                      onChange={event => setCreateSessionNotes(event.target.value.slice(0, 500))}
+                      placeholder="Add CHANGE_ME the learner should know before the session..."
+                      rows={4}
+                      className="w-full rounded-lg border border-background-200 bg-white px-4 py-3 text-sm font-medium text-foreground-900 shadow-sm placeholder:text-foreground-400 focus:outline-none focus:ring-2 focus:ring-primary-200 resize-none"
+                    />
+                  </label>
+                  <p className="mt-1 text-[12px] text-foreground-400">{createSessionNotes.length}/500</p>
+                </section>
+              )}
+
+              {createSessionError && (
+                <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+                  {createSessionError}
+                </div>
+              )}
+
+              {createSessionType === 'review' && createSessionReviewPolicy?.learnerId === String(createSessionLearnerId) && createSessionReviewPolicy.detail && (
+                <p role="status" className="text-sm text-foreground-600">{createSessionReviewPolicy.detail}</p>
+              )}
+
+              <div className="flex flex-wrap items-center justify-end gap-3 border-t border-background-200/70 pt-3">
+                <button
+                  type="button"
+                  onClick={closeCreateSessionModal}
+                  className="rounded-lg border border-background-200 px-4 py-2.5 text-sm font-semibold text-foreground-600 transition-smooth hover:bg-background-100 cursor-pointer"
+                >
+                  Cancel
+                </button>
+                {createSessionType === 'review' ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => void handleAddLearnerReview(false)}
+                      disabled={!canAddLearnerReview || createSessionBusy || !createSessionLearnerId || !createSessionReviewTemplateId || !createSessionReviewTargetDate}
+                      className="inline-flex items-center gap-2 rounded-lg border border-primary-300 px-4 py-2.5 text-sm font-semibold text-primary-700 shadow-sm transition-smooth hover:bg-primary-50 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      <AppIcon className={`${createSessionBusy ? 'ri-loader-4-line animate-spin' : 'ri-file-add-line'} text-base`}></AppIcon>
+                      Add Review
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void handleAddLearnerReview(true)}
+                      disabled={
+                        !canAddLearnerReview || createSessionBusy || !createSessionLearnerId || !createSessionReviewTemplateId
+                        || !createSessionReviewTargetDate || !createSessionDate || !createSessionTime
+                        || createReviewAvailabilityLoading || Boolean(createReviewAvailabilityError) || !createReviewTimes.includes(createSessionTime)
+                      }
+                      className="inline-flex items-center gap-2 rounded-lg bg-primary-500 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition-smooth hover:bg-primary-600 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      <AppIcon className={`${createSessionBusy ? 'ri-loader-4-line animate-spin' : 'ri-calendar-check-line'} text-base`}></AppIcon>
+                      {createSessionBusy ? 'Adding...' : 'Add & Schedule'}
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={handleCreateSession}
+                    disabled={createSessionBusy || !createSessionLearnerId || !createSessionDate || !createSessionTime}
+                    className="inline-flex items-center gap-2 rounded-lg bg-primary-500 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition-smooth hover:bg-primary-600 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    <AppIcon className={`${createSessionBusy ? 'ri-loader-4-line animate-spin' : 'ri-calendar-check-line'} text-base`}></AppIcon>
+                    {createSessionBusy ? 'Booking...' : 'Book Session'}
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+          </div>
+      </PageContainer>
+
+      {scheduleModalOpen && (
+        <div className="fixed inset-0 z-[90] flex items-center justify-center bg-black/55 p-4 backdrop-blur-sm" onClick={closeScheduleModal}>
+          <div
+            className={`w-full ${scheduleModalCompact ? 'max-w-[560px]' : 'max-w-[720px]'} max-h-[88vh] overflow-y-auto rounded-2xl border border-background-200 bg-background-50 shadow-sm`}
+            onClick={event => event.stopPropagation()}
+          >
+            <div className="border-b border-background-200/70 bg-background-50 px-4 py-4 md:px-5">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <div className="mb-2 inline-flex items-center gap-2 rounded-full border border-primary-200 bg-primary-50 px-3 py-1 text-[12px] font-semibold text-primary-700">
+                    <AppIcon className="ri-calendar-schedule-line"></AppIcon>
+                    Coach Scheduler
+                  </div>
+                  <h2 className="text-[21px] font-heading font-bold tracking-tight text-foreground-950">{scheduleModalTitle}</h2>
+                  <p className="mt-1 text-[13px] leading-5 text-foreground-500">
+                    {scheduleModalDescription}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={closeScheduleModal}
+                  className="flex h-9 w-9 items-center justify-center rounded-lg border border-background-200 text-foreground-400 transition-smooth hover:bg-background-100 hover:text-foreground-700 cursor-pointer"
+                  aria-label="Close scheduler"
+                >
+                  <AppIcon className="ri-close-line text-base"></AppIcon>
+                </button>
+              </div>
+            </div>
+
+            <div className="space-y-4 px-4 py-4 md:px-5 md:py-5">
+              {scheduleModalCompact && CHANGE_MEScheduleEvent && (
+                <section className="rounded-xl border border-background-200 bg-white p-4">
+                  <div className="flex items-start gap-3">
+                    <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-primary-50 text-primary-700">
+                      <AppIcon className="ri-calendar-event-line text-base"></AppIcon>
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <div className="mb-1 flex flex-wrap items-center gap-1.5">
+                        <span className="rounded-full bg-primary-50 px-2 py-0.5 text-[11px] font-bold text-primary-700">
+                          {eventSourceLabel(scheduleModalType)}
+                        </span>
+                        <span className={`rounded-full px-2 py-0.5 text-[11px] font-semibold ${statusPillClass(CHANGE_MEScheduleEvent.status)}`}>
+                          {statusLabel(CHANGE_MEScheduleEvent.status)}
+                        </span>
+                      </div>
+                      <p className="truncate text-sm font-heading font-bold text-foreground-950">{CHANGE_MEScheduleEvent.title}</p>
+                      <p className="mt-1 truncate text-[12px] font-medium text-foreground-500">
+                        {CHANGE_MEScheduleEvent.learner || 'Learner'}
+                        {CHANGE_MEScheduleEvent.programme ? ` - ${CHANGE_MEScheduleEvent.programme}` : ''}
+                      </p>
+                    </div>
+                  </div>
+                </section>
+              )}
+
+              {!scheduleModalCompact && (
+              <section>
+                <div className="mb-2">
+                  <div>
+                    <p className="text-[12px] font-semibold uppercase tracking-[0.18em] text-foreground-400">Source</p>
+                    <p className="mt-1 text-[12px] text-foreground-500">Pick the queue.</p>
+                  </div>
+                </div>
+                <div className="grid gap-3 md:grid-cols-4">
+                  {SCHEDULABLE_SOURCE_ORDER.map(source => {
+                    const isActive = scheduleModalType === source;
+                    const meta = SCHEDULABLE_SOURCE_META[source];
+                    return (
+                      <button
+                        key={source}
+                        type="button"
+                        onClick={() => setScheduleModalType(source)}
+                        className={`rounded-lg border px-3.5 py-3 text-left transition-smooth cursor-pointer ${
+                          isActive
+                            ? 'border-primary-300 bg-primary-50 shadow-sm ring-2 ring-primary-100'
+                            : 'border-background-200 bg-white hover:border-primary-200 hover:bg-primary-50/40'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-3">
+                          <span className={`flex h-10 w-10 items-center justify-center rounded-lg bg-gradient-to-br ${meta.surface} ${meta.accent}`}>
+                            <AppIcon className={`${meta.icon} text-base`}></AppIcon>
+                          </span>
+                          <span className={`rounded-full px-2 py-0.5 text-[12px] font-semibold ${isActive ? 'bg-primary-500 text-white' : 'bg-background-100 text-foreground-500'}`}>
+                            {scheduleSourceCounts[source]}
+                          </span>
+                        </div>
+                        <p className="mt-2 text-[15px] font-heading font-semibold text-foreground-950">{eventSourceLabel(source)}</p>
+                        <p className="mt-0.5 text-[12px] leading-5 text-foreground-500">{meta.description}</p>
+                      </button>
+                    );
+                  })}
+                </div>
+              </section>
+              )}
+
+              {scheduleTypeEvents.length === 0 ? (
+                <div className="rounded-2xl border border-dashed border-background-300 bg-background-100/60 px-4 py-8 text-center">
+                  <span className="mx-auto mb-3 flex h-10 w-10 items-center justify-center rounded-lg bg-background-50 text-foreground-300">
+                    <AppIcon className="ri-inbox-archive-line text-lg"></AppIcon>
+                  </span>
+                  <p className="text-sm font-semibold text-foreground-800">No {eventSourceLabel(scheduleModalType).toLowerCase()} items are available right now.</p>
+                  <p className="mt-1 text-[12px] text-foreground-500">
+                    Switch source or come back when a learner item is ready to be placed on the calendar.
+                  </p>
+                </div>
+              ) : (
+                <>
+                  {!scheduleModalCompact && (
+                  <section>
+                    <div className="mb-2 flex items-center justify-between gap-3">
+                      <div>
+                        <p className="text-[12px] font-semibold uppercase tracking-[0.16em] text-foreground-400">Selection</p>
+                        <p className="mt-1 text-[12px] text-foreground-500">Choose learner first, then the session.</p>
+                      </div>
+                      <span className="rounded-full bg-background-100 px-2.5 py-1 text-[12px] font-semibold text-foreground-500">
+                        {scheduleLearnerOptions.length} learner{scheduleLearnerOptions.length === 1 ? '' : 's'}
+                      </span>
+                    </div>
+                    <div className="grid gap-3 md:grid-cols-2">
+                      <div>
+                        <div className="mb-2 flex items-center justify-between gap-2">
+                          <p className="text-[12px] font-semibold uppercase tracking-[0.16em] text-foreground-400">Learner</p>
+                          <span className="rounded-full bg-background-100 px-2 py-0.5 text-[12px] font-semibold text-foreground-500">
+                            {scheduleLearnerOptions.length}
+                          </span>
+                        </div>
+                        <ThemedSelect
+                          value={scheduleModalLearnerKey}
+                          options={scheduleLearnerOptions}
+                          onChange={setScheduleModalLearnerKey}
+                          placeholder="Choose learner"
+                          className="w-full"
+                          buttonClassName="h-[50px] rounded-lg border-background-200 px-4 text-sm font-medium shadow-sm hover:border-primary-200 focus:border-primary-300 focus:ring-primary-100"
+                          menuClassName="rounded-lg border-background-200 py-2 shadow-sm"
+                        />
+                      </div>
+                      <div>
+                        <div className="mb-2 flex items-center justify-between gap-2">
+                          <p className="text-[12px] font-semibold uppercase tracking-[0.16em] text-foreground-400">Session</p>
+                          <span className="rounded-full bg-background-100 px-2 py-0.5 text-[12px] font-semibold text-foreground-500">
+                            {scheduleEventOptions.length}
+                          </span>
+                        </div>
+                        <ThemedSelect
+                          value={scheduleModalEventKey}
+                          options={scheduleEventSelectOptions}
+                          onChange={setScheduleModalEventKey}
+                          placeholder="Choose session"
+                          disabled={!scheduleModalLearnerKey || scheduleEventSelectOptions.length === 0}
+                          className="w-full"
+                          buttonClassName="h-[50px] rounded-lg border-background-200 px-4 text-sm font-medium shadow-sm hover:border-primary-200 focus:border-primary-300 focus:ring-primary-100"
+                          menuClassName="rounded-lg border-background-200 py-2 shadow-sm"
+                        />
+                      </div>
+                    </div>
+                    {CHANGE_MEScheduleEvent && (
+                      <div className="mt-2 flex flex-wrap items-center gap-2">
+                          <span className="rounded-full border border-background-200 bg-background-50 px-3 py-1 text-[12px] font-semibold text-foreground-900">
+                            {CHANGE_MEScheduleEvent.learner || 'Learner'}
+                          </span>
+                          {CHANGE_MEScheduleEvent.programme && (
+                            <span className="rounded-full border border-background-200 bg-background-50 px-3 py-1 text-[12px] text-foreground-600">
+                              {CHANGE_MEScheduleEvent.programme}
+                            </span>
+                          )}
+                          <span className="rounded-full border border-background-200 bg-background-50 px-3 py-1 text-[12px] text-foreground-600">
+                            Due {formatCompactDate(CHANGE_MEScheduleEvent.targetDate || CHANGE_MEScheduleEvent.date)}
+                          </span>
+                      </div>
+                    )}
+                  </section>
+                  )}
+
+                  <section>
+                    <div className="mb-2">
+                      <p className="text-[12px] font-semibold uppercase tracking-[0.16em] text-foreground-400">Schedule Details</p>
+                      <p className="mt-1 text-[12px] text-foreground-500">Set date, time, and duration.</p>
+                    </div>
+                  </section>
+
+                  <section className="grid gap-3 md:grid-cols-3">
+                    <label className="block">
+                      <ScheduleFieldLabel>Date</ScheduleFieldLabel>
+                      <ModernDatePicker
+                        value={scheduleModalDate}
+                        onChange={setScheduleModalDate}
+                      />
+                    </label>
+
+                    <label className="block">
+                      <ScheduleFieldLabel>{isReviewSchedule ? 'Time (UK time · Europe/London)' : 'Time'}</ScheduleFieldLabel>
+                      {isReviewSchedule ? (
+                        <>
+                          <select
+                            aria-label="Schedule time (UK time, Europe/London)"
+                            value={scheduleModalTime}
+                            disabled={scheduleReviewAvailabilityLoading || Boolean(scheduleReviewAvailabilityError) || !scheduleReviewTimes.length}
+                            onChange={event => setScheduleModalTime(event.target.value)}
+                            className="w-full rounded-lg border border-background-200 bg-white px-4 py-2.5 text-sm font-medium text-foreground-900 shadow-sm focus:outline-none focus:ring-2 focus:ring-primary-200"
+                          >
+                            <option value="">{scheduleReviewAvailabilityLoading ? 'Checking coach availability…' : 'Select an available UK time'}</option>
+                            {scheduleReviewTimes.map(time => <option key={time} value={time}>{time}</option>)}
+                          </select>
+                          {scheduleReviewAvailabilityError && <p role="alert" className="mt-1 text-xs text-red-700">{scheduleReviewAvailabilityError} <button type="button" className="font-semibold underline" onClick={() => setScheduleReviewAvailabilityRevision(value => value + 1)}>Retry</button></p>}
+                          {!scheduleReviewAvailabilityLoading && !scheduleReviewAvailabilityError && scheduleModalDate && !scheduleReviewTimes.length && <p role="status" className="mt-1 text-xs text-foreground-500">No available Review times for this date and duration.</p>}
+                        </>
+                      ) : (
+                        <ScheduleTimeInput value={scheduleModalTime} onChange={setScheduleModalTime} />
+                      )}
+                    </label>
+
+                    <label className="block">
+                      <ScheduleFieldLabel>Duration</ScheduleFieldLabel>
+                      <ModernDurationPicker
+                        value={scheduleModalDuration}
+                        onChange={setScheduleModalDuration}
+                      />
+                    </label>
+                  </section>
+
+                  {CHANGE_MEScheduleEvent && !scheduleModalCompact && (
+                    <section className="rounded-lg border border-primary-200/70 bg-primary-50/60 px-3.5 py-3">
+                      <div className="flex flex-wrap items-center gap-1.5 text-[12px] text-foreground-700">
+                        <span className="rounded-full bg-white px-2.5 py-1 font-semibold text-foreground-900">{eventSourceLabel(scheduleModalType)}</span>
+                        <span className="rounded-full bg-white px-2.5 py-1">{CHANGE_MEScheduleEvent.learner || 'Learner'}</span>
+                        <span className="rounded-full bg-white px-2.5 py-1">{scheduleModalDate || 'Choose date'}</span>
+                        <span className="rounded-full bg-white px-2.5 py-1">{scheduleModalTime || '09:00'}</span>
+                        <span className="rounded-full bg-white px-2.5 py-1">{scheduleModalDuration} min</span>
+                      </div>
+                      {CHANGE_MEScheduleEventNotes && (
+                        <p className="mt-2 text-[12px] leading-5 text-foreground-500">
+                          {CHANGE_MEScheduleEventNotes}
+                        </p>
+                      )}
+                    </section>
+                  )}
+                </>
+              )}
+
+              {scheduleModalFeedback && (
+                <div className={`rounded-2xl border px-4 py-3 text-sm ${
+                  scheduleModalError
+                    ? 'border-red-200 bg-red-50 text-red-700'
+                    : 'border-amber-200 bg-amber-50 text-amber-800'
+                }`}>
+                  {scheduleModalFeedback}
+                </div>
+              )}
+
+              <div className="flex flex-wrap items-center justify-between gap-3 border-t border-background-200/70 pt-3">
+                <p className="text-[12px] text-foreground-500">
+                  {scheduleModalCompact
+                    ? 'This updates the calendar slot and Teams meeting details.'
+                    : scheduleNeedsApproval
+                      ? 'LMS introduction requests become Teams meetings when scheduled.'
+                      : 'This places the session on the coach calendar and updates its Teams meeting details.'}
+                </p>
+                <div className="flex items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={closeScheduleModal}
+                    className="rounded-lg border border-background-200 px-4 py-2.5 text-sm font-semibold text-foreground-600 transition-smooth hover:bg-background-100 cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleModalScheduleSave}
+                    disabled={scheduleModalBusy || !CHANGE_MEScheduleEvent || !scheduleModalDate || !scheduleModalTime
+                      || (isReviewSchedule && (scheduleReviewAvailabilityLoading || Boolean(scheduleReviewAvailabilityError) || !scheduleReviewTimes.includes(scheduleModalTime)))}
+                    className="inline-flex items-center gap-2 rounded-lg bg-primary-500 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition-smooth hover:bg-primary-600 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    <AppIcon className={`${scheduleModalBusy ? 'ri-loader-4-line animate-spin' : 'ri-calendar-check-line'} text-base`}></AppIcon>
+                    {scheduleModalBusy ? 'Scheduling...' : scheduleActionLabel(CHANGE_MEScheduleEvent)}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+      {progressReviewCompletionEvent && (
+        <ProgressReviewCompletionModal
+          key={eventIdentity(progressReviewCompletionEvent)}
+          event={progressReviewCompletionEvent}
+          busy={eventActionBusy}
+          error={eventActionError}
+          onClose={() => {
+            if (!eventActionBusy) setProgressReviewCompletionEvent(null);
+          }}
+          onSubmit={handleProgressReviewSubmit}
+        />
+      )}
+      <CalendarColorPreferencesDrawer
+        open={colorPreferencesOpen}
+        value={calendarColors}
+        onClose={handleCloseColorPreferences}
+        onSave={handleCalendarColorsSave}
+        activeMeetingTypeKeys={activeMeetingTypeKeys}
+      />
+      {supportBookingEvent && <ImportedReviewBookingDialog
+        event={supportBookingEvent as CoachCalendarEvent}
+        viewingAsCoach={coach.isViewingAsCoach}
+        onClose={() => setSupportBookingEvent(null)}
+        onSaved={(saved, notice, options) => {
+          const day = new Date(`${saved.scheduledDate}T00:00:00`);
+          const [hour, minute] = (saved.scheduledTime || '09:00').split(':').map(Number);
+          const startHour = hour + minute / 60;
+          const updated = { ...supportBookingEvent, ...saved, date: saved.scheduledDate || undefined,
+            year: day.getFullYear(), month: day.getMonth(), dayOfMonth: day.getDate(),
+            dayOfWeek: ((day.getDay() + 6) % 7) as TimetableEvent['dayOfWeek'],
+            startHour, endHour: startHour + (saved.durationMinutes || 60) / 60,
+            isTimeEstimated: false,
+          } as TimetableEvent;
+          updateSingleEvent(updated);
+          focusEventOnCalendar(updated);
+          setEventActionNotice(notice);
+          if (!options?.keepOpen) setSupportBookingEvent(null);
+        }}
+      />}
+    </WorkspaceShell>
+  );
+}
+

@@ -1,0 +1,845 @@
+import { LoadingSkeleton } from '@/components/feature/LoadingSkeleton';
+import { useEffect, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { WorkspaceShell } from '@/components/feature/WorkspaceShell';
+import { WorkspaceHeroBanner } from '@/components/feature/WorkspaceHeroBanner';
+import { roleNavMap } from '@/mocks/navigation';
+import {
+  fetchClubs, createClub as apiCreateClub, updateClub, deleteClub as apiDeleteClub,
+  addClubMeeting, updateClubMeeting, deleteClubMeeting,
+  fetchClubMembers, assignClubMember, removeClubMember,
+  fetchClubMeetingAttendance, saveClubMeetingAttendance,
+  type EngagementClub as Club, type EngagementClubMeeting as ClubMeeting, type ClubMember,
+  type AttendanceRosterEntry,
+} from '@/api/engagement';
+import { ClubCardSkeletonGrid } from '@/pages/engagement/EngagementSkeletons';
+import { useOperatorIdentity } from '@/hooks/useOperatorIdentity';
+import { LearnerPickerModal } from '@/pages/engagement/LearnerPickerModal';
+
+const engagementNav = roleNavMap.engagement;
+const CLUB_ACTION_FOCUS = 'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-300 focus-visible:ring-offset-1';
+const CLUB_ACTION_LAYOUT = 'inline-flex min-h-9 items-center justify-center gap-1.5 rounded-lg px-3 py-2 text-xs font-semibold transition-smooth cursor-pointer whitespace-nowrap';
+const CLUB_GRID_LAYOUT = 'grid grid-cols-[repeat(auto-fit,minmax(min(100%,30rem),1fr))] items-stretch gap-4';
+const CLUB_PRIMARY_ACTION = `border border-[#E6DDCD] bg-[#F7F2E9] text-[#73552F] shadow-none hover:bg-[#EEE5D5] active:bg-[#E7DCC8] [html[data-theme=dark]_&]:border-[#5C5140] [html[data-theme=dark]_&]:bg-[#373128] [html[data-theme=dark]_&]:text-[#DDC9A7] [html[data-theme=dark]_&]:hover:bg-[#453C2F] [html[data-theme=dark]_&]:active:bg-[#504535] ${CLUB_ACTION_FOCUS}`;
+const CLUB_SECONDARY_ACTION = `border border-[#E5DEED] bg-[#F5F2F8] text-[#655575] shadow-none hover:bg-[#ECE6F2] active:bg-[#E3DAEC] [html[data-theme=dark]_&]:border-[#55485F] [html[data-theme=dark]_&]:bg-[#302836] [html[data-theme=dark]_&]:text-[#D8CBE4] [html[data-theme=dark]_&]:hover:bg-[#3C3145] [html[data-theme=dark]_&]:active:bg-[#473A52] ${CLUB_ACTION_FOCUS}`;
+const CLUB_FILTER_ACTIVE = 'border-[#D5C6E2] bg-[#ECE5F2] text-[#5D4671] shadow-none [html[data-theme=dark]_&]:border-[#62536D] [html[data-theme=dark]_&]:bg-[#393040] [html[data-theme=dark]_&]:text-[#E1D4EA]';
+
+// Clubs are organised by location (city/region). KBC does not provide
+// transport, so each club groups the learners who live near each other and
+// meets locally. Clubs exist mainly to build community and networking through
+// meetings — some are scheduled during the learning period, others are held
+// ad-hoc, so meetings are UNSCHEDULED by default with the option to add a date.
+// Club/ClubMeeting types are imported from the api module.
+
+function formatMeetingDate(date?: string) {
+  if (!date) return '';
+  const d = new Date(date + 'T00:00:00');
+  if (isNaN(d.getTime())) return date;
+  return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+}
+
+// Human "time remaining until the meeting starts" — used in the email reminder.
+function remainingLabel(date?: string, time?: string) {
+  if (!date) return 'Not scheduled yet';
+  const dt = new Date(`${date}T${time || '00:00'}:00`);
+  if (isNaN(dt.getTime())) return '';
+  const diff = dt.getTime() - Date.now();
+  if (diff <= 0) return 'Already started or passed';
+  const mins = Math.floor(diff / 60000);
+  const days = Math.floor(mins / 1440);
+  const hours = Math.floor((mins % 1440) / 60);
+  const rem = mins % 60;
+  if (days > 0) return `in ${days} day${days > 1 ? 's' : ''}${hours ? ` ${hours}h` : ''}`;
+  if (hours > 0) return `in ${hours}h${rem ? ` ${rem}m` : ''}`;
+  return `in ${rem} minute${rem === 1 ? '' : 's'}`;
+}
+
+export default function EngagementClubsPage() {
+  const navigate = useNavigate();
+  const operator = useOperatorIdentity();
+  const [clubs, setClubs] = useState<Club[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [customLocations, setCustomLocations] = useState<string[]>([]);
+  const [locationFilter, setLocationFilter] = useState<string>('all');
+  const [activeOnly, setActiveOnly] = useState(true);
+
+  // Ambassadors can create new meetings on a club (each club makes its own).
+  // Meetings live inside their club (single source of truth) and start
+  // UNSCHEDULED — a date can be added later via the meeting manager.
+  const [addingClubId, setAddingClubId] = useState<string | null>(null);
+  const [draftTitle, setDraftTitle] = useState('');
+
+  // Per-meeting manager modal — edit details, schedule, delete, or email students.
+  const [meetingCtx, setMeetingCtx] = useState<{ clubId: string; meetingId: string } | null>(null);
+  const [meetingForm, setMeetingForm] = useState({ title: '', date: '', time: '', venue: '' });
+  const [emailMsg, setEmailMsg] = useState('');
+
+  // Lightweight confirmation toast.
+  const [toast, setToast] = useState<{ msg: string; kind: 'success' | 'error' } | null>(null);
+
+  // Add a new location/city to the filter (works even before a club exists there).
+  const [addingLocation, setAddingLocation] = useState(false);
+  const [draftLocation, setDraftLocation] = useState('');
+
+  // Create a new club.
+  const emptyClubForm = { name: '', location: '', description: '', ambassador: '', ambassadorRole: '' };
+  const [creatingClub, setCreatingClub] = useState(false);
+  const [clubForm, setClubForm] = useState(emptyClubForm);
+
+  // Manage (edit / activate / delete) an existing club.
+  const [managingClubId, setManagingClubId] = useState<string | null>(null);
+  const [manageForm, setManageForm] = useState({ description: '', ambassador: '', ambassadorRole: '' });
+
+  // Staff-assigned membership — learners never join themselves.
+  const [membersClubId, setMembersClubId] = useState<string | null>(null);
+  const [members, setMembers] = useState<ClubMember[]>([]);
+  const [membersLoading, setMembersLoading] = useState(false);
+  const [showLearnerPicker, setShowLearnerPicker] = useState(false);
+
+  // Attendance modal — mark which members showed up to a meeting. Marking
+  // 'present' awards club_meeting_attended points server-side.
+  const [attendanceCtx, setAttendanceCtx] = useState<{ clubId: string; meetingId: string; meetingTitle: string } | null>(null);
+  const [attendanceRoster, setAttendanceRoster] = useState<AttendanceRosterEntry[]>([]);
+  const [attendanceLoading, setAttendanceLoading] = useState(false);
+  const [attendanceSaving, setAttendanceSaving] = useState(false);
+  const [attendanceDraft, setAttendanceDraft] = useState<Record<string, 'present' | 'absent'>>({});
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchClubs()
+      .then(data => { if (!cancelled) setClubs(data); })
+      .catch(err => { if (!cancelled) setToast({ msg: err.message || 'Could not load clubs', kind: 'error' }); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, []);
+
+  const locations = ['all', ...Array.from(new Set([...clubs.map(c => c.location), ...customLocations]))];
+
+  const filtered = clubs.filter(c => {
+    const matchLoc = locationFilter === 'all' || c.location === locationFilter;
+    const matchActive = !activeOnly || c.active;
+    return matchLoc && matchActive;
+  });
+
+  const totalMembers = clubs.reduce((s, c) => s + c.members, 0);
+  const liveMeetings = clubs.flatMap(c => c.meetings);
+  const scheduledCount = liveMeetings.filter(m => m.scheduled).length;
+  const unscheduledCount = liveMeetings.length - scheduledCount;
+
+  const showToast = (msg: string, kind: 'success' | 'error' = 'success') => { setToast({ msg, kind }); window.setTimeout(() => setToast(null), 3500); };
+
+  const addMeeting = async (clubId: string) => {
+    const title = draftTitle.trim();
+    if (!title) return;
+    try {
+      const created = await addClubMeeting(clubId, { title });
+      setClubs(prev => prev.map(c => (c.id === clubId ? { ...c, meetings: [...c.meetings, created] } : c)));
+      setDraftTitle('');
+      setAddingClubId(null);
+    } catch (err: any) {
+      showToast(err.message || 'Could not add meeting', 'error');
+    }
+  };
+
+  const openMeeting = (club: Club, m: ClubMeeting) => {
+    setMeetingCtx({ clubId: club.id, meetingId: m.id });
+    setMeetingForm({ title: m.title, date: m.date ?? '', time: m.time ?? '', venue: m.venue ?? '' });
+    setEmailMsg(`Hi everyone,\n\nA quick reminder about our upcoming "${m.title}" meetup for ${club.name}. Hope to see you there!\n\n${club.ambassador}`);
+  };
+  const saveMeeting = async () => {
+    if (!meetingCtx) return;
+    const title = meetingForm.title.trim() || 'Untitled meeting';
+    const scheduled = !!meetingForm.date;
+    try {
+      const updated = await updateClubMeeting(meetingCtx.clubId, meetingCtx.meetingId, {
+        title,
+        scheduled,
+        date: meetingForm.date || null,
+        time: meetingForm.time || null,
+        venue: meetingForm.venue.trim() || null,
+      });
+      setClubs(prev => prev.map(c => c.id === meetingCtx.clubId
+        ? { ...c, meetings: c.meetings.map(m => m.id === meetingCtx.meetingId ? updated : m) }
+        : c));
+      setMeetingCtx(null);
+      showToast('Meeting saved');
+    } catch (err: any) {
+      showToast(err.message || 'Could not save meeting', 'error');
+    }
+  };
+  const deleteMeeting = async () => {
+    if (!meetingCtx) return;
+    try {
+      await deleteClubMeeting(meetingCtx.clubId, meetingCtx.meetingId);
+      setClubs(prev => prev.map(c => c.id === meetingCtx.clubId
+        ? { ...c, meetings: c.meetings.filter(m => m.id !== meetingCtx.meetingId) }
+        : c));
+      setMeetingCtx(null);
+      showToast('Meeting deleted');
+    } catch (err: any) {
+      showToast(err.message || 'Could not delete meeting', 'error');
+    }
+  };
+  const sendMeetingEmail = (recipients: number, clubName: string) => {
+    setMeetingCtx(null);
+    showToast(`Reminder emailed to ${recipients} learner${recipients === 1 ? '' : 's'} in ${clubName}`);
+  };
+
+  const openAttendance = async (club: Club, meeting: ClubMeeting) => {
+    setAttendanceCtx({ clubId: club.id, meetingId: meeting.id, meetingTitle: meeting.title });
+    setAttendanceLoading(true);
+    try {
+      const roster = await fetchClubMeetingAttendance(club.id, meeting.id);
+      setAttendanceRoster(roster);
+      const draft: Record<string, 'present' | 'absent'> = {};
+      roster.forEach(r => { if (r.status) draft[r.learnerId] = r.status; });
+      setAttendanceDraft(draft);
+    } catch (err: any) {
+      showToast(err.message || 'Could not load attendance', 'error');
+      setAttendanceCtx(null);
+    } finally {
+      setAttendanceLoading(false);
+    }
+  };
+
+  const setMark = (learnerId: string, status: 'present' | 'absent') => {
+    setAttendanceDraft(prev => ({ ...prev, [learnerId]: status }));
+  };
+
+  const markAll = (status: 'present' | 'absent') => {
+    const draft: Record<string, 'present' | 'absent'> = {};
+    attendanceRoster.forEach(r => { draft[r.learnerId] = status; });
+    setAttendanceDraft(draft);
+  };
+
+  const saveAttendance = async () => {
+    if (!attendanceCtx) return;
+    const records = attendanceRoster
+      .filter(r => attendanceDraft[r.learnerId])
+      .map(r => ({ learnerId: r.learnerId, learnerName: r.learnerName, status: attendanceDraft[r.learnerId] }));
+    if (records.length === 0) { showToast('Mark at least one learner before saving', 'error'); return; }
+    setAttendanceSaving(true);
+    try {
+      const { meeting, roster } = await saveClubMeetingAttendance(attendanceCtx.clubId, attendanceCtx.meetingId, records);
+      setClubs(prev => prev.map(c => c.id === attendanceCtx.clubId
+        ? { ...c, meetings: c.meetings.map(m => m.id === attendanceCtx.meetingId ? meeting : m) }
+        : c));
+      setAttendanceRoster(prev => prev.map(r => roster.find(saved => saved.learnerId === r.learnerId) ?? r));
+      const presentCount = records.filter(r => r.status === 'present').length;
+      showToast(`Attendance saved — ${presentCount} learner${presentCount === 1 ? '' : 's'} marked present`);
+      setAttendanceCtx(null);
+    } catch (err: any) {
+      showToast(err.message || 'Could not save attendance', 'error');
+    } finally {
+      setAttendanceSaving(false);
+    }
+  };
+
+  const addLocation = () => {
+    const loc = draftLocation.trim();
+    if (!loc) return;
+    if (!locations.includes(loc)) setCustomLocations(prev => [...prev, loc]);
+    setLocationFilter(loc);
+    setDraftLocation('');
+    setAddingLocation(false);
+  };
+
+  const createClub = async () => {
+    const name = clubForm.name.trim();
+    const location = clubForm.location.trim();
+    if (!name || !location) return;
+    try {
+      const created = await apiCreateClub({
+        name,
+        location,
+        description: clubForm.description.trim() || `A local community for ${location} learners to meet, network, and connect.`,
+        ambassador: clubForm.ambassador.trim() || 'Unassigned',
+        ambassadorRole: clubForm.ambassadorRole.trim() || `${location} Ambassador`,
+      });
+      setClubs(prev => [...prev, created]);
+      setLocationFilter(location);
+      setClubForm(emptyClubForm);
+      setCreatingClub(false);
+      showToast(`${created.name} created`);
+    } catch (err: any) {
+      showToast(err.message || 'Could not create club', 'error');
+    }
+  };
+
+  const openManage = (club: Club) => {
+    setManagingClubId(club.id);
+    setManageForm({ description: club.description, ambassador: club.ambassador, ambassadorRole: club.ambassadorRole });
+  };
+  const saveManage = async () => {
+    if (!managingClubId) return;
+    try {
+      const updated = await updateClub(managingClubId, {
+        description: manageForm.description,
+        ambassador: manageForm.ambassador,
+        ambassadorRole: manageForm.ambassadorRole,
+      });
+      setClubs(prev => prev.map(c => (c.id === managingClubId ? updated : c)));
+      setManagingClubId(null);
+      showToast('Club updated');
+    } catch (err: any) {
+      showToast(err.message || 'Could not update club', 'error');
+    }
+  };
+  const toggleActive = async (clubId: string) => {
+    const club = clubs.find(c => c.id === clubId);
+    if (!club) return;
+    try {
+      const updated = await updateClub(clubId, { active: !club.active });
+      setClubs(prev => prev.map(c => (c.id === clubId ? updated : c)));
+    } catch (err: any) {
+      showToast(err.message || 'Could not update club', 'error');
+    }
+  };
+  const deleteClub = async (clubId: string) => {
+    const club = clubs.find(c => c.id === clubId);
+    try {
+      await apiDeleteClub(clubId);
+      setClubs(prev => prev.filter(c => c.id !== clubId));
+      setManagingClubId(null);
+      if (club) showToast(`${club.name} deleted`);
+    } catch (err: any) {
+      showToast(err.message || 'Could not delete club', 'error');
+    }
+  };
+
+  useEffect(() => {
+    if (!membersClubId) { setMembers([]); return; }
+    let cancelled = false;
+    setMembersLoading(true);
+    fetchClubMembers(membersClubId)
+      .then(data => { if (!cancelled) setMembers(data); })
+      .catch(err => { if (!cancelled) showToast(err.message || 'Could not load members', 'error'); })
+      .finally(() => { if (!cancelled) setMembersLoading(false); });
+    return () => { cancelled = true; };
+  }, [membersClubId]);
+
+  const refreshClubMemberCount = (clubId: string, delta: number) => {
+    setClubs(prev => prev.map(c => c.id === clubId ? { ...c, members: Math.max(0, c.members + delta) } : c));
+  };
+
+  const assignMember = async (learner: { id: string; name: string }) => {
+    if (!membersClubId) return;
+    try {
+      const result = await assignClubMember(membersClubId, { learnerId: learner.id, learnerName: learner.name });
+      setMembers(prev => prev.some(m => m.learnerId === learner.id) ? prev : [...prev, result].sort((a, b) => a.learnerName.localeCompare(b.learnerName)));
+      refreshClubMemberCount(membersClubId, 1);
+      setShowLearnerPicker(false);
+    } catch (err: any) {
+      showToast(err.message || 'Could not assign learner', 'error');
+    }
+  };
+
+  const removeMember = async (learnerId: string) => {
+    if (!membersClubId) return;
+    try {
+      await removeClubMember(membersClubId, learnerId);
+      setMembers(prev => prev.filter(m => m.learnerId !== learnerId));
+      refreshClubMemberCount(membersClubId, -1);
+    } catch (err: any) {
+      showToast(err.message || 'Could not remove learner', 'error');
+    }
+  };
+
+  const managingClub = clubs.find(c => c.id === managingClubId) ?? null;
+  const membersClub = clubs.find(c => c.id === membersClubId) ?? null;
+  const managingMeeting = (() => {
+    if (!meetingCtx) return null;
+    const club = clubs.find(c => c.id === meetingCtx.clubId);
+    const meeting = club?.meetings.find(m => m.id === meetingCtx.meetingId);
+    return club && meeting ? { club, meeting } : null;
+  })();
+
+  return (
+    <WorkspaceShell
+      role="engagement" roleLabel={engagementNav.label} navItems={engagementNav.items} workspaceLabel={engagementNav.workspaceLabel}
+      pageTitle="Learner Clubs" pageSubtitle="Local community clubs that bring nearby learners together to meet, network, and connect"
+      userName={operator.name} userRole={operator.role}
+    >
+      <div className="ml-0 mr-auto w-full !max-w-7xl p-4 sm:p-6 space-y-5">
+        <WorkspaceHeroBanner
+          className="[&_.workspace-hero-description]:max-w-[70ch] [&_.workspace-hero-banner__stats]:gap-2 [&_.workspace-hero-metric]:flex-1"
+          title="Learner Clubs"
+          description={`${clubs.length} location-based clubs. ${totalMembers} learners joined. ${scheduledCount} meetings scheduled, ${unscheduledCount} awaiting a date. Clubs are grouped by where learners live so meeting up locally is easy — no travel required.`}
+          icon="ri-team-line"
+          imageUrl="https://readdy.ai/api/search-image?query=UK%20learner%20clubs%20group%20collaboration%20teamwork%20warm%20modern%20office%20professional&width=400&height=160&seq=clubs-01&orientation=landscape"
+          imageAlt="Learner Clubs"
+          stats={[{ label: 'Clubs', value: String(clubs.length) }, { label: 'Members', value: String(totalMembers) }, { label: 'Scheduled', value: String(scheduledCount) }]}
+        />
+
+        {/* Quick access */}
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="w-full sm:w-auto text-xs font-semibold text-foreground-500 mr-1">Quick access:</span>
+          <button onClick={() => navigate('/engagement/events')} className={`${CLUB_ACTION_LAYOUT} ${CLUB_ACTION_FOCUS} bg-background-50 border border-foreground-200/60 text-foreground-600 hover:bg-primary-50 hover:text-primary-600 hover:border-primary-200/50`}>
+            <AppIcon className="ri-calendar-event-line text-sm"></AppIcon> Events
+          </button>
+          <button onClick={() => navigate('/engagement/recognition')} className={`${CLUB_ACTION_LAYOUT} ${CLUB_ACTION_FOCUS} bg-background-50 border border-foreground-200/60 text-foreground-600 hover:bg-accent-50 hover:text-accent-600 hover:border-accent-200/50`}>
+            <AppIcon className="ri-thumb-up-line text-sm"></AppIcon> Recognition
+          </button>
+          <button onClick={() => navigate('/engagement/points-rules')} className={`${CLUB_ACTION_LAYOUT} ${CLUB_ACTION_FOCUS} bg-background-50 border border-foreground-200/60 text-foreground-600 hover:bg-secondary-50 hover:text-secondary-600 hover:border-secondary-200/50`}>
+            <AppIcon className="ri-gift-2-line text-sm"></AppIcon> Points Rules
+          </button>
+          <button onClick={() => navigate('/engagement/learner-engagement')} className={`${CLUB_ACTION_LAYOUT} ${CLUB_ACTION_FOCUS} bg-background-50 border border-foreground-200/60 text-foreground-600 hover:bg-amber-50 hover:text-amber-600 hover:border-amber-200/50`}>
+            <AppIcon className="ri-heart-line text-sm"></AppIcon> Learner Engagement
+          </button>
+        </div>
+
+        {/* Location filter + create actions */}
+        <div className="flex items-center gap-3 flex-wrap rounded-xl border border-foreground-200/60 bg-background-50 p-3 sm:p-4">
+          <div className="flex max-w-full items-center gap-1 bg-background-100 rounded-lg p-1 overflow-x-auto">
+            {locations.map(loc => (
+              <button key={loc} onClick={() => setLocationFilter(loc)} aria-pressed={locationFilter === loc} className={`min-h-9 px-3 py-2 rounded-md border text-xs font-semibold transition-smooth whitespace-nowrap cursor-pointer ${CLUB_ACTION_FOCUS} ${locationFilter === loc ? CLUB_FILTER_ACTIVE : 'border-transparent text-foreground-500 hover:text-foreground-700'}`}>
+                {loc === 'all' ? 'All locations' : loc}
+              </button>
+            ))}
+          </div>
+
+          {/* Add a new location/city to the filter */}
+          {addingLocation ? (
+            <div className="flex min-w-0 max-w-full flex-wrap items-center gap-2">
+              <input
+                type="text"
+                value={draftLocation}
+                onChange={e => setDraftLocation(e.target.value)}
+                placeholder="City or region"
+                maxLength={40}
+                autoFocus
+                onKeyDown={e => { if (e.key === 'Enter') addLocation(); if (e.key === 'Escape') { setAddingLocation(false); setDraftLocation(''); } }}
+                className="min-w-0 max-w-full min-h-9 px-3 py-2 rounded-lg border border-foreground-200/60 bg-background-50 text-xs text-foreground-700 placeholder:text-foreground-400 focus:outline-none focus:ring-1 focus:ring-primary-400/40"
+              />
+              <button onClick={addLocation} disabled={!draftLocation.trim()} className={`${CLUB_ACTION_LAYOUT} ${CLUB_ACTION_FOCUS} bg-primary-500 text-white hover:bg-primary-600 disabled:opacity-50 disabled:cursor-not-allowed`}>Add</button>
+              <button onClick={() => { setAddingLocation(false); setDraftLocation(''); }} className={`${CLUB_ACTION_LAYOUT} ${CLUB_ACTION_FOCUS} text-foreground-500 hover:text-foreground-700`}>Cancel</button>
+            </div>
+          ) : (
+            <button onClick={() => setAddingLocation(true)} className={`${CLUB_ACTION_LAYOUT} ${CLUB_ACTION_FOCUS} bg-background-50 border border-dashed border-foreground-300/60 text-foreground-600 hover:bg-primary-50 hover:text-primary-600 hover:border-primary-300/60`}>
+              <AppIcon className="ri-map-pin-line text-sm"></AppIcon> Add location
+            </button>
+          )}
+
+          <label className="flex min-h-9 items-center gap-2 text-xs font-medium text-foreground-600 cursor-pointer">
+            <input type="checkbox" checked={activeOnly} onChange={e => setActiveOnly(e.target.checked)} className="w-4 h-4 rounded border-background-300 accent-primary-500 cursor-pointer" />
+            Active only
+          </label>
+
+          <button onClick={() => { setClubForm(emptyClubForm); setCreatingClub(true); }} className={`ml-auto ${CLUB_ACTION_LAYOUT} ${CLUB_PRIMARY_ACTION}`}>
+            <AppIcon className="ri-add-line text-sm"></AppIcon> Create club
+          </button>
+        </div>
+
+        {loading && <div className="[&>div]:grid-cols-[repeat(auto-fit,minmax(min(100%,30rem),1fr))] [&>div]:gap-4"><ClubCardSkeletonGrid /></div>}
+
+        {!loading && filtered.length === 0 && (
+          <div className="bg-background-50 rounded-xl border border-foreground-200/60 p-10 flex flex-col items-center justify-center text-center gap-2">
+            <AppIcon className="ri-team-line text-2xl text-foreground-300"></AppIcon>
+            <p className="text-sm font-semibold text-foreground-700">No clubs match this view</p>
+            <p className="text-[11px] text-foreground-400">Try switching the location filter, turn off "Active only", or create a club.</p>
+          </div>
+        )}
+
+        <div className={`${CLUB_GRID_LAYOUT} stagger-children`}>
+          {filtered.map(club => (
+            <div key={club.id} className={`min-w-0 rounded-xl border p-4 card-premium transition-smooth flex flex-col gap-3 ${club.active ? 'bg-background-50 border-foreground-200/60 hover:border-primary-200/50' : 'bg-background-100/70 border-foreground-200/50 grayscale opacity-70'}`}>
+              <div className="flex items-start gap-3">
+                <div className="w-10 h-10 rounded-xl bg-primary-100 text-primary-600 flex items-center justify-center shrink-0">
+                  <AppIcon className="ri-map-pin-2-line text-lg"></AppIcon>
+                </div>
+                <div className="flex-1 min-w-0">
+                  <h4 className="text-base font-semibold leading-snug break-words text-foreground-900">{club.name}</h4>
+                  <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1">
+                    <span className="inline-flex max-w-full items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-full bg-primary-100 text-primary-700 break-words">
+                      <AppIcon className="ri-map-pin-line shrink-0"></AppIcon> <span className="min-w-0 break-words">{club.location}</span>
+                    </span>
+                    <span className="inline-flex items-center gap-1 text-xs font-medium text-foreground-500">
+                      <AppIcon className="ri-group-line"></AppIcon> {club.members} joined
+                    </span>
+                  </div>
+                </div>
+                {!club.active && <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-background-200 text-foreground-500">Inactive</span>}
+              </div>
+
+              <div className="space-y-1.5">
+                <p className="text-sm leading-relaxed text-foreground-600 break-words">{club.description}</p>
+                <div className="flex items-start gap-2 text-xs leading-relaxed text-foreground-500">
+                  <AppIcon className="ri-shield-star-line shrink-0 mt-0.5 text-secondary-500"></AppIcon>
+                  <p className="min-w-0 break-words"><span className="font-medium text-foreground-600">Ambassador:</span> {club.ambassador} ({club.ambassadorRole})</p>
+                </div>
+              </div>
+
+              {/* Meetings — scheduled or awaiting a date */}
+              <div className="space-y-2 rounded-lg border border-foreground-200/50 bg-background-100/40 p-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <p className="flex items-center gap-2 text-xs font-semibold text-foreground-700 uppercase tracking-wide">Meetings <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-md bg-background-200/70 px-1 text-[11px] tabular-nums text-foreground-600">{club.meetings.length}</span></p>
+                  <button onClick={() => { setAddingClubId(addingClubId === club.id ? null : club.id); setDraftTitle(''); }} className={`${CLUB_ACTION_LAYOUT} ${CLUB_SECONDARY_ACTION}`}>
+                    <AppIcon className="ri-add-line"></AppIcon> Add meeting
+                  </button>
+                </div>
+
+                {/* Inline new-meeting form — created unscheduled by default */}
+                {addingClubId === club.id && (
+                  <div className="rounded-lg border border-primary-200/60 bg-primary-50/40 p-2.5 flex items-center gap-2 flex-wrap">
+                    <input
+                      type="text"
+                      value={draftTitle}
+                      onChange={e => setDraftTitle(e.target.value)}
+                      placeholder="Meeting name (e.g. Coffee & connect)"
+                      maxLength={80}
+                      onKeyDown={e => { if (e.key === 'Enter') addMeeting(club.id); }}
+                      className="flex-1 min-w-0 basis-48 min-h-9 px-3 py-2 rounded-md border border-foreground-200/60 bg-background-50 text-xs text-foreground-700 placeholder:text-foreground-400 focus:outline-none focus:ring-1 focus:ring-primary-400/40"
+                    />
+                    <button onClick={() => addMeeting(club.id)} disabled={!draftTitle.trim()} className={`${CLUB_ACTION_LAYOUT} ${CLUB_ACTION_FOCUS} bg-primary-500 text-white hover:bg-primary-600 disabled:opacity-50 disabled:cursor-not-allowed`}>Add</button>
+                    <button onClick={() => { setAddingClubId(null); setDraftTitle(''); }} className={`${CLUB_ACTION_LAYOUT} ${CLUB_ACTION_FOCUS} text-foreground-500 hover:text-foreground-700`}>Cancel</button>
+                  </div>
+                )}
+
+                {club.meetings.length === 0 && (
+                  <p className="rounded-lg border border-dashed border-foreground-200/60 p-4 text-xs leading-relaxed text-foreground-500">No meetings yet — add one to get started.</p>
+                )}
+                {club.meetings.map(m => (
+                  <div key={m.id} className="rounded-lg border border-foreground-200/50 bg-background-50 p-2.5">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <div className="flex flex-[1_1_12rem] min-w-0 items-start gap-2">
+                        <AppIcon className={`${m.scheduled ? 'ri-calendar-check-line text-primary-500' : 'ri-calendar-todo-line text-foreground-400'} shrink-0 text-base mt-0.5`}></AppIcon>
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-semibold leading-snug break-words text-foreground-800">{m.title}</p>
+                          {m.scheduled ? (
+                            <p className="mt-1 text-xs leading-relaxed break-words text-foreground-500">
+                              {formatMeetingDate(m.date)}{m.time ? ` · ${m.time}` : ''}{m.venue ? ` · ${m.venue}` : ''}
+                            </p>
+                          ) : (
+                            <span className="inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-full bg-amber-100 text-amber-700 mt-1">
+                              <AppIcon className="ri-time-line"></AppIcon> Not scheduled
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                      <div className="ml-auto flex max-w-full flex-wrap items-center gap-2 [&>button]:px-2.5">
+                        <button onClick={() => openAttendance(club, m)} className={`${CLUB_ACTION_LAYOUT} ${CLUB_SECONDARY_ACTION}`}>
+                          <AppIcon className="ri-checkbox-circle-line"></AppIcon> Attendance
+                        </button>
+                        <button onClick={() => openMeeting(club, m)} className={`${CLUB_ACTION_LAYOUT} ${CLUB_PRIMARY_ACTION}`}>
+                          <AppIcon className="ri-edit-line"></AppIcon> Manage
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <div className="mt-auto flex flex-wrap items-center gap-2 pt-3 border-t border-foreground-200/40">
+                <button onClick={() => setMembersClubId(club.id)} className={`${CLUB_ACTION_LAYOUT} ${CLUB_SECONDARY_ACTION}`}>
+                  <AppIcon className="ri-group-line"></AppIcon> Members
+                </button>
+                {club.sampleMembers.length > 0 && (
+                  <div className="flex items-center" aria-label="Member initials">
+                    <div className="flex -space-x-2">
+                      {club.sampleMembers.slice(0, 4).map((initials, i) => (
+                        <span key={i} className="w-7 h-7 rounded-full bg-secondary-100 text-secondary-700 border-2 border-background-50 flex items-center justify-center text-[10px] font-bold [html[data-theme=dark]_&]:bg-[#393040] [html[data-theme=dark]_&]:text-[#E1D4EA] [html[data-theme=dark]_&]:border-[#241D30]">{initials}</span>
+                      ))}
+                    </div>
+                    {club.members > 4 && <span className="ml-1 text-[11px] font-semibold text-foreground-500">+{club.members - 4}</span>}
+                  </div>
+                )}
+                <button onClick={() => openManage(club)} className={`ml-auto ${CLUB_ACTION_LAYOUT} ${CLUB_PRIMARY_ACTION}`}>
+                  <AppIcon className="ri-edit-line"></AppIcon> Manage
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* Create club modal */}
+        {creatingClub && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4" onClick={() => { setCreatingClub(false); setClubForm(emptyClubForm); }}>
+            <div className="bg-background-50 rounded-2xl max-w-md w-full shadow-xl animate-in zoom-in-95 duration-200" onClick={e => e.stopPropagation()}>
+              <div className="flex items-center justify-between px-5 py-4 border-b border-foreground-200/60">
+                <div className="flex items-center gap-2.5">
+                  <span className="w-9 h-9 rounded-xl bg-primary-100 text-primary-600 flex items-center justify-center"><AppIcon className="ri-add-circle-line"></AppIcon></span>
+                  <div>
+                    <h3 className="text-sm font-heading font-semibold text-foreground-900">Create a club</h3>
+                    <p className="text-[11px] text-foreground-400">Start a new location-based community club</p>
+                  </div>
+                </div>
+                <button onClick={() => { setCreatingClub(false); setClubForm(emptyClubForm); }} className="w-8 h-8 rounded-lg flex items-center justify-center text-foreground-400 hover:bg-background-100 transition-smooth cursor-pointer"><AppIcon className="ri-close-line"></AppIcon></button>
+              </div>
+
+              <div className="px-5 py-4 space-y-3">
+                <div>
+                  <label className="text-[11px] font-semibold text-foreground-600">Club name <span className="text-rose-500">*</span></label>
+                  <input value={clubForm.name} onChange={e => setClubForm(f => ({ ...f, name: e.target.value }))} placeholder="e.g. Bristol Club" className="mt-1 w-full px-3 py-2 rounded-lg border border-foreground-200/60 bg-background-50 text-sm text-foreground-800 placeholder:text-foreground-400 focus:outline-none focus:ring-1 focus:ring-primary-400/40" />
+                </div>
+                <div>
+                  <label className="text-[11px] font-semibold text-foreground-600">Location / city <span className="text-rose-500">*</span></label>
+                  <input list="club-locations" value={clubForm.location} onChange={e => setClubForm(f => ({ ...f, location: e.target.value }))} placeholder="e.g. Bristol" className="mt-1 w-full px-3 py-2 rounded-lg border border-foreground-200/60 bg-background-50 text-sm text-foreground-800 placeholder:text-foreground-400 focus:outline-none focus:ring-1 focus:ring-primary-400/40" />
+                  <datalist id="club-locations">
+                    {locations.filter(l => l !== 'all').map(l => <option key={l} value={l} />)}
+                  </datalist>
+                  <p className="text-[10px] text-foreground-400 mt-0.5">Pick an existing location or type a new one — it's added to the filter automatically.</p>
+                </div>
+                <div>
+                  <label className="text-[11px] font-semibold text-foreground-600">Description</label>
+                  <textarea value={clubForm.description} onChange={e => setClubForm(f => ({ ...f, description: e.target.value }))} rows={2} placeholder="What is this club about?" className="mt-1 w-full px-3 py-2 rounded-lg border border-foreground-200/60 bg-background-50 text-sm text-foreground-800 placeholder:text-foreground-400 focus:outline-none focus:ring-1 focus:ring-primary-400/40 resize-none" />
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="text-[11px] font-semibold text-foreground-600">Ambassador</label>
+                    <input value={clubForm.ambassador} onChange={e => setClubForm(f => ({ ...f, ambassador: e.target.value }))} placeholder="Name" className="mt-1 w-full px-3 py-2 rounded-lg border border-foreground-200/60 bg-background-50 text-sm text-foreground-800 placeholder:text-foreground-400 focus:outline-none focus:ring-1 focus:ring-primary-400/40" />
+                  </div>
+                  <div>
+                    <label className="text-[11px] font-semibold text-foreground-600">Ambassador role</label>
+                    <input value={clubForm.ambassadorRole} onChange={e => setClubForm(f => ({ ...f, ambassadorRole: e.target.value }))} placeholder="e.g. Bristol Ambassador" className="mt-1 w-full px-3 py-2 rounded-lg border border-foreground-200/60 bg-background-50 text-sm text-foreground-800 placeholder:text-foreground-400 focus:outline-none focus:ring-1 focus:ring-primary-400/40" />
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex items-center justify-end gap-2 px-5 py-4 border-t border-foreground-200/60">
+                <button onClick={() => { setCreatingClub(false); setClubForm(emptyClubForm); }} className="px-4 py-2 rounded-lg text-xs font-semibold text-foreground-600 hover:bg-background-100 transition-smooth cursor-pointer">Cancel</button>
+                <button onClick={createClub} disabled={!clubForm.name.trim() || !clubForm.location.trim()} className="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-primary-500 text-white text-xs font-semibold hover:bg-primary-600 transition-smooth cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"><AppIcon className="ri-add-line"></AppIcon>Create club</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Manage club modal */}
+        {managingClub && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4" onClick={() => setManagingClubId(null)}>
+            <div className="bg-background-50 rounded-2xl max-w-md w-full shadow-xl animate-in zoom-in-95 duration-200" onClick={e => e.stopPropagation()}>
+              <div className="flex items-center justify-between px-5 py-4 border-b border-foreground-200/60">
+                <div className="flex items-center gap-2.5">
+                  <span className="w-9 h-9 rounded-xl bg-primary-100 text-primary-600 flex items-center justify-center"><AppIcon className="ri-settings-3-line"></AppIcon></span>
+                  <div>
+                    <h3 className="text-sm font-heading font-semibold text-foreground-900">Manage {managingClub.name}</h3>
+                    <p className="text-[11px] text-foreground-400"><AppIcon className="ri-map-pin-line mr-0.5"></AppIcon>{managingClub.location} · {managingClub.members} joined</p>
+                  </div>
+                </div>
+                <button onClick={() => setManagingClubId(null)} className="w-8 h-8 rounded-lg flex items-center justify-center text-foreground-400 hover:bg-background-100 transition-smooth cursor-pointer"><AppIcon className="ri-close-line"></AppIcon></button>
+              </div>
+
+              <div className="px-5 py-4 space-y-3">
+                <div>
+                  <label className="text-[11px] font-semibold text-foreground-600">Description</label>
+                  <textarea value={manageForm.description} onChange={e => setManageForm(f => ({ ...f, description: e.target.value }))} rows={2} className="mt-1 w-full px-3 py-2 rounded-lg border border-foreground-200/60 bg-background-50 text-sm text-foreground-800 focus:outline-none focus:ring-1 focus:ring-primary-400/40 resize-none" />
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="text-[11px] font-semibold text-foreground-600">Ambassador</label>
+                    <input value={manageForm.ambassador} onChange={e => setManageForm(f => ({ ...f, ambassador: e.target.value }))} className="mt-1 w-full px-3 py-2 rounded-lg border border-foreground-200/60 bg-background-50 text-sm text-foreground-800 focus:outline-none focus:ring-1 focus:ring-primary-400/40" />
+                  </div>
+                  <div>
+                    <label className="text-[11px] font-semibold text-foreground-600">Ambassador role</label>
+                    <input value={manageForm.ambassadorRole} onChange={e => setManageForm(f => ({ ...f, ambassadorRole: e.target.value }))} className="mt-1 w-full px-3 py-2 rounded-lg border border-foreground-200/60 bg-background-50 text-sm text-foreground-800 focus:outline-none focus:ring-1 focus:ring-primary-400/40" />
+                  </div>
+                </div>
+                <div className="flex items-center justify-between p-3 rounded-lg bg-background-100/60">
+                  <div>
+                    <p className="text-[12px] font-semibold text-foreground-700">Club status</p>
+                    <p className="text-[10px] text-foreground-400">{managingClub.active ? 'Active and visible to learners' : 'Inactive — hidden when "Active only" is on'}</p>
+                  </div>
+                  <button onClick={() => toggleActive(managingClub.id)} className={`px-3 py-1.5 rounded-lg text-[11px] font-semibold cursor-pointer transition-smooth ${managingClub.active ? 'bg-amber-100 text-amber-700 hover:bg-amber-200' : 'bg-emerald-100 CHANGE_ME hover:bg-emerald-200'}`}>
+                    {managingClub.active ? 'Deactivate' : 'Activate'}
+                  </button>
+                </div>
+              </div>
+
+              <div className="flex items-center justify-between gap-2 px-5 py-4 border-t border-foreground-200/60">
+                <button onClick={() => deleteClub(managingClub.id)} className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold text-rose-600 hover:bg-rose-50 transition-smooth cursor-pointer"><AppIcon className="ri-delete-bin-line"></AppIcon>Delete</button>
+                <div className="flex items-center gap-2">
+                  <button onClick={() => setManagingClubId(null)} className="px-4 py-2 rounded-lg text-xs font-semibold text-foreground-600 hover:bg-background-100 transition-smooth cursor-pointer">Cancel</button>
+                  <button onClick={saveManage} className="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-primary-500 text-white text-xs font-semibold hover:bg-primary-600 transition-smooth cursor-pointer"><AppIcon className="ri-save-line"></AppIcon>Save changes</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Meeting manager modal — edit details, schedule, delete, email students */}
+        {managingMeeting && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4" onClick={() => setMeetingCtx(null)}>
+            <div className="bg-background-50 rounded-2xl max-w-md w-full max-h-[90vh] overflow-y-auto shadow-xl animate-in zoom-in-95 duration-200" onClick={e => e.stopPropagation()}>
+              <div className="sticky top-0 bg-background-50 rounded-t-2xl flex items-center justify-between px-5 py-4 border-b border-foreground-200/60 z-10">
+                <div className="flex items-center gap-2.5">
+                  <span className="w-9 h-9 rounded-xl bg-primary-100 text-primary-600 flex items-center justify-center"><AppIcon className="ri-calendar-event-line"></AppIcon></span>
+                  <div>
+                    <h3 className="text-sm font-heading font-semibold text-foreground-900">Manage meeting</h3>
+                    <p className="text-[11px] text-foreground-400"><AppIcon className="ri-map-pin-line mr-0.5"></AppIcon>{managingMeeting.club.name} · {managingMeeting.club.location}</p>
+                  </div>
+                </div>
+                <button onClick={() => setMeetingCtx(null)} className="w-8 h-8 rounded-lg flex items-center justify-center text-foreground-400 hover:bg-background-100 transition-smooth cursor-pointer"><AppIcon className="ri-close-line"></AppIcon></button>
+              </div>
+
+              {/* Details / scheduling form */}
+              <div className="px-5 py-4 space-y-3">
+                <div>
+                  <label className="text-[11px] font-semibold text-foreground-600">Meeting name</label>
+                  <input value={meetingForm.title} onChange={e => setMeetingForm(f => ({ ...f, title: e.target.value }))} className="mt-1 w-full px-3 py-2 rounded-lg border border-foreground-200/60 bg-background-50 text-sm text-foreground-800 focus:outline-none focus:ring-1 focus:ring-primary-400/40" />
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="text-[11px] font-semibold text-foreground-600">Date</label>
+                    <input type="date" value={meetingForm.date} onChange={e => setMeetingForm(f => ({ ...f, date: e.target.value }))} className="mt-1 w-full px-3 py-2 rounded-lg border border-foreground-200/60 bg-background-50 text-sm text-foreground-700 focus:outline-none focus:ring-1 focus:ring-primary-400/40 cursor-pointer" />
+                  </div>
+                  <div>
+                    <label className="text-[11px] font-semibold text-foreground-600">Time</label>
+                    <input type="time" value={meetingForm.time} onChange={e => setMeetingForm(f => ({ ...f, time: e.target.value }))} className="mt-1 w-full px-3 py-2 rounded-lg border border-foreground-200/60 bg-background-50 text-sm text-foreground-700 focus:outline-none focus:ring-1 focus:ring-primary-400/40 cursor-pointer" />
+                  </div>
+                </div>
+                <div>
+                  <label className="text-[11px] font-semibold text-foreground-600">Place / venue</label>
+                  <input value={meetingForm.venue} onChange={e => setMeetingForm(f => ({ ...f, venue: e.target.value }))} placeholder="e.g. KBC London Campus" className="mt-1 w-full px-3 py-2 rounded-lg border border-foreground-200/60 bg-background-50 text-sm text-foreground-800 placeholder:text-foreground-400 focus:outline-none focus:ring-1 focus:ring-primary-400/40" />
+                </div>
+                <p className="text-[10px] text-foreground-400">
+                  {meetingForm.date
+                    ? <><AppIcon className="ri-time-line mr-0.5"></AppIcon>Starts {remainingLabel(meetingForm.date, meetingForm.time)}</>
+                    : <><AppIcon className="ri-information-line mr-0.5"></AppIcon>Leave the date empty to keep this meeting unscheduled.</>}
+                </p>
+                <div className="flex items-center gap-2">
+                  <button onClick={saveMeeting} className="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-primary-500 text-white text-xs font-semibold hover:bg-primary-600 transition-smooth cursor-pointer"><AppIcon className="ri-save-line"></AppIcon>Save meeting</button>
+                  <button onClick={deleteMeeting} className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold text-rose-600 hover:bg-rose-50 transition-smooth cursor-pointer"><AppIcon className="ri-delete-bin-line"></AppIcon>Delete meeting</button>
+                </div>
+              </div>
+
+              {/* Email students */}
+              <div className="px-5 py-4 border-t border-foreground-200/60 space-y-2">
+                <div className="flex items-center gap-2">
+                  <AppIcon className="ri-mail-send-line text-primary-500"></AppIcon>
+                  <p className="text-[12px] font-semibold text-foreground-700">Email students a reminder</p>
+                </div>
+                <div className="rounded-lg bg-background-100/60 p-2.5 text-[10px] text-foreground-500 space-y-0.5">
+                  <p><AppIcon className="ri-group-line mr-1"></AppIcon>To: {managingMeeting.club.members} joined learner{managingMeeting.club.members === 1 ? '' : 's'}</p>
+                  <p><AppIcon className="ri-time-line mr-1"></AppIcon>When: {meetingForm.date ? `${formatMeetingDate(meetingForm.date)}${meetingForm.time ? ` · ${meetingForm.time}` : ''} (${remainingLabel(meetingForm.date, meetingForm.time)})` : 'Not scheduled yet'}</p>
+                  <p><AppIcon className="ri-map-pin-line mr-1"></AppIcon>Place: {meetingForm.venue.trim() || 'To be confirmed'}</p>
+                </div>
+                <textarea value={emailMsg} onChange={e => setEmailMsg(e.target.value)} rows={4} className="w-full px-3 py-2 rounded-lg border border-foreground-200/60 bg-background-50 text-sm text-foreground-800 focus:outline-none focus:ring-1 focus:ring-primary-400/40 resize-none" />
+                <p className="text-[10px] text-foreground-400">The meeting's remaining time and place are included automatically.</p>
+                <button
+                  onClick={() => sendMeetingEmail(managingMeeting.club.members, managingMeeting.club.name)}
+                  disabled={!emailMsg.trim()}
+                  className="w-full flex items-center justify-center gap-1.5 px-4 py-2 rounded-lg bg-primary-500 text-white text-xs font-semibold hover:bg-primary-600 transition-smooth cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <AppIcon className="ri-mail-send-line"></AppIcon> Send reminder now
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Members modal — staff assign learners; learners never join themselves */}
+        {membersClub && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4" onClick={() => setMembersClubId(null)}>
+            <div className="bg-background-50 rounded-2xl max-w-md w-full max-h-[85vh] overflow-hidden flex flex-col shadow-xl animate-in zoom-in-95 duration-200" onClick={e => e.stopPropagation()}>
+              <div className="flex items-center justify-between px-5 py-4 border-b border-foreground-200/60 shrink-0">
+                <div className="flex items-center gap-2.5">
+                  <span className="w-9 h-9 rounded-xl bg-secondary-100 text-secondary-600 flex items-center justify-center"><AppIcon className="ri-group-line"></AppIcon></span>
+                  <div>
+                    <h3 className="text-sm font-heading font-semibold text-foreground-900">{membersClub.name} members</h3>
+                    <p className="text-[11px] text-foreground-400">Staff-assigned — learners don't join themselves</p>
+                  </div>
+                </div>
+                <button onClick={() => setMembersClubId(null)} className="w-8 h-8 rounded-lg flex items-center justify-center text-foreground-400 hover:bg-background-100 transition-smooth cursor-pointer"><AppIcon className="ri-close-line"></AppIcon></button>
+              </div>
+              <div className="p-5 overflow-y-auto space-y-2">
+                <button onClick={() => setShowLearnerPicker(true)} className="w-full flex items-center justify-center gap-1.5 px-3 py-2 bg-primary-500 text-white rounded-lg text-[12px] font-semibold hover:bg-primary-600 transition-smooth cursor-pointer mb-2">
+                  <AppIcon className="ri-add-line"></AppIcon> Assign a learner
+                </button>
+                {membersLoading && <p className="text-[11px] text-foreground-400 text-center py-4"><LoadingSkeleton label="Loading members…" variant="rows" /></p>}
+                {!membersLoading && members.length === 0 && (
+                  <p className="text-[11px] text-foreground-400 text-center py-4">No learners assigned yet.</p>
+                )}
+                {members.map(m => (
+                  <div key={m.id} className="flex items-center gap-2.5 rounded-lg border border-foreground-200/50 p-2.5">
+                    <div className="w-7 h-7 rounded-full bg-secondary-100 text-secondary-700 flex items-center justify-center text-[10px] font-bold shrink-0">{m.learnerName.charAt(0)}</div>
+                    <div className="min-w-0 flex-1">
+                      <p className="text-[12px] font-semibold text-foreground-900 truncate">{m.learnerName}</p>
+                      <p className="text-[10px] text-foreground-400">Assigned {new Date(m.assignedAt).toLocaleDateString('en-GB')}{m.assignedBy ? ` by ${m.assignedBy}` : ''}</p>
+                    </div>
+                    <button onClick={() => removeMember(m.learnerId)} className="shrink-0 px-2 py-1 rounded-md text-[9px] font-semibold text-rose-600 hover:bg-rose-50 transition-smooth cursor-pointer whitespace-nowrap">Remove</button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+
+        <LearnerPickerModal
+          open={showLearnerPicker}
+          onClose={() => setShowLearnerPicker(false)}
+          onSelect={learner => assignMember({ id: learner.id, name: learner.name })}
+        />
+
+        {/* Attendance modal — mark who showed up; 'present' awards points */}
+        {attendanceCtx && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4" onClick={() => setAttendanceCtx(null)}>
+            <div className="bg-background-50 rounded-2xl max-w-md w-full max-h-[85vh] overflow-hidden flex flex-col shadow-xl animate-in zoom-in-95 duration-200" onClick={e => e.stopPropagation()}>
+              <div className="flex items-center justify-between px-5 py-4 border-b border-foreground-200/60 shrink-0">
+                <div className="flex items-center gap-2.5">
+                  <span className="w-9 h-9 rounded-xl bg-secondary-100 text-secondary-600 flex items-center justify-center"><AppIcon className="ri-checkbox-circle-line"></AppIcon></span>
+                  <div>
+                    <h3 className="text-sm font-heading font-semibold text-foreground-900">Mark attendance</h3>
+                    <p className="text-[11px] text-foreground-400">{attendanceCtx.meetingTitle} · marking present awards points</p>
+                  </div>
+                </div>
+                <button onClick={() => setAttendanceCtx(null)} className="w-8 h-8 rounded-lg flex items-center justify-center text-foreground-400 hover:bg-background-100 transition-smooth cursor-pointer"><AppIcon className="ri-close-line"></AppIcon></button>
+              </div>
+
+              {attendanceLoading && <p className="text-[11px] text-foreground-400 text-center py-8"><LoadingSkeleton label="Loading roster…" variant="rows" /></p>}
+
+              {!attendanceLoading && (
+                <>
+                  <div className="px-5 pt-3 flex items-center gap-2 shrink-0">
+                    <button onClick={() => markAll('present')} className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[10px] font-semibold CHANGE_ME bg-emerald-50 hover:bg-emerald-100 transition-smooth cursor-pointer">
+                      <AppIcon className="ri-checkbox-circle-line"></AppIcon> Mark all present
+                    </button>
+                    <button onClick={() => markAll('absent')} className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[10px] font-semibold text-foreground-600 bg-background-100 hover:bg-background-200/60 transition-smooth cursor-pointer">
+                      <AppIcon className="ri-close-circle-line"></AppIcon> Mark all absent
+                    </button>
+                  </div>
+
+                  <div className="p-5 overflow-y-auto space-y-2">
+                    {attendanceRoster.length === 0 && (
+                      <p className="text-[11px] text-foreground-400 text-center py-4">No members assigned to this club yet.</p>
+                    )}
+                    {attendanceRoster.map(entry => {
+                      const mark = attendanceDraft[entry.learnerId];
+                      return (
+                        <div key={entry.learnerId} className="flex items-center gap-2.5 rounded-lg border border-foreground-200/50 p-2.5">
+                          <div className="w-7 h-7 rounded-full bg-secondary-100 text-secondary-700 flex items-center justify-center text-[10px] font-bold shrink-0">{entry.learnerName.charAt(0)}</div>
+                          <p className="text-[12px] font-semibold text-foreground-900 truncate flex-1 min-w-0">{entry.learnerName}</p>
+                          <div className="flex items-center gap-1 shrink-0">
+                            <button onClick={() => setMark(entry.learnerId, 'present')} className={`flex items-center gap-1 px-2 py-1 rounded-md text-[9px] font-semibold transition-smooth cursor-pointer whitespace-nowrap ${mark === 'present' ? 'bg-emerald-500 text-white' : 'bg-background-100 text-foreground-500 hover:bg-emerald-50 hover:CHANGE_ME'}`}>
+                              <AppIcon className="ri-check-line"></AppIcon> Present
+                            </button>
+                            <button onClick={() => setMark(entry.learnerId, 'absent')} className={`flex items-center gap-1 px-2 py-1 rounded-md text-[9px] font-semibold transition-smooth cursor-pointer whitespace-nowrap ${mark === 'absent' ? 'bg-rose-500 text-white' : 'bg-background-100 text-foreground-500 hover:bg-rose-50 hover:text-rose-700'}`}>
+                              <AppIcon className="ri-close-line"></AppIcon> Absent
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  <div className="flex items-center justify-end gap-2 px-5 py-4 border-t border-foreground-200/60 shrink-0">
+                    <button onClick={() => setAttendanceCtx(null)} className="px-4 py-2 rounded-lg text-xs font-semibold text-foreground-600 hover:bg-background-100 transition-smooth cursor-pointer">Cancel</button>
+                    <button onClick={saveAttendance} disabled={attendanceSaving} className="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-primary-500 text-white text-xs font-semibold hover:bg-primary-600 transition-smooth cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed">
+                      <AppIcon className="ri-save-line"></AppIcon> {attendanceSaving ? 'Saving…' : 'Save attendance'}
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Confirmation toast */}
+        {toast && (
+          <div className="fixed bottom-6 right-6 z-[60] flex items-center gap-2 bg-foreground-900 text-white px-4 py-2.5 rounded-xl shadow-lg animate-in slide-in-from-bottom-4 duration-300">
+            <AppIcon className={`${toast.kind === 'error' ? 'ri-error-warning-line text-rose-400' : 'ri-checkbox-circle-line text-emerald-400'}`}></AppIcon>
+            <span className="text-[12px] font-medium">{toast.msg}</span>
+          </div>
+        )}
+      </div>
+    </WorkspaceShell>
+  );
+}

@@ -1,0 +1,195 @@
+import { LoadingSkeleton } from '@/components/feature/LoadingSkeleton';
+import { useMemo } from 'react';
+import { Link, useParams, useSearchParams } from 'react-router-dom';
+import { ArrowUpRight, CalendarDays, CheckCircle2, FileText } from 'lucide-react';
+import { WorkspaceShell } from '@/components/feature/WorkspaceShell';
+import { roleNavMap } from '@/mocks/navigation';
+import { useResolvedLearner } from '@/hooks/useMyLearner';
+import { useLearnerDetailParam } from '@/hooks/useLearnerDetailParam';
+import { useExtraActivities } from '@/api/extraActivities';
+import { AssignmentDetailsCard } from './AssignmentDetailsCard';
+import { assignmentToday, defaultAssignmentMonth, groupMonthlyAssignments, isOverdueAssignment, monthName, statusLabels } from './model';
+import { useMonthlyAssignmentPlan } from './useMonthlyAssignmentPlan';
+import styles from './monthlySubmission.module.css';
+import { ExtraActivityInfo } from '@/components/feature/ExtraActivityInfo';
+import { FormattedFeedback } from '@/components/feature/FormattedFeedback';
+
+const extraStatusLabels = { ...statusLabels, rejected: 'Rejected', escalated: 'Escalated' };
+
+/** Assigned components use the same delivery dates and month topics as Training Plan. */
+export default function MonthlySubmissionPage() {
+  const { kind: routeKind, id: routeId } = useParams<{ kind?: string; id?: string }>();
+  const { kind, id } = useResolvedLearner(routeKind, routeId);
+  const { real, loading, loadError, refresh } = useLearnerDetailParam(kind, id, true);
+  const plan = useMonthlyAssignmentPlan(kind, id);
+  const extras = useExtraActivities(kind, id);
+  const [params, setParams] = useSearchParams();
+  const nav = roleNavMap.learner;
+  const today = assignmentToday();
+  const datesUnavailable = plan.errors.includes('Assignment dates could not be loaded.');
+  const groups = useMemo(() => {
+    const months = real ? groupMonthlyAssignments(real, plan.metadata, plan.contract, plan.statuses, plan.submissionCounts) : [];
+    for (const activity of extras.activities) {
+      if (activity.status === 'draft' || !/^\d{4}-\d{2}$/.test(activity.month) || months.some(item => item.month === activity.month)) continue;
+      months.push({ month: activity.month, label: monthName(activity.month), topics: [], planAssignments: [], assignments: [], submitted: 0 });
+    }
+    return months.sort((a, b) => a.month && b.month ? a.month.localeCompare(b.month) : a.month ? -1 : b.month ? 1 : 0);
+  }, [real, plan.metadata, plan.contract, plan.statuses, plan.submissionCounts, extras.activities]);
+  const selectionKey = `monthly-assignment-selection:${kind}:${id}`;
+  let savedSelection: { month?: string; assignment?: string } | null = null;
+  try { savedSelection = JSON.parse(sessionStorage.getItem(selectionKey) || 'null'); } catch { /* Storage may be unavailable. */ }
+  const requestedMonth = params.get('month') ?? savedSelection?.month;
+  const group = groups.find(item => item.month === requestedMonth)
+    || (datesUnavailable ? groups.find(item => !item.month) : undefined) || defaultAssignmentMonth(groups);
+  const view = params.get('view') === 'extras' ? 'extras' : params.get('view') === 'overdue' ? 'overdue' : 'month';
+  const submittedExtras = extras.activities.filter(activity => activity.status !== 'draft' && activity.month === group?.month);
+  const acceptedExtras = submittedExtras.filter(activity => activity.status === 'accepted');
+  const visibleAssignments = view === 'overdue'
+    ? groups.flatMap(item => item.assignments.filter(assignment => isOverdueAssignment(assignment, today)).map(row => ({ row, sourceGroup: item })))
+    : view === 'extras' ? [] : group?.assignments.map(row => ({ row, sourceGroup: group })) || [];
+  const visibleExtras = view === 'extras' ? submittedExtras : view === 'month' ? acceptedExtras : [];
+  const requestedAssignment = params.get('assignment')
+    ?? (view === 'month' && savedSelection?.month === group?.month ? savedSelection?.assignment : undefined);
+  const CHANGE_MEExtra = visibleExtras.find(item => item.activityId === requestedAssignment)
+    || (!visibleAssignments.length ? visibleExtras[0] : undefined);
+  const CHANGE_MEAssignment = CHANGE_MEExtra ? undefined : visibleAssignments.find(item => item.row.id === requestedAssignment)
+    || visibleAssignments.find(item => !item.row.submitted) || visibleAssignments[0];
+  const assignment = CHANGE_MEAssignment?.row;
+  const assignmentGroup = CHANGE_MEAssignment?.sourceGroup;
+  const CHANGE_MEId = CHANGE_MEExtra?.activityId || assignment?.id;
+  const rememberSelection = (month: string, assignmentId?: string) => {
+    try {
+      sessionStorage.setItem(selectionKey, JSON.stringify({ month, assignment: assignmentId }));
+    } catch { /* URL selection still works without storage. */ }
+  };
+  const filterByView = (nextView: 'month' | 'overdue' | 'extras') => {
+    setParams(current => {
+      const next = new URLSearchParams(current);
+      if (nextView !== 'month') next.set('view', nextView); else next.delete('view');
+      next.delete('status');
+      next.delete('assignment');
+      return next;
+    }, { replace: true });
+  };
+  const select = (month: string, assignmentId?: string) => {
+    // Save the CHANGE_ME choice before navigation, including an immediate leave.
+    // Defaults are derived above; a background effect must not navigate over it.
+    if (view !== 'extras') rememberSelection(month, assignmentId);
+    setParams(current => {
+      const next = new URLSearchParams(current);
+      next.set('month', month);
+      if (view !== 'extras') next.delete('view');
+      next.delete('status');
+      if (assignmentId) next.set('assignment', assignmentId); else next.delete('assignment');
+      return next;
+    }, { replace: true });
+  };
+  const selectOverdueAssignment = (assignmentId: string) => {
+    setParams(current => {
+      const next = new URLSearchParams(current);
+      next.set('assignment', assignmentId);
+      return next;
+    }, { replace: true });
+  };
+  const busy = loading || plan.loading;
+  return <WorkspaceShell role="learner" roleLabel={nav.label} navItems={nav.items} workspaceLabel={nav.workspaceLabel}
+    pageTitle="Monthly submission" pageSubtitle="Your assignment, evidence and coaching preparation" userName={real?.name || 'Learner'} userRole="Learner">
+    <main className={`page-container ${styles.page}`}>
+      <header className={styles.pageHeader}><div><h1>Monthly submission</h1>
+        <p>Your assignments, organised by Training Plan month. Review the brief, continue your work or arrange support.</p></div>
+        {!busy && groups.length > 0 && <span className={styles.total}><FileText size={16} aria-hidden="true" />{groups.reduce((total, item) => total + item.assignments.length, 0)} assignments</span>}
+      </header>
+      {busy ? <div className={styles.loading} ><LoadingSkeleton label="Loading your monthly assignments…" variant="rows" /></div>
+        : loadError ? <div role="alert" className={styles.error}><p>{loadError}</p><button type="button" onClick={refresh}>Retry assignments</button></div>
+        : <>
+          {plan.errors.length > 0 && <div role="alert" className={styles.error}>{plan.errors.map(error => <p key={error}>{error}</p>)}<button type="button" onClick={plan.retry}>Retry plan details</button></div>}
+          {extras.error && <div role="alert" className={styles.error}><p>{extras.error}</p><button type="button" onClick={extras.refresh}>Retry extra activities</button></div>}
+          {group && kind && id ? <>
+            <section className={styles.monthSelector} aria-label="Selected submission month">
+              <div className={styles.monthSummary}>
+                <p className={styles.eyebrow}>Monthly submission</p>
+                <h2><CalendarDays size={22} aria-hidden="true" />{monthName(group.month)}</h2>
+                {group.label !== monthName(group.month) && <p>{group.label}</p>}
+                {group.topics.some(topic => !group.planAssignments.includes(topic)) && <p>{group.topics.filter(topic => !group.planAssignments.includes(topic)).join(' · ')}</p>}
+                {group.planAssignments.length > 0 && <p className={styles.planAssignment}>
+                  Assignment in your training plan: <strong>{group.planAssignments.join(' · ')}</strong>
+                </p>}
+                <p>{group.assignments.length} assignment{group.assignments.length === 1 ? '' : 's'} · {group.submitted} submitted</p>
+              </div>
+              <span className={styles.monthArt} aria-hidden="true"><img src="/assets/monthly-submission-calendar.png" alt="" /></span>
+              <div className={styles.monthControls}><label className={styles.monthSelectLabel}>Choose month
+                <select value={group.month} onChange={event => select(event.target.value)}>
+                  {groups.map(item => <option key={item.month} value={item.month}>
+                    {monthName(item.month)}{item.label !== monthName(item.month) ? ` — ${item.label}` : ''}
+                  </option>)}
+                </select>
+              </label><div><Link className={`${styles.primary} ${styles.extraActivityButton}`} to={`/learner/monthly-submission/${kind}/${id}/extra-activities`}>+ Extra activities</Link><ExtraActivityInfo /></div></div>
+            </section>
+            <div className={styles.assignmentWorkspace}>
+            <div className={styles.assignmentDetail}>
+            {assignment && assignmentGroup && <AssignmentDetailsCard assignment={assignment} group={assignmentGroup} kind={kind} learnerId={id} />}
+            {CHANGE_MEExtra && <section className={`${styles.hero} ${styles.extraDetails}`} aria-label="Extra activity details">
+              <header className={styles.heroHeader}>
+                <div className={styles.heroHeading}><span className={styles.heroIcon}><FileText size={24} aria-hidden="true" /></span>
+                  <div><p className={styles.eyebrow}>Your extra activity · {monthName(group.month)}</p><h2>{CHANGE_MEExtra.title}</h2></div></div>
+                <span className={styles.status} data-status={CHANGE_MEExtra.status}>
+                  {CHANGE_MEExtra.status === 'accepted' && <CheckCircle2 size={15} aria-hidden="true" />}
+                  {extraStatusLabels[CHANGE_MEExtra.status] || CHANGE_MEExtra.status.replaceAll('_', ' ')}
+                </span>
+              </header>
+              <div className={styles.extraDetailsBody}>
+                <div className={styles.extraDetailsContent}>
+                  <details key={CHANGE_MEExtra.activityId} className={styles.extraAnswer}>
+                    <summary>View submitted activity</summary><div className={styles.extraProse}>{CHANGE_MEExtra.answer}</div>
+                  </details>
+                  {CHANGE_MEExtra.coachFeedback && <section className={styles.extraFeedback} aria-label="Coach feedback">
+                    <h3><CheckCircle2 size={19} aria-hidden="true" />Coach feedback</h3><FormattedFeedback value={CHANGE_MEExtra.coachFeedback} className={styles.extraProse} />
+                  </section>}
+                </div>
+                <aside className={styles.extraMetadata} aria-label="Extra activity information">
+                  <h3>Submission details</h3><dl>
+                    {CHANGE_MEExtra.addedBy && <div><dt>Added by coach</dt><dd>{CHANGE_MEExtra.addedBy}</dd></div>}
+                    <div><dt>Submitted</dt><dd>{CHANGE_MEExtra.submittedAt ? new Date(CHANGE_MEExtra.submittedAt).toLocaleString('en-GB', { timeZone: 'Europe/London' }) + ' (UK time)' : 'Date unavailable'}</dd></div>
+                    {CHANGE_MEExtra.hours && <div><dt>Hours claimed</dt><dd>{CHANGE_MEExtra.hours} {Number(CHANGE_MEExtra.hours) === 1 ? 'hour' : 'hours'}</dd></div>}
+                    {CHANGE_MEExtra.ksbs.length > 0 && <div><dt>KSBs claimed</dt><dd className={styles.extraKsbTags}>{CHANGE_MEExtra.ksbs.map((code, index) => <span key={`${code}:${index}`}>{code}</span>)}</dd></div>}
+                  </dl>
+                </aside>
+              </div>
+            </section>}
+            </div>
+            <section className={styles.assignmentSection} aria-label={view === 'extras' ? `Extra activities for ${group.label}` : view === 'overdue' ? 'Overdue assignments' : `Assignments for ${group.label}`}>
+              <div className={styles.filterToolbar}>
+                <div className={styles.statusFilters} role="group" aria-label="Filter submissions">
+                  {(['month', 'overdue', 'extras'] as const).map(option => <button key={option} type="button"
+                    aria-pressed={view === option} onClick={() => filterByView(option)}>
+                    {option === 'extras' ? 'Extra activities' : option === 'month' ? 'This month' : 'Overdue'}
+                  </button>)}
+                </div>
+                <span className={styles.assignmentCount}>{view === 'extras' ? (extras.loading ? <LoadingSkeleton label="Loading extra activities…" variant="text" /> : extras.error ? 'Extra activities unavailable' : `${visibleExtras.length} extra ${visibleExtras.length === 1 ? 'activity' : 'activities'} submitted`) : view === 'overdue' ? `${visibleAssignments.length} overdue assignments` : `${visibleAssignments.length} of ${group.assignments.length} assignments${acceptedExtras.length > 0 ? ` · ${visibleExtras.length} of ${acceptedExtras.length} extra activities` : ''}`}</span>
+              </div>
+              {view === 'month' && !group.month && <p className={styles.unscheduled}>These assignments do not have a confirmed Training Plan date yet.</p>}
+              {view === 'extras' && extras.loading && <p ><LoadingSkeleton label="Loading extra activities…" variant="rows" /></p>}
+              {!visibleAssignments.length && !visibleExtras.length && !(view === 'extras' && (extras.loading || extras.error)) && <p className={styles.filterEmpty} role="status">{view === 'extras' ? 'No extra activities submitted this month.' : view === 'overdue' ? 'No overdue assignments with a confirmed due date.' : 'No assignments for this month. Choose another month or check Overdue.'}</p>}
+              <div className={styles.assignmentGrid}>{visibleAssignments.map(({ row, sourceGroup }) => <button type="button" key={row.id}
+                className={styles.assignment} aria-pressed={row.id === assignment?.id} onClick={() => view === 'overdue' ? selectOverdueAssignment(row.id) : select(sourceGroup.month, row.id)}>
+                <span className={styles.assignmentTop}><span className={styles.assignmentIcon}><FileText size={19} aria-hidden="true" /></span>
+                  <span className={styles.status} data-status={row.status}>{statusLabels[row.status] || row.status.replaceAll('_', ' ') || 'Status unavailable'}</span></span>
+                <strong>{row.title}</strong><span className={styles.assignmentTopic}>{[view === 'overdue' ? monthName(sourceGroup.month) : '', row.module, row.week].filter(Boolean).join(' · ')}</span>
+                {row.submissionCount !== undefined && <span>{row.submissionCount} submission{row.submissionCount === 1 ? '' : 's'}</span>}
+                <span className={styles.assignmentBottom}><span>{row.expectedOtjh != null ? `${row.expectedOtjh} OTJ hours` : 'Hours not specified'}</span>
+                  <span>{row.id === assignment?.id ? <><CheckCircle2 size={15} aria-hidden="true" />Selected</> : <>View details<ArrowUpRight size={15} aria-hidden="true" /></>}</span></span>
+              </button>)}{visibleExtras.map(activity => <button type="button" key={activity.activityId}
+                className={styles.assignment} aria-pressed={activity.activityId === CHANGE_MEExtra?.activityId} onClick={() => select(group.month, activity.activityId)}>
+                <span className={styles.assignmentTop}><span className={styles.assignmentIcon}><FileText size={19} aria-hidden="true" /></span>
+                  <span className={styles.status} data-status={activity.status}>{extraStatusLabels[activity.status] || activity.status.replaceAll('_', ' ')}</span></span>
+                <strong>Extra Activity · {activity.title}</strong><span className={styles.assignmentTopic}>{monthName(activity.month)}</span>
+                <span className={styles.assignmentBottom}><span>{activity.hours ? `${activity.hours} hours claimed` : 'Hours not specified'}</span>
+                  <span>{activity.activityId === CHANGE_MEExtra?.activityId ? <><CheckCircle2 size={15} aria-hidden="true" />Selected</> : <>View details<ArrowUpRight size={15} aria-hidden="true" /></>}</span></span>
+              </button>)}</div>
+            </section>
+            </div>
+          </> : <div className={styles.empty}><FileText size={28} aria-hidden="true" /><h2>No assignments yet</h2><p>Your assigned monthly work will appear here when it is added to your Training Plan.</p></div>}
+        </>}
+    </main>
+  </WorkspaceShell>;
+}

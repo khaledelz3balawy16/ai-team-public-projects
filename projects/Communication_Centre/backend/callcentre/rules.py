@@ -1,0 +1,268 @@
+import re
+from datetime import date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
+
+from django.conf import settings
+from django.db.models import Q
+
+LONDON = ZoneInfo('Europe/London')
+BANK_HOLIDAYS = {
+    '2026-01-01', '2026-04-03', '2026-04-06', '2026-05-04', '2026-05-25', '2026-08-31', '2026-12-25', '2026-12-28',
+    '2027-01-01', '2027-03-26', '2027-03-29', '2027-05-03', '2027-05-31', '2027-08-30', '2027-12-27', '2027-12-28',
+    '2028-01-03', '2028-04-14', '2028-04-17', '2028-05-01', '2028-05-29', '2028-08-28', '2028-12-25', '2028-12-26',
+}
+# The system cutoff: missed lectures and reviews dated before it are too old to call about. No case is opened
+# for them and older open cases are left out of every list. Change the date here; the database is not touched.
+SYSTEM_CUTOFF = date(2026, 9, 1)
+# Missed lectures start later: only lectures from 1 November 2026 are called about.
+MISSED_LECTURES_SINCE = date(2026, 11, 1)
+REVIEWS_SINCE = SYSTEM_CUTOFF
+# Cases made from the LMS reviews (lms_reviews.py): overdue, missed and unsigned reviews.
+REVIEW_CATEGORIES = {'pr', 'mcm', 'pr_missed', 'mcm_missed', 'signature'}
+# A missed lecture waits this many calendar days after the lecture date before it becomes a case. 0: it becomes a
+# case as soon as the register shows the absence (an LMS lecture once its Teams attendance report has synced).
+# A register corrected later sets the case aside (sources.retire).
+MISSED_LECTURE_DELAY_DAYS = 0
+# Case types switched off for now: none are created and open ones are left out of every list.
+# 'satisfaction' (emailed quarterly employer surveys) was replaced by employer_feedback calls on 2026-10-05.
+PAUSED_CATEGORIES = {'otj', 'satisfaction'}
+# Recurring feedback calls: one open case per contact, completed by the feedback form after an answered call,
+# then due again three calendar months later (learner_satisfaction.py).
+SATISFACTION_TYPES = {'learner_satisfaction', 'employer_feedback'}
+
+
+def missed_lectures_ready_until(today):
+    """The latest lecture date whose absence is old enough to call about."""
+    return today - timedelta(days=MISSED_LECTURE_DELAY_DAYS)
+
+
+def out_of_scope():
+    """Open cases the call centre does not work on now. They stay in the database, untouched."""
+    from .sources import active_case_contacts, on_break_emails, test_learner_emails   # sources imports this module
+    from .do_not_call import listed   # do_not_call imports models, which imports this module
+    today = datetime.now(LONDON).date()
+    ready = missed_lectures_ready_until(today)
+    return (Q(source_type__in=PAUSED_CATEGORIES)
+            | ~active_case_contacts()
+            # Set aside by the cycle while its source no longer reports the issue (sources.set_eligible).
+            | Q(source_data__has_key='eligible', source_data__eligible=False)
+            # A reminder is for the next working day's appointment; once that day is today or past, the call is moot.
+            | Q(source_type='reminder', booking_at__lt=datetime.combine(next_workday(today), time.min, tzinfo=LONDON))
+            | Q(learner_email__in=on_break_emails())
+            | Q(learner_email__in=test_learner_emails())
+            # Taken off every call list by a director (do_not_call); a missing employer signature is the employer's call.
+            | (Q(learner_email__in=listed()) & ~Q(source_type='signature', source_data__employer_signature_missing=True))
+            | Q(source_type='attendance', overdue_since__lt=MISSED_LECTURES_SINCE)
+            | Q(source_type='attendance', overdue_since__gt=ready)
+            | Q(source_type__in=REVIEW_CATEGORIES, overdue_since__lt=REVIEWS_SINCE)
+            # Progress review / monthly coaching cases from Aptem's old tables, replaced by the LMS reviews.
+            | (Q(source_type__in=('pr', 'mcm')) & ~Q(source_data__has_key='review_type')))
+
+
+SLA_DAYS = {'attendance': 2, 'mcm': 3, 'pr': 3, 'mcm_missed': 3, 'pr_missed': 3, 'signature': 3, 'otj': 5, 'epa': 5,
+            'satisfaction': 14, 'learner_satisfaction': 10, 'employer_feedback': 10}
+# 'cut_off': an outgoing call "answered" for under 10 seconds (voicemail picking up, or the learner hanging up at once).
+FAILED_RESULTS = {'no_answer', 'missed', 'busy', 'voicemail', 'rejected', 'cut_off'}
+WAITING = {'pending_learner', 'pending_verification', 'ai_suggested_close', 'unreachable', 'escalated'}
+# What a learner can agree to on a call, per case type, and the calendar days they have to do it.
+# The case stays open until source evidence proves it; a missed deadline returns it to the queue.
+# None: agreeing closes the case straight away (MVP — booking proof is not connected yet).
+# A missed lecture the learner says they will attend with another group of their cohort: their word closes the case.
+# The other group's session, when the LMS has one, is kept on the case (alternative_sessions.py).
+OTHER_GROUP = 'other_group_session'
+# A missed lecture the learner confirms they already attended with another group (a covering lecture): the register is
+# corrected on the call (attendance_edits.py) and the case closes.
+ATTENDED_OTHER_GROUP = 'attended_other_group'
+# A missed lecture already caught up in a catch-up session with the coach: said by the learner on the call, or marked by
+# the coach on the coaches' screen (coach_centre.py). Either closes the case.
+CAUGHT_UP_WITH_COACH = 'caught_up_with_coach'
+# A missed lecture the learner told their coach beforehand they would miss (authorised_absence.py): the case closes as
+# soon as it is made.
+AUTHORISED_ABSENCE = 'authorised_absence'
+# A missed lecture the learner reported in the LMS, pending or approved (reported_absence.py): closes the same way.
+LMS_ABSENCE_REPORT = 'lms_absence_report'
+PROMISES = {
+    'attendance': {'catch_up_session': 7, OTHER_GROUP: None, ATTENDED_OTHER_GROUP: None, CAUGHT_UP_WITH_COACH: None},
+    'pr': {'book_pr': None},
+    'mcm': {'book_mcm': None},
+    'pr_missed': {'book_pr': None},
+    'mcm_missed': {'book_mcm': None},
+    'signature': {'sign_review': None},
+    'otj': {'log_hours': 7},
+    'epa': {'epa_step': 7},
+    'reminder': {},
+    'manual': {},
+    # A technical issue raised in the help desk: the specialist resolves it once the learner confirms the fix.
+    'tech_support': {},
+}
+def waiting_on_support():
+    """Technical-issue cases whose help-desk ticket is not closed yet: support has the work, not the specialist."""
+    return Q(source_type='tech_support') & ~Q(source_data__helpdesk_status='Closed')
+
+
+# Cases with nothing to prove: the call itself is the work, so the specialist closes them.
+SPECIALIST_CLOSES = {'reminder', 'manual', 'tech_support'}
+OPTIONS = {option for options in PROMISES.values() for option in options} | {'other'}
+# Missed calls on one case after which the line-manager reminder email goes out (when reminders are on).
+MAX_MISSED_CALLS = 3
+
+
+def same_contact(ticket):
+    """Cases of the same person in the same role. Someone who is a learner and also a line manager is two contacts:
+    a call about their own learning is not their employer feedback call, and the other way round."""
+    return Q(learner_email=ticket.learner_email) & (Q(source_type='employer_feedback') if ticket.source_type == 'employer_feedback'
+                                                    else ~Q(source_type='employer_feedback'))
+
+
+def contact_key(ticket):
+    if ticket.source_type == 'employer_feedback':
+        return 'employer:' + ticket.learner_email if ticket.learner_email else f'case:{ticket.pk}'
+    return ticket.source_data.get('person_id') or ticket.learner_email or f'case:{ticket.pk}'
+
+
+def contact_keys(tickets):
+    """One key per person across these cases: cases that share a person ID or an email are the same contact, even
+    when only some of them carry the person ID. Employer contacts keep their own key (``contact_key``)."""
+    parent = {}
+
+    def find(node):
+        parent.setdefault(node, node)
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    labels = {}
+    for ticket in tickets:
+        if ticket.source_type == 'employer_feedback':
+            continue
+        person_id = ticket.source_data.get('person_id') if isinstance(ticket.source_data, dict) else None
+        labels[ticket.pk] = [label for label in (person_id, email_key(ticket.learner_email)) if label]
+        for label in labels[ticket.pk]:
+            parent[find(label)] = find(f'case:{ticket.pk}')
+    groups = {}
+    for pk, own in labels.items():
+        groups.setdefault(find(f'case:{pk}'), []).extend(own)
+    # The smallest label names the group, so the key stays the same from one refresh to the next.
+    return {ticket.pk: min(groups.get(find(f'case:{ticket.pk}')) or [contact_key(ticket)])
+            if ticket.pk in labels else contact_key(ticket) for ticket in tickets}
+
+
+def email_key(value):
+    return str(value or '').strip().lower()
+
+
+def normalize_phone(value):
+    value = str(value or '').strip()
+    if not value or re.search(r'[^\d\s()+.\-]', value):
+        return ''
+    digits = re.sub(r'\D', '', value)
+    if value.startswith('00'):
+        digits = digits[2:]
+    elif digits.startswith('0'):
+        digits = '44' + digits[1:]
+    elif not value.startswith('+') and not digits.startswith('44'):
+        return ''
+    if digits.startswith('440'):
+        digits = '44' + digits[3:]
+    if not 8 <= len(digits) <= 15 or digits.startswith('0'):
+        return ''
+    if digits.startswith('44') and len(digits) != 12:
+        return ''
+    return '+' + digits
+
+
+def working_day(day):
+    holidays = BANK_HOLIDAYS | set(getattr(settings, 'CALLCENTRE_HOLIDAYS', []))
+    return day.weekday() < 5 and day.isoformat() not in holidays
+
+
+def holidays_from(day):
+    """Bank holidays and college closures from this day on, ISO dates: the screens skip them like the server does."""
+    holidays = BANK_HOLIDAYS | set(getattr(settings, 'CALLCENTRE_HOLIDAYS', []))
+    return sorted(value for value in holidays if value >= day.isoformat())
+
+
+def next_workday(day):
+    candidate = day + timedelta(days=1)
+    while not working_day(candidate):
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def add_workdays(moment, count):
+    local = moment.astimezone(LONDON)
+    day = local.date()
+    while count:
+        day = next_workday(day)
+        count -= 1
+    return datetime.combine(day, local.timetz(), tzinfo=LONDON)
+
+
+def due_at(category, now, booking_at=None):
+    if category == 'reminder':
+        if booking_at is None:
+            raise ValueError('Reminder needs a confirmed session time.')
+        return booking_at
+    return add_workdays(now, SLA_DAYS[category])
+
+
+def promise_deadline(category, option, now):
+    """17:00 London on the last day the learner has to keep the promise."""
+    day = now.astimezone(LONDON).date() + timedelta(days=PROMISES[category][option])
+    return datetime.combine(day, time(17), tzinfo=LONDON)
+
+
+# A fresh start: every case due before this day counts as due on it, so nothing is late until the day after. Call dates
+# themselves are left as they are; moving or removing this date undoes it.
+FRESH_START = date(2026, 10, 26)
+LATE_FROM = datetime.combine(FRESH_START + timedelta(days=1), time.min, tzinfo=LONDON)
+
+
+def late_cutoff(now):
+    """A case is late when its call date is before this: ``now``, or (before the fresh start is over) nothing at all."""
+    return now if now >= LATE_FROM else datetime(1970, 1, 1, tzinfo=LONDON)
+
+
+def is_late(due_at, now):
+    return due_at < late_cutoff(now)
+
+
+def days_late(due_at, now):
+    """Whole days the call is late, counted from the fresh start for a case due before it."""
+    if not is_late(due_at, now):
+        return 0
+    return max(0, (now.astimezone(LONDON).date() - max(due_at.astimezone(LONDON).date(), FRESH_START)).days)
+
+
+def priority(ticket, now):
+    today = now.astimezone(LONDON).date()
+    overdue = max(0, (today - ticket.overdue_since).days) if ticket.overdue_since else 0
+    tomorrow = bool(ticket.booking_at and ticket.booking_at.astimezone(LONDON).date() == next_workday(today))
+    # A missed call drops to the bottom; a broken promise ranks with red risk at the top.
+    return (not missed_call(ticket), promise_missed(ticket, now) or ticket.risk == 'red', is_late(ticket.due_at, now),
+            overdue, ticket.misses, tomorrow, -ticket.attempts)
+
+
+def missed_call(ticket):
+    """The latest call on an open case went unanswered. Needs the ``last_call_result`` annotation."""
+    return ticket.status != 'resolved' and getattr(ticket, 'last_call_result', None) in FAILED_RESULTS
+
+
+def promise_missed(ticket, now):
+    """The learner's agreed deadline passed without proof and the case is back with the specialists."""
+    return bool(ticket.promised_at and ticket.promised_at <= now and ticket.status in ('new', 'in_progress', 'escalated'))
+
+
+def parse_moment(value):
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=LONDON)
+    if isinstance(value, dict):
+        # Microsoft booking values may contain an explicit timezone.
+        dt = datetime.fromisoformat(value['dateTime'].replace('Z', '+00:00'))
+        if dt.tzinfo:
+            return dt
+        zone = value.get('timeZone', 'Europe/London')
+        return dt.replace(tzinfo=ZoneInfo('Europe/London' if zone == 'GMT Standard Time' else zone))
+    dt = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+    return dt if dt.tzinfo else dt.replace(tzinfo=LONDON)

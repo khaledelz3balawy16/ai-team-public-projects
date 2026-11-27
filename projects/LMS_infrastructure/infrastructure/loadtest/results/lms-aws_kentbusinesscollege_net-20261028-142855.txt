@@ -1,0 +1,49 @@
+time="2026-10-28T14:28:56+03:00" level=info msg="signed in as role=admin subject=staff; 1 API paths per iteration" source=console
+time="2026-10-28T14:31:21+03:00" level=warning msg="Request Failed" error="Get \"https://lms-aws.kentbusinesscollege.net/learner/home\": request timeout"
+
+
+  █ THRESHOLDS 
+
+    checks
+    ✓ 'rate>0.95' rate=99.99%
+
+    http_req_duration{kind:api}
+    ✓ 'p(95)<5000' p(95)=2.16s
+
+    http_req_duration{kind:page}
+    ✓ 'p(95)<1000' p(95)=587.4ms
+
+    http_req_failed
+    ✓ 'rate<0.05' rate=0.00%
+
+
+  █ TOTAL RESULTS 
+
+    checks_total.......: 30246  76.835101/s
+    checks_succeeded...: 99.99% 30245 out of 30246
+    checks_failed......: 0.00%  1 out of 30246
+
+    ✗ page 200
+      ↳  99% — ✓ 15122 / ✗ 1
+    ✓ api 200
+
+    HTTP
+    http_req_duration..............: avg=839.23ms med=300.15ms p(90)=1.92s    p(95)=2.04s   p(99)=5.46s  max=18.78s
+      { expected_response:true }...: avg=839.26ms med=300.15ms p(90)=1.92s    p(95)=2.04s   p(99)=5.46s  max=18.78s
+      { kind:api }.................: avg=1.47s    med=1.6s     p(90)=2.01s    p(95)=2.16s   p(99)=10.03s max=18.78s
+      { kind:page }................: avg=207.16ms med=73.25ms  p(90)=345.33ms p(95)=587.4ms p(99)=3.12s  max=10.14s
+    http_req_failed................: 0.00%  1 out of 30248
+    http_reqs......................: 30248  76.840182/s
+
+    EXECUTION
+    iteration_duration.............: avg=3.68s    med=3.5s     p(90)=4.79s    p(95)=5.22s   p(99)=11.88s max=1m3s  
+    iterations.....................: 15123  38.417551/s
+    vus............................: 1      min=0          max=200
+    vus_max........................: 200    min=200        max=200
+
+    NETWORK
+    data_received..................: 151 MB 382 kB/s
+    data_sent......................: 2.2 MB 5.7 kB/s
+
+
+

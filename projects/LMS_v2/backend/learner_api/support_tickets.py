@@ -1,0 +1,321 @@
+"""Account-owned LMS support tickets. No Inclusion or email side effects."""
+import functools
+import json
+from uuid import UUID
+
+from django.db import DatabaseError, connections, transaction
+from django.core.exceptions import RequestDataTooBig, TooManyFilesSent
+from django.http import HttpResponseBase, JsonResponse
+from django.middleware.csrf import get_token
+from django.utils import timezone
+from django.views.decorators.csrf import csrf_protect
+
+from login.permissions import authenticate_request, _unauthenticated, _accesses_of
+from . import support_ticket_files as files
+from . import assistant_conversations
+
+TABLE = '"Learner".support_tickets'
+CATEGORIES = {'Technical Issue', 'Learning Support', 'Data / MIS', 'Coaching Query', 'Safeguarding Concern', 'Other'}
+PRIORITIES = {'low', 'medium', 'high', 'urgent'}
+STATUSES = {'open', 'in-progress', 'resolved', 'closed'}
+
+
+class TicketError(ValueError):
+    def __init__(self, message, status=400):
+        super().__init__(message)
+        self.status = status
+
+
+def staff_allowed(account):
+    return account.role == 'admin' or (account.role == 'staff' and 'support' in _accesses_of(account))
+
+
+def endpoint(staff=False):
+    def decorate(view):
+        @csrf_protect
+        @functools.wraps(view)
+        def wrapped(request, *args, **kwargs):
+            try:
+                account = authenticate_request(request)
+                if account is None or not account.is_active:
+                    return _unauthenticated(request)
+                allowed = staff_allowed(account) if staff else account.role == 'learner' and account.subject_type == 'learner'
+                if not allowed:
+                    raise TicketError('You do not have access to these support tickets.', 403)
+                if request.method not in {'GET', 'POST'}:
+                    raise TicketError('Method not allowed.', 405)
+                body = {}
+                if request.method == 'POST':
+                    if request.content_type == 'multipart/form-data':
+                        if int(request.META.get('CONTENT_LENGTH') or 0) > files.MAX_TOTAL_BYTES + 40000:
+                            raise TicketError('The request is too large.', 413)
+                        if set(request.POST) != {'payload'} or set(request.FILES) - {'attachments'}:
+                            raise TicketError('The request contains unsupported fields.')
+                        payload = request.POST['payload']
+                        if len(payload.encode('utf-8')) > 40000:
+                            raise TicketError('The request is too large.', 413)
+                        body = json.loads(payload)
+                        if request.FILES and (staff or kwargs.get('attachment_id')):
+                            raise TicketError('Only learners can upload support attachments.', 403)
+                    else:
+                        if len(request.body) > 40000:
+                            raise TicketError('The request is too large.', 413)
+                        body = json.loads(request.body or b'{}')
+                    if not isinstance(body, dict):
+                        raise TicketError('A JSON object is required.')
+                result = view(request, account, body, staff=staff, *args, **kwargs)
+                if isinstance(result, HttpResponseBase):
+                    result['Cache-Control'] = 'private, no-store'
+                    return result
+                if 'ticket' in result:
+                    result['ticket'] = public_ticket(result['ticket'])
+                if 'tickets' in result:
+                    result['tickets'] = [public_ticket(ticket) for ticket in result['tickets']]
+                response = JsonResponse({**result, 'csrfToken': get_token(request)})
+            except (TicketError, files.AttachmentError) as exc:
+                response = JsonResponse({'error': str(exc)}, status=exc.status)
+            except (RequestDataTooBig, TooManyFilesSent):
+                response = JsonResponse({'error': 'The attachment request is too large.'}, status=413)
+            except (ValueError, TypeError, UnicodeDecodeError):
+                response = JsonResponse({'error': 'Invalid support ticket request.'}, status=400)
+            except DatabaseError:
+                response = JsonResponse({'error': 'Support tickets are unavailable. Your message has not been cleared; please retry.'}, status=503)
+            response['Cache-Control'] = 'private, no-store'
+            return response
+        return wrapped
+    return decorate
+
+
+def text_field(body, key, maximum):
+    value = body.get(key)
+    if not isinstance(value, str) or not value.strip() or len(value.strip()) > maximum:
+        raise TicketError(f'{key} is required and must be at most {maximum} characters.')
+    return value.strip()
+
+
+def only(body, fields):
+    if set(body) - set(fields):
+        raise TicketError('The request contains unsupported fields.')
+
+
+def unpack(row):
+    return json.loads(row[0]) if isinstance(row[0], str) else row[0]
+
+
+def public_ticket(ticket):
+    return {**ticket, 'attachments': files.public(ticket.get('attachments', [])),
+            'replies': [{**{key: value for key, value in reply.items() if key not in {'accountId', 'attachments'}},
+                         'attachments': files.public(reply.get('attachments', []))}
+                        for reply in ticket.get('replies', [])]}
+
+
+def collection(request, account, body, *, staff):
+    if request.method == 'GET':
+        try:
+            offset = max(0, int(request.GET.get('offset', '0')))
+        except ValueError:
+            raise TicketError('Invalid page.') from None
+        with connections['enrolment'].cursor() as cursor:
+            where, params = ('', []) if staff else ('WHERE owner_account_id=%s', [account.pk])
+            cursor.execute(f'SELECT data FROM {TABLE} {where} ORDER BY created_at DESC, id LIMIT 101 OFFSET %s', [*params, offset])
+            rows = cursor.fetchall()
+        return {'tickets': [unpack(row) for row in rows[:100]], 'nextOffset': offset + 100 if len(rows) > 100 else None}
+    if staff:
+        raise TicketError('Create tickets from your learner account.', 403)
+    only(body, {'requestId', 'title', 'description', 'category', 'priority'})
+    ticket_id = str(UUID(text_field(body, 'requestId', 36)))
+    title = text_field(body, 'title', 200)
+    description = text_field(body, 'description', 10000)
+    if body.get('category') not in CATEGORIES or body.get('priority') not in PRIORITIES:
+        raise TicketError('Select a valid category and priority.')
+    prepared = files.prepare(request.FILES.getlist('attachments'), ticket_id)
+    now = timezone.now().isoformat()
+    data = dict(id=ticket_id, title=title, description=description, category=body['category'],
+                priority=body['priority'], status='open', submitted=now, lastUpdate=now,
+                requester=account.display_name or 'Learner', assignedTo='', assignedTeam='LMS Support',
+                messages=0, timeline=[{'event': 'Opened', 'timestamp': now}], replies=[],
+                attachments=[item for item, _ in prepared])
+    with files.upload_session() as staged, transaction.atomic(using='enrolment'), connections['enrolment'].cursor() as cursor:
+        cursor.execute(f'INSERT INTO {TABLE} (id,owner_account_id,enrolment_id,data) VALUES (%s,%s,%s,%s::jsonb) ON CONFLICT(id) DO NOTHING',
+                       [ticket_id, account.pk, account.subject_id, json.dumps(data)])
+        inserted = cursor.rowcount == 1
+        cursor.execute(f'SELECT data FROM {TABLE} WHERE id=%s AND owner_account_id=%s FOR UPDATE', [ticket_id, account.pk])
+        row = cursor.fetchone()
+        if not row:
+            raise TicketError('This request ID has already been used.', 409)
+        saved = unpack(row)
+        if any(saved.get(key) != data[key] for key in ('title', 'description', 'category', 'priority')):
+            raise TicketError('This request ID belongs to a different ticket. Reload the ticket list before retrying.', 409)
+        if not files.matches(saved.get('attachments', []), prepared):
+            raise TicketError('This request ID belongs to different attachments. Reload the ticket list before retrying.', 409)
+        if inserted:
+            files.save(prepared, staged)
+    # The LMS table is authoritative.  The secondary write is deliberately
+    # outside that transaction so a failure never rolls back a learner's ticket;
+    # the request remains retry-safe because the copy is keyed by ticket UUID.
+    try:
+        assistant_conversations.record_ticket(account=account, ticket=saved)
+    except assistant_conversations.AssistantConversationSyncError as exc:
+        raise TicketError(str(exc), 503) from exc
+    return {'ticket': saved}
+
+
+def create_staff_ticket(*, learner_account, ticket, actor_name='Support'):
+    """Create an LMS ticket for an authenticated staff workflow.
+
+    The learner account is resolved server-side from the feedback response; the
+    caller cannot supply ownership. The ticket UUID is deterministic so a retry
+    cannot create a second ticket.
+    """
+    if not learner_account or getattr(learner_account, 'subject_type', None) != 'learner':
+        raise TicketError('This feedback response is not linked to a learner account.', 409)
+    ticket_id = str(ticket['id'])
+    now = timezone.now().isoformat()
+    data = {
+        **ticket,
+        'id': ticket_id,
+        'status': 'open',
+        'submitted': now,
+        'lastUpdate': now,
+        'requester': getattr(learner_account, 'display_name', '') or 'Learner',
+        'assignedTo': '',
+        'assignedTeam': 'Quality Team',
+        'portalAssignedTeam': 'Quality Team',
+        'messages': 0,
+        'timeline': [{'event': 'Opened', 'timestamp': now, 'detail': actor_name}],
+        'replies': [],
+        'attachments': [],
+    }
+    with transaction.atomic(using='enrolment'), connections['enrolment'].cursor() as cursor:
+        cursor.execute(
+            f'INSERT INTO {TABLE} (id,owner_account_id,enrolment_id,data) VALUES (%s,%s,%s,%s::jsonb) ON CONFLICT(id) DO NOTHING',
+            [ticket_id, learner_account.pk, learner_account.subject_id, json.dumps(data)],
+        )
+        cursor.execute(f'SELECT data FROM {TABLE} WHERE id=%s AND owner_account_id=%s FOR UPDATE', [ticket_id, learner_account.pk])
+        row = cursor.fetchone()
+        if not row:
+            raise TicketError('The quality ticket could not be loaded.', 503)
+        saved = unpack(row)
+        if saved.get('assignedTeam') != 'Quality Team':
+            raise TicketError('This request ID belongs to a different ticket.', 409)
+    try:
+        assistant_conversations.record_ticket(account=learner_account, ticket=saved)
+    except assistant_conversations.AssistantConversationSyncError as exc:
+        raise TicketError(str(exc), 503) from exc
+    return saved
+
+
+def close_feedback_ticket(*, ticket_id, learner_id, actor_name):
+    """Synchronize closure of one server-identified feedback ticket.
+
+    Remote commits first. A local commit failure remains retryable: the next
+    attempt sees the remote Closed state and finishes the local update once.
+    The local row lock also serializes ticket creation and staff updates.
+    """
+    with transaction.atomic(using='enrolment'), connections['enrolment'].cursor() as cursor:
+        cursor.execute(f'SELECT data, enrolment_id FROM {TABLE} WHERE id=%s FOR UPDATE', [str(ticket_id)])
+        row = cursor.fetchone()
+        if not row:
+            return 'not_required'
+        saved = unpack(row)
+        if str(row[1]) != str(learner_id) or saved.get('assignedTeam') != 'Quality Team':
+            raise TicketError('The linked Quality ticket does not match this feedback response.', 409)
+        if saved.get('status') not in {'open', 'closed'}:
+            return 'not_required'
+        remote_status = assistant_conversations.close_open_quality_ticket(ticket_id=str(ticket_id))
+        if remote_status != 'Closed':
+            # Pending and any other non-open remote status are preserved.
+            return 'not_required'
+        if saved.get('status') != 'closed':
+            now = timezone.now().isoformat()
+            saved['status'], saved['lastUpdate'] = 'closed', now
+            saved.setdefault('timeline', []).append({
+                'event': 'Closed', 'timestamp': now,
+                'detail': f'{actor_name}: feedback follow-up email accepted for sending.',
+            })
+            cursor.execute(f'UPDATE {TABLE} SET data=%s::jsonb WHERE id=%s',
+                           [json.dumps(saved), str(ticket_id)])
+        return 'closed'
+
+
+def detail(request, account, body, ticket_id, *, staff):
+    with files.upload_session() as staged, transaction.atomic(using='enrolment'), connections['enrolment'].cursor() as cursor:
+        where, params = ('', []) if staff else (' AND owner_account_id=%s', [account.pk])
+        cursor.execute(f'SELECT data FROM {TABLE} WHERE id=%s{where} FOR UPDATE', [str(ticket_id), *params])
+        row = cursor.fetchone()
+        if not row:
+            raise TicketError('Ticket not found.', 404)
+        ticket = unpack(row)
+        if request.method == 'GET':
+            return {'ticket': ticket}
+        action = body.get('action')
+        if request.FILES and action != 'reply':
+            raise TicketError('Attachments can only be added to a reply.')
+        now = timezone.now().isoformat()
+        if action == 'reply':
+            only(body, {'action', 'requestId', 'body'})
+            reply_id = str(UUID(text_field(body, 'requestId', 36)))
+            message = text_field(body, 'body', 4000)
+            prepared = files.prepare(request.FILES.getlist('attachments'), str(ticket_id))
+            previous = next((reply for reply in ticket['replies'] if reply['id'] == reply_id), None)
+            if previous:
+                if (previous.get('accountId') != account.pk or previous['body'] != message
+                        or not files.matches(previous.get('attachments', []), prepared)):
+                    raise TicketError('This reply ID has already been used.', 409)
+                return {'ticket': ticket}
+            files.save(prepared, staged)
+            ticket['replies'].append(dict(id=reply_id, accountId=account.pk, sender=account.display_name or ('Support' if staff else 'Learner'),
+                                          senderRole='Support' if staff else 'Learner', body=message, timestamp=now,
+                                          attachments=[item for item, _ in prepared]))
+            ticket['messages'] = len(ticket['replies'])
+        elif action == 'status' and staff:
+            only(body, {'action', 'status', 'expectedStatus'})
+            if body.get('status') not in STATUSES:
+                raise TicketError('Invalid ticket status.')
+            if body.get('expectedStatus') != ticket['status']:
+                raise TicketError('The ticket has changed. Refresh before updating its status.', 409)
+            ticket['status'] = body['status']
+            ticket['timeline'].append(dict(event=body['status'], timestamp=now, detail=account.display_name or 'Support'))
+        elif action == 'assign' and staff:
+            only(body, {'action'})
+            ticket['assignedTo'] = account.display_name or 'Support'
+            ticket['timeline'].append(dict(event='Assigned', timestamp=now, detail=ticket['assignedTo']))
+        elif action == 'feedback' and not staff:
+            only(body, {'action', 'rating', 'comment'})
+            if ticket['status'] not in {'resolved', 'closed'} or type(body.get('rating')) is not int or not 1 <= body['rating'] <= 5:
+                raise TicketError('Rate a resolved ticket from 1 to 5.')
+            comment = body.get('comment', '')
+            if not isinstance(comment, str) or len(comment) > 4000:
+                raise TicketError('Feedback must be at most 4000 characters.')
+            ticket['feedback'] = dict(rating=body['rating'], comment=comment, timestamp=now)
+        else:
+            raise TicketError('This ticket action is not allowed.', 403)
+        ticket['lastUpdate'] = now
+        cursor.execute(f'UPDATE {TABLE} SET data=%s::jsonb WHERE id=%s', [json.dumps(ticket), str(ticket_id)])
+    return {'ticket': ticket}
+
+
+def attachment(request, account, body, ticket_id, attachment_id, *, staff):
+    if request.method != 'GET':
+        raise TicketError('Method not allowed.', 405)
+    with connections['enrolment'].cursor() as cursor:
+        where, params = ('', []) if staff else (' AND owner_account_id=%s', [account.pk])
+        cursor.execute(f'SELECT data FROM {TABLE} WHERE id=%s{where}', [str(ticket_id), *params])
+        row = cursor.fetchone()
+    if not row:
+        raise TicketError('Ticket not found.', 404)
+    ticket = unpack(row)
+    items = [*ticket.get('attachments', []),
+             *(item for reply in ticket.get('replies', []) for item in reply.get('attachments', []))]
+    item = next((item for item in items if item['id'] == str(attachment_id)), None)
+    if item is None:
+        raise TicketError('Attachment not found.', 404)
+    return files.download(item)
+
+
+learner_tickets = endpoint()(collection)
+learner_ticket = endpoint()(detail)
+staff_tickets = endpoint(staff=True)(collection)
+staff_ticket = endpoint(staff=True)(detail)
+learner_attachment = endpoint()(attachment)
+staff_attachment = endpoint(staff=True)(attachment)

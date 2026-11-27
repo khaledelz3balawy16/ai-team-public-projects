@@ -1,0 +1,1969 @@
+import type { RouteObject } from "react-router-dom";
+import { Navigate } from "react-router-dom";
+import { CHAT_ENABLED, LEARNER_FEEDBACK_ENABLED, LEARNER_POST_LECTURE_FEEDBACK_ENABLED } from "@/lib/featureFlags";
+import { RequireAuth } from "@/components/feature/RequireAuth";
+import { lazyRoute } from "./lazyRoute";
+import { LearnerDashboardRedirect } from "./LearnerDashboardRedirect";
+import { LearnerFeedbackFormRoute } from "./LearnerFeedbackFormRoute";
+import { studentWorkspaceRoutes } from "./studentWorkspaceRoutes";
+
+// Route components are code-split: each page becomes its own chunk, fetched on
+// first navigation instead of shipping in the entry bundle. router/index.ts
+// wraps every element in a <Suspense> boundary.
+//
+// `lazyRoute` rather than React's `lazy`: after a deploy the chunk names in an
+// already-open tab no longer exist, and the first navigation would otherwise
+// fail with "Failed to fetch dynamically imported module". See ./lazyRoute.
+const AdminAccessLogsPage = lazyRoute(() => import("../pages/admin/access-logs/page"));
+const SystemAuditTrailPage = lazyRoute(() => import("../pages/admin/audit-trail/page"));
+const SystemAuditTrailPersonPage = lazyRoute(() => import("../pages/admin/audit-trail/person/page"));
+const AdminDashboard = lazyRoute(() => import("../pages/workspace/admin/page"));
+const AdvancedAdminWorkspace = lazyRoute(() => import("../pages/workspace/advanced-admin/page"));
+// Give this route one extra bounded reload if a Vite update is still in flight
+// when the first reload reaches it.
+const AdvancedAdminLearner = lazyRoute(() => import("../pages/workspace/advanced-admin/learner"), { maxChunkReloads: 2 });
+const AdvancedAdminLearnerPreview = lazyRoute(() => import("../pages/workspace/advanced-admin/preview"));
+const EmployerWorkspacePage = lazyRoute(() => import("../pages/workspace/admin/employers/page"));
+const AdminCertificatesPage = lazyRoute(() => import("../pages/admin/certificates/page"));
+const AdminDocumentsPage = lazyRoute(() => import("../pages/admin/documents/page"));
+const AdminEvidencePage = lazyRoute(() => import("../pages/admin/evidence/page"));
+const AdminNotificationsPage = lazyRoute(() => import("../pages/admin/notifications/page"));
+const AdminPermissionsPage = lazyRoute(() => import("../pages/admin/permissions/page"));
+const AdminRolesPage = lazyRoute(() => import("../pages/admin/roles/page"));
+const AdminSystemSettingsPage = lazyRoute(() => import("../pages/admin/system/page"));
+const AdminAnnouncementsPage = lazyRoute(() => import("../pages/admin/announcements/page"));
+const CoachDirectoryPage = lazyRoute(() => import("../pages/admin/coach-directory/page"));
+const CoachBookingPage = lazyRoute(() => import("../pages/coach-booking/page"));
+const LmsIntroductionPage = lazyRoute(() => import("../pages/lms-introduction/page"));
+const ApprenticeshipApplicationPage = lazyRoute(() => import("../pages/apprenticeship-application/page"));
+const AdminUsersPage = lazyRoute(() => import("../pages/admin/users/page"));
+const PlatformReportPage = lazyRoute(() => import("../pages/admin/platform-report/page"));
+const AttendancePage = lazyRoute(() => import("../pages/learner/attendance/page"));
+const AttendanceRiskPage = lazyRoute(() => import("../pages/engagement/attendance-risk/page"));
+const AuditorWorkspace = lazyRoute(() => import("../pages/workspace/auditor/page"));
+const AuditorCopyWorkspace = lazyRoute(() => import("../pages/workspace/auditor-copy/page"));
+const AuditorManualWorkspace = lazyRoute(() => import("../pages/workspace/auditor-manual/page"));
+const AuditorHoursTestWorkspace = lazyRoute(() => import("../pages/workspace/auditor-hours-test/page"));
+const AuditSelectPage = lazyRoute(() => import("../pages/workspace/audit-select/page"));
+const BadgeDetailPage = lazyRoute(() => import("../pages/learner/rewards/badge-detail/page"));
+const BoardPage = lazyRoute(() => import("../pages/users/BoardPage"));
+const EmployerPortalPage = lazyRoute(() => import("../pages/employer/EmployerPortalPage"));
+const EmployerFeedbackPage = lazyRoute(() => import("../pages/employer/EmployerFeedbackPage"));
+const EmployerLearnerPage = lazyRoute(() => import("../pages/employer/EmployerLearnerPage"));
+const EventFeedbackPage = lazyRoute(() => import("../pages/event-feedback/page"));
+const PublicLectureFeedbackPage = lazyRoute(() => import("../pages/lecture-feedback/page"));
+const EventRsvpPage = lazyRoute(() => import("../pages/event-rsvp/page"));
+const EventCheckInPage = lazyRoute(() => import("../pages/event-check-in/page"));
+const QRAttendancePage = lazyRoute(() => import("../pages/qr-attendance/page"));
+const EmployerDocumentsPage = lazyRoute(() => import("../pages/employer/EmployerDocumentsPage"));
+const BudgetsPage = lazyRoute(() => import("../pages/finance/budgets/page"));
+const CallLogsPage = lazyRoute(() => import("../pages/engagement/call-logs/page"));
+const CatchUpPage = lazyRoute(() => import("../pages/learner/catchup/page"));
+const CertificateVerificationPage = lazyRoute(() => import("../pages/certificates/verify/page"));
+const CheckpointsPage = lazyRoute(() => import("../pages/curriculum/checkpoints/page"));
+const ClubBadgeDetailPage = lazyRoute(() => import("../pages/learner/clubs/badge-detail/page"));
+const ClubDetailPage = lazyRoute(() => import("../pages/learner/clubs/detail/page"));
+const ClubDiscussionDetailPage = lazyRoute(() => import("../pages/learner/clubs/discussion-detail/page"));
+const ClubEventsPage = lazyRoute(() => import("../pages/learner/clubs/events/page"));
+const ClubsPage = lazyRoute(() => import("../pages/learner/clubs/page"));
+const CoachAiMarking = lazyRoute(() => import("../pages/coach/ai-marking/page"));
+const CoachAttendance = lazyRoute(() => import("../pages/coach/attendance/page"));
+const CoachSupportTickets = lazyRoute(() => import("../pages/coach/support-tickets/page"));
+const CoachInfoSource = lazyRoute(() => import("../pages/coach/info-source/page"));
+const CoachAttendanceProfile = lazyRoute(() => import("../pages/coach/attendance-profile/page"));
+const CoachCaseFiles = lazyRoute(() => import("../pages/coach/case-files/page"));
+const CoachCaseload = lazyRoute(() => import("../pages/coach/caseload/page"));
+const CoachCatchupQueue = lazyRoute(() => import("../pages/coach/catchup-queue/page"));
+const CoachDashboard = lazyRoute(() => import("../pages/workspace/coach/page"));
+const CoachEvidenceValidation = lazyRoute(() => import("../pages/coach/evidence-validation/page"));
+const CoachKsbImpact = lazyRoute(() => import("../pages/coach/ksb-impact/page"));
+const CoachMarkingQueue = lazyRoute(() => import("../pages/coach/marking-queue/page"));
+const CoachMarkingReviewPage = lazyRoute(() => import("../pages/coach/marking-review/page"));
+const CoachMonthlyCoaching = lazyRoute(() => import("../pages/coach/monthly-coaching/page"));
+const CoachMeetingDetail = lazyRoute(() => import("../pages/coach/meeting-detail/page"));
+const CoachReviewInstancePage = lazyRoute(() => import("../pages/coach/review-instance/page"));
+const MonthlyLogsPage = lazyRoute(() => import("../features/monthly-logs/page"));
+const CoachOtjhReports = lazyRoute(() => import("../pages/coach/otjh-reports/page"));
+const CoachMonthlyReports = lazyRoute(() => import("../pages/coach/monthly-reports/page"));
+const CoachProgressReviews = lazyRoute(() => import("../pages/coach/progress-reviews/page"));
+const CoachReportsPage = lazyRoute(() => import("../pages/coach/reports/page"));
+const CoachTimetable = lazyRoute(() => import("../pages/coach/timetable/page"));
+const CommunicationPage = lazyRoute(() => import("../pages/communication/page"));
+const CurriculumDashboard = lazyRoute(() => import("../pages/workspace/curriculum/page"));
+const CurriculumLibraryHub = lazyRoute(() => import("../pages/curriculum/hubs/page").then(module => ({ default: module.CurriculumLibraryHub })));
+const MigratedReviewTemplates = lazyRoute(() => import("../pages/curriculum/review-templates/page"));
+const CurriculumDeliveryHub = lazyRoute(() => import("../pages/curriculum/hubs/page").then(module => ({ default: module.CurriculumDeliveryHub })));
+const CurriculumBulkAttendance = lazyRoute(() => import("../pages/curriculum/bulk-attendance/page"));
+const CurriculumQualityHub = lazyRoute(() => import("../pages/curriculum/hubs/page").then(module => ({ default: module.CurriculumQualityHub })));
+const CurriculumQualityDemo = lazyRoute(() => import("../pages/dashboard/page"));
+const CoachingQualityReviewsPage = lazyRoute(() => import("../pages/coaching-recordings/QualityReviewsPage"));
+const CoachingQualityFormsPage = lazyRoute(() => import("../pages/coaching-recordings/QualityFormsPage"));
+const CurriculumFreeCourses = lazyRoute(() => import("../pages/curriculum/free-courses/page"));
+const CoachAuditTrailPage = lazyRoute(() => import("../pages/coach/audit-trail/page"));
+const CoachAuditTrailPersonPage = lazyRoute(() => import("../pages/coach/audit-trail/person/page"));
+const CurriculumAuditTrailPage = lazyRoute(() => import("../pages/curriculum/audit-trail/page"));
+const CurriculumAuditTrailPersonPage = lazyRoute(() => import("../pages/curriculum/audit-trail/person/page"));
+const CurriculumArchive = lazyRoute(() => import("../pages/curriculum/archive/page"));
+const CurriculumCohorts = lazyRoute(() => import("../pages/curriculum/cohorts/page"));
+const CurriculumCohortWorkspace = lazyRoute(() => import("../pages/curriculum/cohort-workspace/page"));
+const CurriculumGroups = lazyRoute(() => import("../pages/curriculum/groups/page"));
+const CurriculumGroupWorkspace = lazyRoute(() => import("../pages/curriculum/group-workspace/page"));
+const CurriculumEnglandHolidays = lazyRoute(() => import("../pages/curriculum/england-holidays/page"));
+const CurriculumModuleWorkspace = lazyRoute(() => import("../pages/curriculum/module-workspace/page"));
+const CurriculumTeamsMeetings = lazyRoute(() => import("../pages/curriculum/teams-meetings/page"));
+const CurriculumRecordings = lazyRoute(() => import("../pages/curriculum/recordings/page"));
+const CurriculumRecordingsHub = lazyRoute(() => import("../pages/curriculum/recordings/RecordingsHub"));
+const CoachingRecordings = lazyRoute(() => import("../pages/coaching-recordings/page"));
+const CurriculumProgrammes = lazyRoute(() => import("../pages/curriculum/programmes/page"));
+const CurriculumPublishedPage = lazyRoute(() => import("../pages/curriculum/published/page"));
+const CurriculumQAPage = lazyRoute(() => import("../pages/curriculum/curriculum-qa/page"));
+const CurriculumReportsPage = lazyRoute(() => import("../pages/curriculum/reports/page"));
+const CurriculumStandards = lazyRoute(() => import("../pages/curriculum/standards/page"));
+const CurriculumVersionControlPage = lazyRoute(() => import("../pages/curriculum/version-control/page"));
+const CurriculumWeekBuilder = lazyRoute(() => import("../pages/curriculum/week-builder/page"));
+const EmailLogsPage = lazyRoute(() => import("../pages/engagement/email-logs/page"));
+const EmployerApprenticeProgress = lazyRoute(() => import("@/pages/employer/apprentice-progress/page"));
+const EmployerApprenticeRisk = lazyRoute(() => import("@/pages/employer/apprentice-risk/page"));
+const EmployerApprentices = lazyRoute(() => import("../pages/employer/apprentices/page"));
+const EmployerCommunityActivity = lazyRoute(() => import("@/pages/employer/community-activity/page"));
+const EmployerDashboard = lazyRoute(() => import("../pages/workspace/employer/page"));
+const EmployerDocumentsToSign = lazyRoute(() => import("../pages/employer/documents/page"));
+const EmployerEmployerClubs = lazyRoute(() => import("@/pages/employer/employer-clubs/page"));
+const EmployerEvents = lazyRoute(() => import("@/pages/employer/events/page"));
+const EmployerEvidenceSummary = lazyRoute(() => import("@/pages/employer/evidence-summary/page"));
+const EmployerGatewayEPA = lazyRoute(() => import("@/pages/employer/gateway-epa/page"));
+const EmployerKSBProgress = lazyRoute(() => import("@/pages/employer/ksb-progress/page"));
+const EmployerLearnerClubs = lazyRoute(() => import("@/pages/employer/learner-clubs/page"));
+const EmployerOTJHConfirmation = lazyRoute(() => import("../pages/employer/otjh-confirm/page"));
+const EmployerProgressReviewsPage = lazyRoute(() => import("../pages/employer/progress-reviews/page"));
+const EmployerReports = lazyRoute(() => import("@/pages/employer/reports/page"));
+const EmployerReviewActions = lazyRoute(() => import("@/pages/employer/review-actions/page"));
+const EmployerSupportRequests = lazyRoute(() => import("@/pages/employer/support/page"));
+const EmployerWorkplaceConfirmations = lazyRoute(() => import("@/pages/employer/workplace-confirm/page"));
+const EngagementClubsPage = lazyRoute(() => import("../pages/engagement/clubs/page"));
+const EngagementDashboard = lazyRoute(() => import("../pages/workspace/engagement/page"));
+const EngagementFeedbacksPage = lazyRoute(() => import("../pages/engagement/feedbacks/page"));
+const EngagementReportsPage = lazyRoute(() => import("../pages/engagement/reports/page"));
+const FeedbackPage = lazyRoute(() => import("../pages/engagement/feedback/page"));
+const FeedbackEditorPage = lazyRoute(() => import("../pages/engagement/feedback/editor/page"));
+const FeedbackPreviewPage = lazyRoute(() => import("../pages/engagement/feedback/preview/page"));
+const EventDetailPage = lazyRoute(() => import("../pages/learner/clubs/events/detail/page"));
+const EventsPage = lazyRoute(() => import("../pages/engagement/events/page"));
+const LearnerFlashCardsPage = lazyRoute(() => import("../pages/learner/flash-cards/page"));
+const LearnerFeedbackPage = lazyRoute(() => import("../pages/learner/feedback/page"));
+const LearnerFeedbackFormPage = lazyRoute(() => import("../pages/learner/feedback/form/page"));
+const FinanceReportsPage = lazyRoute(() => import("../pages/finance/reports/page"));
+const FinanceWorkspace = lazyRoute(() => import("../pages/workspace/finance/page"));
+const BreatheIntegrationWorkspace = lazyRoute(() => import("../pages/workspace/integrations/breathe/page"));
+const HRSystemWorkspace = lazyRoute(() => import("../pages/workspace/hr-system/page"));
+const FlashCardsPage = lazyRoute(() => import("../pages/engagement/flash-cards/page"));
+const ForgotPasswordPage = lazyRoute(() => import("../pages/forgot-password/page"));
+const LoginPage = lazyRoute(() => import("../pages/login/page"));
+const OldOtjhPage = lazyRoute(() => import("../features/old-otjh/page"));
+const AccessRequiredPage = lazyRoute(() => import("../pages/access-required/page"));
+const ChooseWorkspacePage = lazyRoute(() => import("../pages/choose-workspace/page"));
+// Serves both emailed-token flows; `mode` picks which.
+const SetPasswordPage = lazyRoute(() => import("../pages/set-password/page"));
+const FundingOverviewPage = lazyRoute(() => import("../pages/finance/funding/page"));
+const GatewayReadinessPage = lazyRoute(() => import("../pages/learner/gateway/page"));
+const GeneralMessagesPage = lazyRoute(() => import("../pages/messages/page"));
+const GeneralNotificationsPage = lazyRoute(() => import("../pages/notifications/page"));
+const GeneralTasksPage = lazyRoute(() => import("../pages/tasks/page"));
+const Home = lazyRoute(() => import("../pages/home/page"));
+const IfateStandardPage = lazyRoute(() => import("../pages/curriculum/ifate-standard/page"));
+const InternalPanelPage = lazyRoute(() => import("../pages/internal-panel/page"));
+const InvoicingPage = lazyRoute(() => import("../pages/finance/invoices/page"));
+const KSBMapping = lazyRoute(() => import("../pages/curriculum/ksb-mapping/page"));
+const LeadershipAchievementPipelinePage = lazyRoute(() => import("@/pages/leadership/achievement-pipeline/page"));
+const LeadershipAttendanceTrendsPage = lazyRoute(() => import("@/pages/leadership/attendance-trends/page"));
+const LeadershipCoachWorkloadPage = lazyRoute(() => import("@/pages/leadership/coach-workload/page"));
+const LeadershipCohortPerformancePage = lazyRoute(() => import("@/pages/leadership/cohort-performance/page"));
+const LeadershipComplianceRiskPage = lazyRoute(() => import("@/pages/leadership/compliance-risk/page"));
+const LeadershipDashboard = lazyRoute(() => import("../pages/workspace/leadership/page"));
+const LeadershipDeliveryPerformancePage = lazyRoute(() => import("@/pages/leadership/delivery-performance/page"));
+const LeadershipEmployerEngagementPage = lazyRoute(() => import("@/pages/leadership/employer-engagement/page"));
+const LeadershipEngagementTrendsPage = lazyRoute(() => import("@/pages/leadership/engagement-trends/page"));
+const LeadershipGatewayEpaProgressPage = lazyRoute(() => import("@/pages/leadership/gateway-epa-progress/page"));
+const LeadershipKsbProgressPage = lazyRoute(() => import("@/pages/leadership/ksb-progress/page"));
+const LeadershipLearnerProgressPage = lazyRoute(() => import("@/pages/leadership/learner-progress/page"));
+const LeadershipOfstedPage = lazyRoute(() => import("@/pages/leadership/ofsted/page"));
+const LeadershipOtjhTrendsPage = lazyRoute(() => import("@/pages/leadership/otjh-trends/page"));
+const LeadershipProgrammePerformancePage = lazyRoute(() => import("@/pages/leadership/programme-performance/page"));
+const LeadershipQaSamplingPage = lazyRoute(() => import("@/pages/leadership/qa-sampling/page"));
+const LeadershipReportsPage = lazyRoute(() => import("@/pages/leadership/reports/page"));
+const LeadershipSarQipPage = lazyRoute(() => import("@/pages/leadership/sar-qip/page"));
+const LeadershipTutorSlaPage = lazyRoute(() => import("@/pages/leadership/tutor-sla/page"));
+const LearnerCalendarPage = lazyRoute(() => import("../pages/learner/calendar/page"));
+const LearnerCaseFile = lazyRoute(() => import("../pages/coach/learner-case-file/page"));
+const LearnerEngagementPage = lazyRoute(() => import("../pages/engagement/learner-engagement/page"));
+const LearnerKnowledgeBase = lazyRoute(() => import("../pages/learner/knowledge-base/page"));
+const LearnerLearningPlanPage = lazyRoute(() => import("../pages/learner/learning-plan/page"));
+const LearnerLearningPlanModulesPage = lazyRoute(() => import("../pages/learner/learning-plan/modules/page"));
+const LearnerOnboardingPage = lazyRoute(() => import("../pages/learner/onboarding/page"));
+const LearnerWelcomePage = lazyRoute(() => import("../pages/learner/welcome/page"));
+const LearnerCompliancePage = lazyRoute(() => import("../pages/learner/compliance/page"));
+const LearnerFirstSessionPage = lazyRoute(() => import("../pages/learner/first-session/page"));
+const LearnerOnboardingReviewsPage = lazyRoute(() => import("../pages/learner/onboarding/reviews/page"));
+const LearnerReviewFormPage = lazyRoute(() => import("../pages/learner/onboarding/reviews/form"));
+const LearnerProfilePage = lazyRoute(() => import("../pages/learner/profile/page"));
+const MISDashboard = lazyRoute(() => import("../pages/workspace/mis/page"));
+// These two exports live in the same module; map the named list export for lazy routing.
+const MonthlyCoachingPage = lazyRoute(() => import("../pages/learner/monthly-coaching/page"));
+const MonthlyCoachingListPage = lazyRoute(() => import("../pages/learner/monthly-coaching/page").then(m => ({ default: m.MonthlyCoachingListPage })));
+const ProgressReviewsPage = lazyRoute(() => import("../pages/learner/progress-reviews/page"));
+const ProgressReviewsListPage = lazyRoute(() => import("../pages/learner/progress-reviews/page").then(m => ({ default: m.ProgressReviewsListPage })));
+const CurriculumReviewsPage = lazyRoute(() => import("../pages/learner/reviews/curriculumReviews").then(m => ({ default: m.CurriculumReviewPage })));
+const CurriculumReviewsListPage = lazyRoute(() => import("../pages/learner/reviews/curriculumReviews").then(m => ({ default: m.CurriculumReviewsListPage })));
+const ManualQuizPage = lazyRoute(() => import("../pages/curriculum/quiz-xml/manual/page"));
+const MisAttendanceModesPage = lazyRoute(() => import("../pages/mis/attendance-modes/page"));
+const MisCalendarPage = lazyRoute(() => import("../pages/mis/calendar/page"));
+const MisCoachAssignmentPage = lazyRoute(() => import("../pages/mis/coach-assignment/page"));
+const MisCohortsPage = lazyRoute(() => import("../pages/mis/cohorts/page"));
+const MisDataQualityPage = lazyRoute(() => import("../pages/mis/data-quality/page"));
+const MisDeliveryDatesPage = lazyRoute(() => import("../pages/mis/delivery-dates/page"));
+const MisDeliveryTimelinePage = lazyRoute(() => import("../pages/mis/delivery-timeline/page"));
+const MisLearnerAllocationPage = lazyRoute(() => import("../pages/mis/learner-allocation/page"));
+const MisModuleAllocationPage = lazyRoute(() => import("../pages/mis/module-allocation/page"));
+const MisProgrammeAllocationPage = lazyRoute(() => import("../pages/mis/programme-allocation/page"));
+const MisReportsPage = lazyRoute(() => import("../pages/mis/reports/page"));
+const MisTeamsSessionsPage = lazyRoute(() => import("../pages/mis/teams-sessions/page"));
+const MisTimetablesPage = lazyRoute(() => import("../pages/mis/timetables/page"));
+const MisTutorAssignmentPage = lazyRoute(() => import("../pages/mis/tutor-assignment/page"));
+const ModuleBuilder = lazyRoute(() => import("../pages/curriculum/module-builder/page"));
+const LearnerModuleProgressPage = lazyRoute(() => import("../pages/curriculum/learner-module-progress/page"));
+const ModulesPage = lazyRoute(() => import("../pages/learner/my-learning/page"));
+const ExtraActivityPage = lazyRoute(() => import("../pages/learner/monthly-submission/ExtraActivityPage"));
+const CoachExtraActivitiesPage = lazyRoute(() => import("../pages/coach/extra-activities/page"));
+const MonthlySubmissionPage = lazyRoute(() => import("../pages/learner/monthly-submission/page"));
+const HistoricalAssignmentPage = lazyRoute(() => import("../pages/learner/monthly-submission/HistoricalAssignmentPage"));
+const MyLearningPage = lazyRoute(() => import("../pages/learner/my-learning/page"));
+const PersonalCoursesPage = lazyRoute(() => import("../pages/personal-learning/page"));
+const MySchedulePage = lazyRoute(() => import("../pages/learner/clubs/events/schedule/page"));
+const NotFound = lazyRoute(() => import("../pages/NotFound"));
+const PaymentsPage = lazyRoute(() => import("../pages/finance/payments/page"));
+const PointsRulesPage = lazyRoute(() => import("../pages/engagement/points-rules/page"));
+// Reached only through /learner/otjh and /learner/ksbs, which open it on the
+// matching tab. The combined /learner/progress entry point was removed.
+const ProgressPage = lazyRoute(() => import("../pages/learner/progress/page"));
+const EvidencePage = lazyRoute(() => import("../pages/learner/evidence/page"));
+const ProgrammeDetailPage = lazyRoute(() => import("../pages/curriculum/programme-detail/page"));
+const QADashboard = lazyRoute(() => import("../pages/workspace/qa/page"));
+const QaDeliverySetup = lazyRoute(() => import("../pages/qa/delivery-setup/page"));
+const QaEligibility = lazyRoute(() => import("../pages/qa/eligibility/page"));
+const QaEmployerContracting = lazyRoute(() => import("../pages/qa/employer-contracting/page"));
+const QaEscalations = lazyRoute(() => import("../pages/qa/escalations/page"));
+const QaEvidence = lazyRoute(() => import("../pages/qa/evidence/page"));
+const QaFindings = lazyRoute(() => import("../pages/qa/findings/page"));
+const QaGatewayEpa = lazyRoute(() => import("../pages/qa/gateway-epa/page"));
+const QaInitialAssessment = lazyRoute(() => import("../pages/qa/initial-assessment/page"));
+const QaKsb = lazyRoute(() => import("../pages/qa/ksb/page"));
+const QaModule = lazyRoute(() => import("../pages/qa/module/page"));
+const QaOtjh = lazyRoute(() => import("../pages/qa/otjh/page"));
+const QaPreActive = lazyRoute(() => import("../pages/qa/pre-active/page"));
+const QaProgressReview = lazyRoute(() => import("../pages/qa/progress-review/page"));
+const QaRejected = lazyRoute(() => import("../pages/qa/rejected/page"));
+const QaReport = lazyRoute(() => import("../pages/qa/report/page"));
+const QaReports = lazyRoute(() => import("../pages/qa/reports/page"));
+const QaRpl = lazyRoute(() => import("../pages/qa/rpl/page"));
+const QaSampling = lazyRoute(() => import("../pages/qa/sampling/page"));
+const QuestionBankPage = lazyRoute(() => import("../pages/curriculum/question-bank/page"));
+const QuizEditPage = lazyRoute(() => import("../pages/curriculum/quiz-xml/edit/page"));
+const QuizTakePage = lazyRoute(() => import("../pages/learner/quiz-take/page"));
+const QuizXmlWorkspace = lazyRoute(() => import("../pages/curriculum/quiz-xml/page"));
+const KnowledgeBasePage = lazyRoute(() => import("../pages/curriculum/knowledge-base/page"));
+const QuizzesPage = lazyRoute(() => import("../pages/learner/my-learning/page"));
+const RecognitionPage = lazyRoute(() => import("../pages/engagement/recognition/page"));
+const ReportAbsencePage = lazyRoute(() => import("../pages/learner/report-absence/page"));
+const RewardsPage = lazyRoute(() => import("../pages/learner/rewards/page"));
+const RewardsShopPage = lazyRoute(() => import("../pages/engagement/rewards-shop/page"));
+const SafeguardingClosedCases = lazyRoute(() => import("@/pages/safeguarding/closed-cases/page"));
+const SafeguardingCommunication = lazyRoute(() => import("@/pages/safeguarding/communication/page"));
+const SafeguardingDashboard = lazyRoute(() => import("@/pages/workspace/safeguarding/page"));
+const SafeguardingHighRiskCases = lazyRoute(() => import("@/pages/safeguarding/high-risk-cases/page"));
+const SafeguardingLearnerWellbeing = lazyRoute(() => import("@/pages/safeguarding/learner-wellbeing/page"));
+const SafeguardingNewConcerns = lazyRoute(() => import("@/pages/safeguarding/new-concerns/page"));
+const SafeguardingOpenCases = lazyRoute(() => import("@/pages/safeguarding/open-cases/page"));
+const SafeguardingPreventRisk = lazyRoute(() => import("@/pages/safeguarding/prevent-risk/page"));
+const SafeguardingQAAudit = lazyRoute(() => import("@/pages/safeguarding/qa-audit/page"));
+const SafeguardingReferrals = lazyRoute(() => import("@/pages/safeguarding/referrals/page"));
+const SafeguardingReports = lazyRoute(() => import("@/pages/safeguarding/reports/page"));
+const SessionCalendarPage = lazyRoute(() => import("../pages/curriculum/session-calendar/page"));
+const ProgressTransfersPage = lazyRoute(() => import("../pages/curriculum/progress-transfers/page"));
+const StarredMessagesPage = lazyRoute(() => import("../pages/starred-messages/page"));
+const SupportDashboard = lazyRoute(() => import("@/pages/workspace/support/page"));
+const SupportEscalations = lazyRoute(() => import("@/pages/support/escalations/page"));
+const SupportKnowledgeBase = lazyRoute(() => import("@/pages/support/knowledge-base/page"));
+const SupportMyTickets = lazyRoute(() => import("@/pages/support/my-tickets/page"));
+const SupportPage = lazyRoute(() => import("../pages/learner/support/page"));
+const SupportReports = lazyRoute(() => import("@/pages/support/reports/page"));
+const SupportResolved = lazyRoute(() => import("@/pages/support/resolved/page"));
+const SupportTicketQueue = lazyRoute(() => import("@/pages/support/ticket-queue/page"));
+const TrainingPlanBuilderPage = lazyRoute(() => import("../pages/delivery/TrainingPlanPage"));
+const TrainingPlanPage = lazyRoute(() => import("../pages/learner/my-learning/page"));
+const TutorAiMarkingPage = lazyRoute(() => import("../pages/tutor/ai-marking/page"));
+const TutorAssignmentMarking = lazyRoute(() => import("../pages/tutor/assignment-marking/page"));
+const TutorDashboard = lazyRoute(() => import("../pages/workspace/tutor/page"));
+const TutorEvidenceReview = lazyRoute(() => import("../pages/tutor/evidence-review/page"));
+const TutorFeedbackQueuePage = lazyRoute(() => import("../pages/tutor/feedback-queue/page"));
+const TutorKsbValidationPage = lazyRoute(() => import("../pages/tutor/ksb-validation/page"));
+const TutorLearnersPage = lazyRoute(() => import("../pages/tutor/learners/page"));
+const TutorOtjhValidationPage = lazyRoute(() => import("../pages/tutor/otjh-validation/page"));
+const TutorQuizResults = lazyRoute(() => import("../pages/tutor/quiz-results/page"));
+const TutorReportsPage = lazyRoute(() => import("../pages/tutor/reports/page"));
+const TutorResourcesPage = lazyRoute(() => import("../pages/tutor/resources/page"));
+const TutorSessionsPage = lazyRoute(() => import("../pages/tutor/sessions/page"));
+const UserGuidePage = lazyRoute(() => import("../pages/user-guide/page"));
+const UsersListPage = lazyRoute(() => import("../pages/users/page"));
+const FirstSessionBookingsPage = lazyRoute(() => import("../pages/users/first-sessions/page"));
+const EnrolmentCoursesPage = lazyRoute(() => import("../pages/users/my-courses/page"));
+const VideoWatchPage = lazyRoute(() => import("../pages/learner/video-watch/page"));
+const VoucherClaimsPage = lazyRoute(() => import("../pages/engagement/voucher-claims/page"));
+const WeekDetailPage = lazyRoute(() => import("../pages/learner/week-detail/page"));
+const WhatsAppLogsPage = lazyRoute(() => import("../pages/engagement/whatsapp-logs/page"));
+const WizardPage = lazyRoute(() => import("../pages/users/wizard/WizardPage"));
+const WizardBuilderPage = lazyRoute(() => import("../pages/users/wizard-builder/page"));
+const EligibilityBuilderPage = lazyRoute(() => import("../pages/users/eligibility-builder/page"));
+
+const routes: RouteObject[] = [
+  { path: '/old-otjh', element: <OldOtjhPage /> },
+  { path: '/old-otjh/months', element: <OldOtjhPage /> },
+  { path: '/old-otjh/months/:month', element: <OldOtjhPage /> },
+  { path: '/old-otjh/coach', element: <OldOtjhPage /> },
+  { path: '/old-otjh/monitor', element: <OldOtjhPage /> },
+  { path: '/old-otjh/coach/:aptemId', element: <OldOtjhPage /> },
+  { path: '/old-otjh/coach/:aptemId/months', element: <OldOtjhPage /> },
+  { path: '/old-otjh/coach/:aptemId/months/:month', element: <OldOtjhPage /> },
+  {
+    // Sign-in is the front door. LoginPage bounces an already-signed-in visitor
+    // to their own workspace (see homeFor there), so "/" is the login form for a
+    // stranger and a redirect to your console when you have a session — which is
+    // also what makes the logo and the breadcrumb home icon do the right thing.
+    path: "/",
+    element: <LoginPage />,
+  },
+  {
+    path: "/event-feedback",
+    element: <EventFeedbackPage />,
+  },
+  {
+    path: "/lecture-feedback",
+    element: <PublicLectureFeedbackPage />,
+  },
+  {
+    path: "/event-rsvp",
+    element: <EventRsvpPage />,
+  },
+  {
+    path: "/event-check-in",
+    element: <EventCheckInPage />,
+  },
+  {
+    path: "/qr-attendance",
+    element: <QRAttendancePage />,
+  },
+  {
+    // The public launcher that used to be at "/". Kept reachable: it is the
+    // "explore this section" demo entry point, which is not the same thing as
+    // the way in for a real account.
+    path: "/home",
+    element: <Home />,
+  },
+  {
+    path: "/internal-panel",
+    element: <InternalPanelPage />,
+  },
+  {
+    // Real sign-in against /login_api/ (the Django `login` app). The home page
+    // remains a public launcher; this is the way in for an actual account.
+    path: "/login",
+    element: <LoginPage />,
+  },
+  {
+    // Where a signed-in staff account with no access grant lands. Deliberately
+    // outside any workspace shell — there is no workspace they can open yet.
+    path: "/access-required",
+    element: <AccessRequiredPage />,
+  },
+  {
+    // Where an account holding more than one access grant picks what to open.
+    // NOT public: it names the workspaces a specific account can reach, so it
+    // stays inside RequireAuth with everything else below.
+    path: "/choose-workspace",
+    element: <ChooseWorkspacePage />,
+  },
+  {
+    path: "/forgot-password",
+    element: <ForgotPasswordPage />,
+  },
+  {
+    // Target of the invitation email — set the first password for a new account.
+    path: "/set-password",
+    element: <SetPasswordPage mode="invitation" />,
+  },
+  {
+    // Target of the password-reset email. Same component, different endpoints.
+    path: "/reset-password",
+    element: <SetPasswordPage mode="reset" />,
+  },
+  {
+    // A new apprentice's first sign-in: address and personal details, then an
+    // electronic signature. Sent here by useFirstLoginDetailsRedirect; finishing
+    // moves them to Onboarding and on to the wizard below.
+    path: "/learner/welcome",
+    element: <LearnerWelcomePage />,
+  },
+  {
+    // The learner's own enrolment wizard. Onboarding learners are redirected
+    // here by useOnboardingRedirect, so the bare path must resolve; the wizard
+    // then navigates between steps by slug.
+    path: "/learner/onboarding",
+    element: <LearnerOnboardingPage />,
+  },
+  {
+    // The learner's statutory paperwork — generated from their own record and
+    // signed by them and their employer.
+    path: "/learner/compliance-documents",
+    element: <LearnerCompliancePage />,
+  },
+  {
+    // A Delivery apprentice books their first learning session here, once
+    // they have signed all four compliance documents.
+    path: "/learner/first-session",
+    element: <LearnerFirstSessionPage />,
+  },
+  {
+    // Declared before the :stepSlug pattern below, which would otherwise
+    // capture "reviews" as a wizard step.
+    path: "/learner/onboarding/reviews",
+    element: <LearnerOnboardingReviewsPage />,
+  },
+  {
+    // The review form. The event key contains colons ("eligibility-review:31:1:
+    // 2026-08-03"), which are fine in a single path segment.
+    path: "/learner/onboarding/reviews/:eventKey",
+    element: <LearnerReviewFormPage />,
+  },
+  {
+    path: "/learner/onboarding/:stepSlug",
+    element: <LearnerOnboardingPage />,
+  },
+  {
+    path: "/learner",
+    element: <Navigate to="/learner/home" replace />,
+  },
+  ...studentWorkspaceRoutes,
+  {
+    path: "/workspace/coach",
+    element: <CoachDashboard />,
+  },
+  {
+    path: "/workspace/admin",
+    element: <AdminDashboard />,
+  },
+  {
+    path: "/workspace/advanced-admin",
+    element: <AdvancedAdminWorkspace />,
+  },
+  {
+    path: "/workspace/advanced-admin/learners/:learnerId",
+    element: <AdvancedAdminLearner />,
+  },
+  {
+    path: "/workspace/advanced-admin/learners/:learnerId/preview",
+    element: <AdvancedAdminLearnerPreview />,
+  },
+  {
+    path: "/workspace/advanced-admin/learners/:learnerId/preview/:section",
+    element: <AdvancedAdminLearnerPreview />,
+  },
+  {
+    path: "/workspace/advanced-admin/learners/:learnerId/:section",
+    element: <AdvancedAdminLearner />,
+  },
+  {
+    // Every employer as a card; each opens /employers/:employerId.
+    path: "/workspace/admin/employers",
+    element: <EmployerWorkspacePage />,
+  },
+  {
+    path: "/workspace/admin/certificates",
+    element: <AdminCertificatesPage />,
+  },
+  {
+    path: "/admin/users",
+    element: <AdminUsersPage />,
+  },
+  {
+    path: "/admin/certificates",
+    element: <Navigate to="/workspace/admin/certificates" replace />,
+  },
+  {
+    path: "/admin/roles",
+    element: <AdminRolesPage />,
+  },
+  {
+    path: "/admin/permissions",
+    element: <AdminPermissionsPage />,
+  },
+  {
+    path: "/admin/documents",
+    element: <AdminDocumentsPage />,
+  },
+  {
+    path: "/admin/evidence",
+    element: <AdminEvidencePage />,
+  },
+  {
+    path: "/admin/evidence/:learnerId",
+    element: <AdminEvidencePage />,
+  },
+  {
+    path: "/admin/notifications",
+    element: <AdminNotificationsPage />,
+  },
+  {
+    path: "/users",
+    element: <UsersListPage />,
+  },
+  // The enrolment wizard builder. A static segment, so it wins over /users/:userId.
+  {
+    path: "/users/wizard-builder",
+    element: <WizardBuilderPage />,
+  },
+  // The builder of the public eligibility form (/apprenticeship_application). Static too.
+  {
+    path: "/users/eligibility-builder",
+    element: <EligibilityBuilderPage />,
+  },
+  {
+    path: "/users/:userId",
+    element: <BoardPage />,
+  },
+  // The employer-facing side pages, opened from the Users directory's View action
+  // on an employer row.
+  {
+    path: "/employers/:employerId",
+    element: <EmployerPortalPage />,
+  },
+  {
+    // The two sidebar sections. Same page component, which reads the section
+    // from the path; the static segments outrank the :kind/:learnerId and
+    // documents patterns below, so those keep matching their own pages.
+    path: "/employers/:employerId/learners",
+    element: <EmployerPortalPage />,
+  },
+  {
+    path: "/employers/:employerId/reviews",
+    element: <EmployerPortalPage />,
+  },
+  {
+    path: "/employers/:employerId/feedback",
+    element: <EmployerFeedbackPage />,
+  },
+  {
+    path: "/employers/:employerId/feedback/:deliveryId",
+    element: <EmployerFeedbackPage />,
+  },
+  {
+    // Every document across the employer's learners.
+    path: "/employers/:employerId/documents",
+    element: <EmployerDocumentsPage />,
+  },
+  {
+    path: "/employers/:employerId/learner/:kind/:learnerId",
+    element: <EmployerLearnerPage />,
+  },
+  {
+    path: "/users/:userId/wizard",
+    element: <WizardPage />,
+  },
+  {
+    path: "/users/:userId/wizard/:stepSlug",
+    element: <WizardPage />,
+  },
+ 
+  {
+    path: "/activity-categories",
+    element: <Navigate to="/workspace/auditor" replace />,
+  },
+  {
+    path: "/activity-categories/:kind/:id",
+    element: <Navigate to="/workspace/auditor" replace />,
+  },
+  {
+    path: "/training-plan/:kind/:userId",
+    element: <TrainingPlanBuilderPage />,
+  },
+
+  {
+    path: "/learner/week/:weekNumber",
+    element: <WeekDetailPage />,
+  },
+  {
+    path: "/my-courses",
+    element: <PersonalCoursesPage />,
+  },
+  {
+    // Canonical URL for the merged Overview/Modules/Quizzes page. The three
+    // routes below it are the pre-merge URLs (training-plan, modules,
+    // quizzes) — kept working for staff/coach deep-links and saved links,
+    // each landing on the tab that matches what used to live there.
+    path: "/learner/my-learning",
+    element: <MyLearningPage />,
+  },
+  {
+    path: "/learner/my-learning/:kind/:id",
+    element: <MyLearningPage />,
+  },
+  {
+    // Preserve the learning-plan hub for saved links and its own navigation.
+    // Splits into the modules view and the booked-sessions calendar.
+    path: "/learner/learning-plan",
+    element: <LearnerLearningPlanPage />,
+  },
+  {
+    path: "/learner/learning-plan/:kind/:id",
+    element: <LearnerLearningPlanPage />,
+  },
+  {
+    path: "/learner/learning-plan/modules",
+    element: <LearnerLearningPlanModulesPage />,
+  },
+  {
+    path: "/learner/learning-plan/modules/:kind/:id",
+    element: <LearnerLearningPlanModulesPage />,
+  },
+  {
+    // Training plan details now live on the dashboard. Preserve old bookmarks.
+    path: "/learner/training-plan-timeline",
+    element: <LearnerDashboardRedirect />,
+  },
+  {
+    path: "/learner/training-plan-timeline/:kind/:id",
+    element: <LearnerDashboardRedirect />,
+  },
+  {
+    path: "/learner/training-plan",
+    element: <TrainingPlanPage />,
+  },
+  {
+    path: "/learner/training-plan/:kind/:id",
+    element: <TrainingPlanPage />,
+  },
+  {
+    path: "/learner/quiz/:kind/:id/:quizId",
+    element: <QuizTakePage />,
+  },
+  {
+    path: "/learner/video/:kind/:id/:componentId",
+    element: <VideoWatchPage />,
+  },
+  {
+    path: "/learner/component/:kind/:id/:componentId",
+    element: <VideoWatchPage />,
+  },
+  {
+    path: "/learner/component/:kind/:id/:componentId",
+    element: <VideoWatchPage />,
+  },
+
+  {
+    path: "/learner/modules",
+    element: <ModulesPage />,
+  },
+  {
+    path: "/learner/modules/:kind/:id",
+    element: <ModulesPage />,
+  },
+  {
+    path: "/learner/attendance",
+    element: <AttendancePage />,
+  },
+  {
+    path: "/learner/attendance/:kind/:id",
+    element: <AttendancePage />,
+  },
+  {
+    path: "/learner/feedback",
+    element: LEARNER_FEEDBACK_ENABLED || LEARNER_POST_LECTURE_FEEDBACK_ENABLED ? <LearnerFeedbackPage /> : <Navigate to="/workspace/learner" replace />,
+  },
+  {
+    path: "/learner/feedback/review/:reviewDeliveryId",
+    element: <LearnerFeedbackFormRoute><LearnerFeedbackFormPage /></LearnerFeedbackFormRoute>,
+  },
+  {
+    path: "/learner/feedback/:formId",
+    element: <LearnerFeedbackFormRoute><LearnerFeedbackFormPage /></LearnerFeedbackFormRoute>,
+  },
+  {
+    path: "/learner/feedback/delivery/:deliveryId",
+    element: LEARNER_FEEDBACK_ENABLED || LEARNER_POST_LECTURE_FEEDBACK_ENABLED ? <LearnerFeedbackFormPage /> : <Navigate to="/workspace/learner" replace />,
+  },
+  {
+    path: "/learner/catchup",
+    element: <CatchUpPage />,
+  },
+  {
+    path: "/learner/report-absence",
+    element: <ReportAbsencePage />,
+  },
+  {
+    path: "/learner/otjh",
+    element: <ProgressPage />,
+  },
+  {
+    path: "/learner/otjh/:kind/:id",
+    element: <ProgressPage />,
+  },
+  {
+    path: "/learner/ksbs",
+    element: <ProgressPage />,
+  },
+  {
+    path: "/learner/ksbs/:kind/:id",
+    element: <ProgressPage />,
+  },
+  {
+    path: "/learner/evidence",
+    element: <EvidencePage />,
+  },
+  {
+    path: "/learner/evidence/:kind/:id",
+    element: <EvidencePage />,
+  },
+  {
+    path: "/learner/my-progress",
+    element: <ProgressPage />,
+  },
+  {
+    path: "/learner/my-progress/:kind/:id",
+    element: <ProgressPage />,
+  },
+  {
+    path: "/learner/quizzes",
+    element: <QuizzesPage />,
+  },
+  {
+    path: "/learner/quizzes/:kind/:id",
+    element: <QuizzesPage />,
+  },
+  {
+    path: "/learner/monthly-logs",
+    element: <MonthlyLogsPage />,
+  },
+  {
+    path: "/learner/monthly-logs/:month",
+    element: <MonthlyLogsPage />,
+  },
+  {
+    path: "/learner/monthly-logs/:kind/:id",
+    element: <MonthlyLogsPage />,
+  },
+  {
+    path: "/learner/monthly-logs/:kind/:id/:month",
+    element: <MonthlyLogsPage />,
+  },
+  {
+    path: "/coach/monthly-logs",
+    element: <MonthlyLogsPage />,
+  },
+  {
+    path: "/coach/monthly-logs/:learnerId",
+    element: <MonthlyLogsPage />,
+  },
+  {
+    path: "/coach/monthly-logs/:learnerId/:month",
+    element: <MonthlyLogsPage />,
+  },
+  {
+    path: "/learner/monthly-cycle",
+    element: <MonthlyLogsPage />,
+  },
+  {
+    path: "/learner/extra-activities",
+    element: <ExtraActivityPage />,
+  },
+  {
+    path: "/learner/monthly-submission",
+    element: <MonthlySubmissionPage />,
+  },
+  {
+    path: "/learner/monthly-submission/:kind/:id",
+    element: <MonthlySubmissionPage />,
+  },
+  {
+    path: "/learner/monthly-submission/:kind/:id/extra-activities",
+    element: <ExtraActivityPage />,
+  },
+  {
+    path: "/learner/monthly-submission/:kind/:id/:componentId",
+    element: <VideoWatchPage />,
+  },
+  {
+    path: "/learner/historical-assignment/:kind/:id/:activityId",
+    element: <HistoricalAssignmentPage />,
+  },
+  {
+    path: "/learner/monthly-cycle/:kind/:id",
+    element: <MonthlyLogsPage />,
+  },
+  { path: "/learner/monthly-coaching", element: <MonthlyCoachingListPage /> },
+  { path: "/learner/monthly-coaching/:kind/:id", element: <MonthlyCoachingListPage /> },
+  { path: "/learner/monthly-coaching/:sessionId", element: <MonthlyCoachingPage /> },
+  {
+    path: "/learner/progress-reviews",
+    element: <ProgressReviewsListPage />,
+  },
+  {
+    path: "/learner/reviews",
+    element: <CurriculumReviewsListPage />,
+  },
+  {
+    path: "/learner/progress-reviews/:kind/:id",
+    element: <ProgressReviewsListPage />,
+  },
+  {
+    path: "/learner/reviews/:kind/:id",
+    element: <CurriculumReviewsListPage />,
+  },
+  {
+    path: "/learner/progress-reviews/:reviewId",
+    element: <ProgressReviewsPage />,
+  },
+  {
+    path: "/learner/reviews/:reviewId",
+    element: <CurriculumReviewsPage />,
+  },
+  {
+    path: "/learner/rewards/badge/:badgeId",
+    element: <BadgeDetailPage />,
+  },
+  {
+    path: "/learner/rewards",
+    element: <RewardsPage />,
+  },
+  {
+    path: "/learner/flash-cards",
+    element: <LearnerFlashCardsPage />,
+  },
+  {
+    path: "/learner/clubs/badge/:badgeId",
+    element: <ClubBadgeDetailPage />,
+  },
+  {
+    path: "/learner/clubs/discussion/:discussionId",
+    element: <ClubDiscussionDetailPage />,
+  },
+  {
+    path: "/learner/clubs/events/schedule",
+    element: <MySchedulePage />,
+  },
+  {
+    path: "/learner/clubs/events/:eventId",
+    element: <EventDetailPage />,
+  },
+  {
+    path: "/learner/clubs/events",
+    element: <ClubEventsPage />,
+  },
+  {
+    path: "/learner/clubs/:clubId",
+    element: <ClubDetailPage />,
+  },
+  {
+    path: "/learner/clubs",
+    element: <ClubsPage />,
+  },
+  {
+    path: "/learner/calendar",
+    element: <LearnerCalendarPage />,
+  },
+  {
+    path: "/learner/calendar/:kind/:id",
+    element: <LearnerCalendarPage />,
+  },
+  {
+    path: "/learner/gateway",
+    element: <GatewayReadinessPage />,
+  },
+  {
+    path: "/learner/knowledge-base",
+    element: <LearnerKnowledgeBase />,
+  },
+  {
+    path: "/learner/profile",
+    element: <LearnerProfilePage />,
+  },
+  {
+    path: "/learner/support",
+    element: <SupportPage />,
+  },
+  {
+    // Chat disabled (audit A10). Redirect away while CHAT_ENABLED is false so a
+    // bookmarked/deep link cannot reach the known-broken chat page.
+    path: "/learner/messages",
+    element: CHAT_ENABLED ? <GeneralMessagesPage /> : <Navigate to="/" replace />,
+  },
+  {
+    path: "/workspace/employer",
+    element: <EmployerDashboard />,
+  },
+  {
+    path: "/workspace/integrations/breathe",
+    element: <BreatheIntegrationWorkspace />,
+  },
+  {
+    path: "/workspace/hr-system",
+    element: <HRSystemWorkspace />,
+  },
+  
+  {
+    path: "/workspace/mis",
+    element: <MISDashboard />,
+  },
+  {
+    path: "/workspace/qa",
+    element: <QADashboard />,
+  },
+  {
+    path: "/workspace/tutor",
+    element: <TutorDashboard />,
+  },
+  {
+    path: "/workspace/engagement",
+    element: <EngagementDashboard />,
+  },
+  {
+    path: "/workspace/leadership",
+    element: <LeadershipDashboard />,
+  },
+  {
+    path: "/workspace/curriculum",
+    element: <CurriculumDashboard />,
+  },
+  {
+    // ROUTE_PERMISSIONS lists a bare /coach entry (mocks/rbac.ts), so it gets
+    // typed and linked the same way /curriculum does below — send it to the
+    // workspace dashboard instead of the catch-all 404.
+    path: "/coach",
+    element: <Navigate to="/workspace/coach" replace />,
+  },
+  {
+    path: "/coach/caseload",
+    element: <CoachCaseload />,
+  },
+  {
+    path: "/coach/case-files",
+    element: <CoachCaseFiles />,
+  },
+  {
+    path: "/coach/attendance",
+    element: <CoachAttendance />,
+  },
+  {
+    path: "/coach/attendance/:learnerId",
+    element: <CoachAttendanceProfile />,
+  },
+  {
+    path: "/coach/support-tickets",
+    element: <CoachSupportTickets />,
+  },
+  {
+    path: "/coach/info-source",
+    element: <CoachInfoSource />,
+  },
+  {
+    path: "/coach/absence-reports",
+    element: <Navigate to="/coach/attendance" replace />,
+  },
+  {
+    path: "/coach/catchup-queue",
+    element: <CoachCatchupQueue />,
+  },
+  {
+    path: "/coach/extra-activities",
+    element: <CoachExtraActivitiesPage />,
+  },
+  {
+    path: "/coach/extra-activities/:submissionId",
+    element: <CoachMarkingReviewPage />,
+  },
+  {
+    path: "/coach/marking-queue",
+    element: <CoachMarkingQueue />,
+  },
+  {
+    path: "/coach/marking-queue/:submissionId",
+    element: <CoachMarkingReviewPage />,
+  },
+  {
+    path: "/coach/ai-marking",
+    element: <CoachAiMarking />,
+  },
+  {
+    path: "/coach/monthly-coaching",
+    element: <CoachMonthlyCoaching />,
+  },
+  {
+    path: "/coach/recordings",
+    element: <CoachingRecordings workspace="coach" />,
+  },
+  {
+    path: "/coach/meetings/:eventKey",
+    element: <CoachMeetingDetail />,
+  },
+  {
+    path: "/coach/timetable",
+    element: <CoachTimetable />,
+  },
+  {
+    path: "/coach/monthly-cycle",
+    element: <MonthlyLogsPage />,
+  },
+  {
+    path: "/coach/progress-reviews",
+    element: <CoachProgressReviews key="progress-review" />,
+  },
+  {
+    path: "/coach/reviews",
+    element: <CoachProgressReviews key="review" category="review" />,
+  },
+  {
+    path: "/coach/progress-reviews/:eventKey",
+    element: <CoachMeetingDetail />,
+  },
+  {
+    path: "/coach/reviews/:eventKey",
+    element: <CoachMeetingDetail />,
+  },
+  {
+    path: "/coach/review-instances/:instanceId",
+    element: <CoachReviewInstancePage />,
+  },
+  {
+    path: "/coach/ksb-impact",
+    element: <CoachKsbImpact />,
+  },
+  {
+    path: "/coach/otjh-reports",
+    element: <CoachOtjhReports />,
+  },
+  {
+    path: "/coach/monthly-reports",
+    element: <CoachMonthlyReports />,
+  },
+  {
+    path: "/coach/evidence-validation",
+    element: <CoachEvidenceValidation />,
+  },
+  {
+    // The Coach workspace's own scoped door onto the Audit Trail. Same
+    // component as /admin/audit-trail and /curriculum/audit-trail, fixed to the
+    // coach workspace.
+    path: "/coach/audit-trail",
+    element: <CoachAuditTrailPage />,
+  },
+  {
+    // One person's own page rather than a panel over the list: an audit finding
+    // is something people send each other, and a link to it has to survive
+    // being pasted into a message.
+    path: "/coach/audit-trail/people/:email",
+    element: <CoachAuditTrailPersonPage />,
+  },
+  {
+    path: "/admin/access-logs",
+    element: <AdminAccessLogsPage />,
+  },
+  {
+    // The system-wide Audit Trail: every workspace, not just Curriculum.
+    // Curriculum keeps its own scoped door at /curriculum/audit-trail; both
+    // render the same component from features/audit-trail.
+    path: "/admin/audit-trail",
+    element: <SystemAuditTrailPage />,
+  },
+  {
+    // One person's own page rather than a panel over the list: an audit finding
+    // is something people send each other, and a link to it has to survive
+    // being pasted into a message.
+    path: "/admin/audit-trail/people/:email",
+    element: <SystemAuditTrailPersonPage />,
+  },
+  {
+    path: "/admin/coach_directory",
+    element: <CoachDirectoryPage />,
+  },
+  {
+    path: "/users/coach-directory",
+    element: <CoachDirectoryPage workspaceRole="compliance" />,
+  },
+  {
+    path: "/users/first-sessions",
+    element: <FirstSessionBookingsPage />,
+  },
+  {
+    path: "/users/my-courses",
+    element: <EnrolmentCoursesPage />,
+  },
+  {
+    path: "/curriculum/coach-directory",
+    element: <CoachDirectoryPage workspaceRole="curriculum" />,
+  },
+  {
+    path: "/coach-booking/:slug",
+    element: <CoachBookingPage />,
+  },
+  {
+    // Opened from the account invitation, before the learner has a password.
+    path: "/lms-introduction",
+    element: <LmsIntroductionPage />,
+  },
+  {
+    // The public apprenticeship eligibility form, for people with no account.
+    path: "/apprenticeship_application",
+    element: <ApprenticeshipApplicationPage />,
+  },
+  {
+    path: "/admin/system",
+    element: <AdminSystemSettingsPage />,
+  },
+  {
+    path: "/admin/announcements",
+    element: <AdminAnnouncementsPage />,
+  },
+  {
+    path: "/admin/platform-report",
+    element: <PlatformReportPage />,
+  },
+  {
+    path: "/employer/apprentices",
+    element: <EmployerApprentices />,
+  },
+  {
+    path: "/employer/otjh-confirm",
+    element: <EmployerOTJHConfirmation />,
+  },
+  {
+    path: "/employer/progress-reviews",
+    element: <EmployerProgressReviewsPage />,
+  },
+  {
+    path: "/employer/documents",
+    element: <EmployerDocumentsToSign />,
+  },
+  {
+    path: "/coach/learner-case-file",
+    element: <LearnerCaseFile />,
+  },
+  {
+    // Every Curriculum Studio page lives under /curriculum/*, so the bare path
+    // gets typed and linked (ROUTE_PERMISSIONS lists it too) — send it to the
+    // workspace dashboard instead of the catch-all 404.
+    path: "/curriculum",
+    element: <Navigate to="/workspace/curriculum" replace />,
+  },
+  {
+    path: "/curriculum/programmes/:id",
+    element: <ProgrammeDetailPage />,
+  },
+  {
+    path: "/curriculum/programmes",
+    element: <CurriculumProgrammes />,
+  },
+  {
+    path: "/curriculum/library",
+    element: <CurriculumLibraryHub />,
+  },
+  {
+    path: "/curriculum/library/review-templates",
+    element: <MigratedReviewTemplates />,
+  },
+  {
+    path: "/curriculum/delivery",
+    element: <CurriculumDeliveryHub />,
+  },
+  {
+    path: "/curriculum/bulk-attendance",
+    element: <CurriculumBulkAttendance />,
+  },
+  {
+    path: "/curriculum/progress-transfers",
+    element: <Navigate to="/users/progress-transfers" replace />,
+  },
+  {
+    path: "/users/progress-transfers",
+    element: <ProgressTransfersPage />,
+  },
+  {
+    path: "/curriculum/quality",
+    element: <CurriculumQualityHub />,
+  },
+  {
+    path: "/curriculum/quality-demo",
+    element: <CurriculumQualityDemo />,
+  },
+  {
+    path: "/curriculum/free-courses",
+    element: <CurriculumFreeCourses />,
+  },
+  {
+    path: "/curriculum/module-builder",
+    element: <ModuleBuilder />,
+  },
+  {
+    path: "/curriculum/learner-module-progress",
+    element: <LearnerModuleProgressPage />,
+  },
+  {
+    path: "/curriculum/ksb-mapping",
+    element: <KSBMapping />,
+  },
+  {
+    path: "/curriculum/standards/:id",
+    element: <IfateStandardPage />,
+  },
+  {
+    path: "/curriculum/standards",
+    element: <CurriculumStandards />,
+  },
+  {
+    path: "/curriculum/week-builder",
+    element: <CurriculumWeekBuilder />,
+  },
+  {
+    path: "/curriculum/quiz-xml",
+    element: <QuizXmlWorkspace />,
+  },
+  {
+    path: "/curriculum/knowledge-base",
+    element: <KnowledgeBasePage />,
+  },
+  {
+    path: "/curriculum/quiz-xml/manual",
+    element: <ManualQuizPage />,
+  },
+  {
+    path: "/curriculum/question-bank",
+    element: <QuestionBankPage />,
+  },
+  {
+    path: "/curriculum/quiz-xml/:quizId/edit",
+    element: <QuizEditPage />,
+  },
+  
+  {
+    path: "/curriculum/checkpoints",
+    element: <CheckpointsPage />,
+  },
+  {
+    // Curriculum's archive, across all four record types. The per-list "View
+    // archived" toggles stay where they are; this is the one that answers
+    // "what did we archive" without knowing the list it came from.
+    path: "/curriculum/archive",
+    element: <CurriculumArchive />,
+  },
+  {
+    path: "/curriculum/cohorts",
+    element: <CurriculumCohorts />,
+  },
+  {
+    path: "/curriculum/cohorts/:id",
+    element: <CurriculumCohortWorkspace />,
+  },
+  {
+    // Learner allocation has no page of its own yet; the cohort workspace is the
+    // nearest live view of who is in the cohort.
+    path: "/curriculum/cohorts/:id/allocate",
+    element: <Navigate to="/curriculum/cohorts" replace />,
+  },
+  {
+    path: "/curriculum/groups",
+    element: <CurriculumGroups />,
+  },
+  {
+    path: "/curriculum/groups/:id",
+    element: <CurriculumGroupWorkspace />,
+  },
+  {
+    // The Modules list is gone: the Module Builder catalogue is the single list
+    // of modules, and it carries the delivery context (cohort, group, tutor,
+    // dates, Teams) the list used to hold. Old links keep working, filters and all.
+    path: "/curriculum/modules",
+    element: <Navigate to="/curriculum/module-builder" replace />,
+  },
+  {
+    path: "/curriculum/modules/:id",
+    element: <CurriculumModuleWorkspace />,
+  },
+  {
+    // The schedule side of the Teams work, across every module at once: the
+    // per-module view of the same meeting is the module workspace's Teams tab.
+    path: "/curriculum/teams-meetings",
+    element: <CurriculumTeamsMeetings />,
+  },
+  {
+    path: "/curriculum/recordings-hub",
+    element: <CurriculumRecordingsHub />,
+  },
+  {
+    // Existing lecture links continue to open the same recording library.
+    path: "/curriculum/recordings",
+    element: <CurriculumRecordings />,
+  },
+  {
+    path: "/curriculum/coaching-recordings",
+    element: <CoachingRecordings />,
+  },
+  {
+    path: "/curriculum/coaching-recordings/reviews",
+    element: <CoachingQualityReviewsPage />,
+  },
+  {
+    path: "/curriculum/quality/forms",
+    element: <CoachingQualityFormsPage />,
+  },
+  {
+    // The bank holiday calendar: GOV.UK holidays stay synced here, and extra
+    // manual holidays are added here without touching the GOV.UK mirror.
+    path: "/curriculum/england-holidays",
+    element: <CurriculumEnglandHolidays />,
+  },
+  {
+    // The bank holiday calendar: GOV.UK holidays stay synced here, and extra
+    // manual holidays are added here without touching the GOV.UK mirror.
+    path: "/curriculum/holiday-calendars",
+    element: <CurriculumEnglandHolidays />,
+  },
+  {
+    path: "/curriculum/session-calendar",
+    element: <SessionCalendarPage />,
+  },
+  {
+    path: "/tutor/sessions",
+    element: <TutorSessionsPage />,
+  },
+  {
+    path: "/tutor/evidence-review",
+    element: <TutorEvidenceReview />,
+  },
+  {
+    path: "/tutor/assignment-marking",
+    element: <TutorAssignmentMarking />,
+  },
+  {
+    path: "/tutor/quiz-results",
+    element: <TutorQuizResults />,
+  },
+  {
+    path: "/workspace/finance",
+    element: <FinanceWorkspace />,
+  },
+  {
+    path: "/workspace/auditor",
+    element: <AuditorWorkspace />,
+  },
+  {
+    path: "/workspace/auditor-copy",
+    element: <AuditorCopyWorkspace />,
+  },
+  {
+    // AUDIT chooser: Automatic (auditor-copy), Manual (auditor-manual) and
+    // HOURS-TEST (auditor-hours-test, the Automatic UI over the cloned data).
+    path: "/workspace/audit",
+    element: <AuditSelectPage />,
+  },
+  {
+    path: "/workspace/auditor-manual",
+    element: <AuditorManualWorkspace />,
+  },
+  {
+    path: "/workspace/auditor-hours-test",
+    element: <AuditorHoursTestWorkspace />,
+  },
+  {
+    path: "/workspace/auditor/learner/:auditLearnerId",
+    element: <AuditorWorkspace />,
+  },
+  {
+    path: "/audit/activity-categories",
+    element: <Navigate to="/workspace/auditor" replace />,
+  },
+  {
+    path: "/audit/activity-categories/:kind/:id",
+    element: <Navigate to="/workspace/auditor" replace />,
+  },
+  {
+    path: "/employer/apprentice-risk",
+    element: <EmployerApprenticeRisk />,
+  },
+  {
+    path: "/employer/apprentice-progress",
+    element: <EmployerApprenticeProgress />,
+  },
+  {
+    path: "/employer/review-actions",
+    element: <EmployerReviewActions />,
+  },
+  {
+    path: "/employer/evidence-summary",
+    element: <EmployerEvidenceSummary />,
+  },
+  {
+    path: "/employer/gateway-epa",
+    element: <EmployerGatewayEPA />,
+  },
+  {
+    path: "/employer/employer-clubs",
+    element: <EmployerEmployerClubs />,
+  },
+  {
+    path: "/employer/learner-clubs",
+    element: <EmployerLearnerClubs />,
+  },
+  {
+    path: "/employer/events",
+    element: <EmployerEvents />,
+  },
+  {
+    path: "/employer/community-activity",
+    element: <EmployerCommunityActivity />,
+  },
+  {
+    path: "/employer/workplace-confirm",
+    element: <EmployerWorkplaceConfirmations />,
+  },
+  {
+    path: "/employer/ksb-progress",
+    element: <EmployerKSBProgress />,
+  },
+  {
+    path: "/employer/reports",
+    element: <EmployerReports />,
+  },
+  {
+    path: "/employer/support",
+    element: <EmployerSupportRequests />,
+  },
+  {
+    path: "/coach/reports",
+    element: <CoachReportsPage />,
+  },
+  {
+    path: "/tutor/learners",
+    element: <TutorLearnersPage />,
+  },
+  {
+    path: "/tutor/ksb-validation",
+    element: <TutorKsbValidationPage />,
+  },
+  {
+    path: "/tutor/otjh-validation",
+    element: <TutorOtjhValidationPage />,
+  },
+  {
+    path: "/tutor/feedback-queue",
+    element: <TutorFeedbackQueuePage />,
+  },
+  {
+    path: "/tutor/ai-marking",
+    element: <TutorAiMarkingPage />,
+  },
+  {
+    path: "/tutor/resources",
+    element: <TutorResourcesPage />,
+  },
+  {
+    path: "/tutor/reports",
+    element: <TutorReportsPage />,
+  },
+  {
+    path: "/curriculum/version-control",
+    element: <CurriculumVersionControlPage />,
+  },
+  {
+    path: "/curriculum/qa",
+    element: <CurriculumQAPage />,
+  },
+  {
+    path: "/communication",
+    element: <CommunicationPage />,
+  },
+  {
+    path: "/curriculum/reports",
+    element: <CurriculumReportsPage />,
+  },
+  {
+    path: "/curriculum/audit-trail",
+    element: <CurriculumAuditTrailPage />,
+  },
+  {
+    // One person's own page rather than a panel over the list: an audit finding
+    // is something people send each other, and a link to it has to survive
+    // being pasted into a message.
+    path: "/curriculum/audit-trail/people/:email",
+    element: <CurriculumAuditTrailPersonPage />,
+  },
+  {
+    path: "/curriculum/published",
+    element: <CurriculumPublishedPage />,
+  },
+  {
+    path: "/engagement/learner-engagement",
+    element: <LearnerEngagementPage />,
+  },
+  {
+    path: "/engagement/attendance-risk",
+    element: <AttendanceRiskPage />,
+  },
+  {
+    path: "/engagement/call-logs",
+    element: <CallLogsPage />,
+  },
+  {
+    path: "/engagement/whatsapp-logs",
+    element: <WhatsAppLogsPage />,
+  },
+  {
+    path: "/engagement/email-logs",
+    element: <EmailLogsPage />,
+  },
+  {
+    path: "/engagement/points-rules",
+    element: <PointsRulesPage />,
+  },
+  {
+    path: "/engagement/rewards-shop",
+    element: <RewardsShopPage />,
+  },
+  {
+    path: "/engagement/voucher-claims",
+    element: <VoucherClaimsPage />,
+  },
+  {
+    path: "/engagement/events",
+    element: <EventsPage />,
+  },
+  {
+    path: "/engagement/clubs",
+    element: <EngagementClubsPage />,
+  },
+  {
+    path: "/engagement/recognition",
+    element: <RecognitionPage />,
+  },
+  
+  {
+    path: "/engagement/feedbacks",
+    element: <EngagementFeedbacksPage />,
+  },
+  {
+    path: "/engagement/reports",
+    element: <EngagementReportsPage />,
+  },
+  {
+    path: "/engagement/reports/feedback",
+    element: <FeedbackPage />,
+  },
+  {
+    path: "/engagement/reports/feedback/create",
+    element: <FeedbackEditorPage />,
+  },
+  {
+    path: "/engagement/reports/feedback/forms/:formId/edit",
+    element: <FeedbackEditorPage />,
+  },
+  {
+    path: "/engagement/reports/feedback/forms/:formId/preview",
+    element: <FeedbackPreviewPage />,
+  },
+  {
+    path: "/engagement/flash-cards",
+    element: <FlashCardsPage />,
+  },
+  
+  {
+    path: "/mis/delivery-timeline",
+    element: <MisDeliveryTimelinePage />,
+  },
+  {
+    path: "/mis/cohorts",
+    element: <MisCohortsPage />,
+  },
+  {
+    path: "/mis/learner-allocation",
+    element: <MisLearnerAllocationPage />,
+  },
+  {
+    path: "/mis/programme-allocation",
+    element: <MisProgrammeAllocationPage />,
+  },
+  {
+    path: "/mis/module-allocation",
+    element: <MisModuleAllocationPage />,
+  },
+  {
+    path: "/mis/timetables",
+    element: <MisTimetablesPage />,
+  },
+  {
+    path: "/mis/teams-sessions",
+    element: <MisTeamsSessionsPage />,
+  },
+  {
+    path: "/mis/attendance-modes",
+    element: <MisAttendanceModesPage />,
+  },
+  {
+    path: "/mis/coach-assignment",
+    element: <MisCoachAssignmentPage />,
+  },
+  {
+    path: "/mis/tutor-assignment",
+    element: <MisTutorAssignmentPage />,
+  },
+  {
+    path: "/mis/calendar",
+    element: <MisCalendarPage />,
+  },
+  {
+    path: "/mis/delivery-dates",
+    element: <MisDeliveryDatesPage />,
+  },
+  {
+    path: "/mis/data-quality",
+    element: <MisDataQualityPage />,
+  },
+  {
+    path: "/mis/reports",
+    element: <MisReportsPage />,
+  },
+  {
+    path: "/qa/pre-active",
+    element: <QaPreActive />,
+  },
+  {
+    path: "/qa/module",
+    element: <QaModule />,
+  },
+  {
+    path: "/qa/evidence",
+    element: <QaEvidence />,
+  },
+  {
+    path: "/qa/otjh",
+    element: <QaOtjh />,
+  },
+  {
+    path: "/qa/ksb",
+    element: <QaKsb />,
+  },
+  {
+    path: "/qa/progress-review",
+    element: <QaProgressReview />,
+  },
+  {
+    path: "/qa/report",
+    element: <QaReport />,
+  },
+  {
+    path: "/qa/rejected",
+    element: <QaRejected />,
+  },
+  {
+    path: "/qa/escalations",
+    element: <QaEscalations />,
+  },
+  {
+    path: "/qa/sampling",
+    element: <QaSampling />,
+  },
+  {
+    path: "/qa/findings",
+    element: <QaFindings />,
+  },
+  {
+    path: "/qa/reports",
+    element: <QaReports />,
+  },
+  {
+    path: "/qa/employer-contracting",
+    element: <QaEmployerContracting />,
+  },
+  {
+    path: "/qa/eligibility",
+    element: <QaEligibility />,
+  },
+  {
+    path: "/qa/initial-assessment",
+    element: <QaInitialAssessment />,
+  },
+  {
+    path: "/qa/rpl",
+    element: <QaRpl />,
+  },
+  {
+    path: "/qa/delivery-setup",
+    element: <QaDeliverySetup />,
+  },
+  {
+    path: "/qa/gateway-epa",
+    element: <QaGatewayEpa />,
+  },
+  {
+    path: "/leadership/cohort-performance",
+    element: <LeadershipCohortPerformancePage />,
+  },
+  {
+    path: "/leadership/programme-performance",
+    element: <LeadershipProgrammePerformancePage />,
+  },
+  {
+    path: "/leadership/learner-progress",
+    element: <LeadershipLearnerProgressPage />,
+  },
+  {
+    path: "/leadership/achievement-pipeline",
+    element: <LeadershipAchievementPipelinePage />,
+  },
+  {
+    path: "/leadership/attendance-trends",
+    element: <LeadershipAttendanceTrendsPage />,
+  },
+  {
+    path: "/leadership/engagement-trends",
+    element: <LeadershipEngagementTrendsPage />,
+  },
+  {
+    path: "/leadership/employer-engagement",
+    element: <LeadershipEmployerEngagementPage />,
+  },
+  {
+    path: "/leadership/otjh-trends",
+    element: <LeadershipOtjhTrendsPage />,
+  },
+  {
+    path: "/leadership/ksb-progress",
+    element: <LeadershipKsbProgressPage />,
+  },
+  {
+    path: "/leadership/gateway-epa-progress",
+    element: <LeadershipGatewayEpaProgressPage />,
+  },
+  {
+    path: "/leadership/tutor-sla",
+    element: <LeadershipTutorSlaPage />,
+  },
+  {
+    path: "/leadership/coach-workload",
+    element: <LeadershipCoachWorkloadPage />,
+  },
+  {
+    path: "/leadership/delivery-performance",
+    element: <LeadershipDeliveryPerformancePage />,
+  },
+  {
+    path: "/leadership/compliance-risk",
+    element: <LeadershipComplianceRiskPage />,
+  },
+  {
+    path: "/leadership/qa-sampling",
+    element: <LeadershipQaSamplingPage />,
+  },
+  {
+    path: "/leadership/ofsted",
+    element: <LeadershipOfstedPage />,
+  },
+  {
+    path: "/leadership/sar-qip",
+    element: <LeadershipSarQipPage />,
+  },
+  {
+    path: "/leadership/reports",
+    element: <LeadershipReportsPage />,
+  },
+  {
+    path: "/finance/funding",
+    element: <FundingOverviewPage />,
+  },
+  {
+    path: "/finance/invoices",
+    element: <InvoicingPage />,
+  },
+  {
+    path: "/finance/payments",
+    element: <PaymentsPage />,
+  },
+  {
+    path: "/finance/budgets",
+    element: <BudgetsPage />,
+  },
+  {
+    path: "/finance/reports",
+    element: <FinanceReportsPage />,
+  },
+  {
+    path: "/workspace/support",
+    element: <SupportDashboard />,
+  },
+  {
+    path: "/support/ticket-queue",
+    element: <SupportTicketQueue />,
+  },
+  {
+    path: "/support/escalations",
+    element: <SupportEscalations />,
+  },
+  {
+    path: "/support/resolved",
+    element: <SupportResolved />,
+  },
+  {
+    path: "/support/reports",
+    element: <SupportReports />,
+  },
+  {
+    path: "/support/my-tickets",
+    element: <SupportMyTickets />,
+  },
+  {
+    path: "/support/knowledge-base",
+    element: <SupportKnowledgeBase />,
+  },
+  {
+    path: "/workspace/safeguarding",
+    element: <SafeguardingDashboard />,
+  },
+  {
+    path: "/safeguarding/open-cases",
+    element: <SafeguardingOpenCases />,
+  },
+  {
+    path: "/safeguarding/new-concerns",
+    element: <SafeguardingNewConcerns />,
+  },
+  {
+    path: "/safeguarding/high-risk-cases",
+    element: <SafeguardingHighRiskCases />,
+  },
+  {
+    path: "/safeguarding/closed-cases",
+    element: <SafeguardingClosedCases />,
+  },
+  {
+    path: "/safeguarding/learner-wellbeing",
+    element: <SafeguardingLearnerWellbeing />,
+  },
+  {
+    path: "/safeguarding/referrals",
+    element: <SafeguardingReferrals />,
+  },
+  {
+    path: "/safeguarding/prevent-risk",
+    element: <SafeguardingPreventRisk />,
+  },
+  {
+    path: "/safeguarding/communication",
+    element: <SafeguardingCommunication />,
+  },
+  {
+    path: "/safeguarding/qa-audit",
+    element: <SafeguardingQAAudit />,
+  },
+  {
+    path: "/safeguarding/reports",
+    element: <SafeguardingReports />,
+  },
+  {
+    path: "/notifications",
+    element: <GeneralNotificationsPage />,
+  },
+  {
+    path: "/tasks",
+    element: <GeneralTasksPage />,
+  },
+  {
+    // Chat disabled (audit A10) — redirect while CHAT_ENABLED is false.
+    path: "/messages",
+    element: CHAT_ENABLED ? <GeneralMessagesPage /> : <Navigate to="/" replace />,
+  },
+  {
+    path: "/user-guide",
+    element: <UserGuidePage />,
+  },
+  {
+    path: "/starred-messages",
+    element: <StarredMessagesPage />,
+  },
+  {
+    path: "/verify-certificate/:token",
+    element: <CertificateVerificationPage />,
+  },
+  {
+    path: "/verify-personal-certificate/:token",
+    element: <CertificateVerificationPage personal />,
+  },
+  {
+    path: "*",
+    element: <NotFound />,
+  },
+];
+
+/**
+ * The only routes a signed-out visitor may render. Everything else in `routes`
+ * is nested under <RequireAuth> below, so protection is the default and opening
+ * a page to the public is an edit to this list — not something a new route gets
+ * for free by being added to the array like every other one.
+ *
+ * What is here and why:
+ *  - "/" and "/login" are the sign-in form itself.
+ *  - "/event-feedback" opens a token-scoped form for an event attendee; an LMS
+ *    account is not required and the backend still validates the personal token.
+ *  - "/forgot-password", "/set-password", "/reset-password" are reached from an
+ *    emailed link by someone who by definition cannot sign in yet; each carries
+ *    its own single-use token, which the backend validates.
+ *  - "/access-required" is where a signed-in staff account with no access grant
+ *    lands. It holds no data — only the request-access button.
+ *  - "/apprenticeship_application" is the eligibility form for applicants, who
+ *    have no account. It only submits a new application and reads nothing back.
+ *
+ * "/home" is deliberately NOT here. It was the public launcher, and its "explore
+ * this section" buttons opened real workspaces reading live data for a visitor
+ * with no session at all.
+ */
+const PUBLIC_PATHS = new Set([
+  "/coach-booking/:slug",
+  "/lms-introduction",
+  "/apprenticeship_application",
+  "/",
+  "/login",
+  "/event-feedback",
+  "/lecture-feedback",
+  "/event-rsvp",
+  "/event-check-in",
+  "/qr-attendance",
+  "/access-required",
+  "/forgot-password",
+  "/set-password",
+  "/reset-password",
+]);
+
+const PUBLIC_PREFIXES = [
+  "/verify-certificate/",
+  "/verify-personal-certificate/",
+];
+
+const isPublic = (route: RouteObject) =>
+  typeof route.path === "string"
+  && (PUBLIC_PATHS.has(route.path) || PUBLIC_PREFIXES.some((prefix) => route.path?.startsWith(prefix)));
+
+export default [
+  ...routes.filter(isPublic),
+  {
+    // Pathless layout route: matching is unchanged (children keep their own
+    // absolute paths), but nothing below renders until RequireAuth has a
+    // server session to render it for. The "*" catch-all lives in here too, so
+    // a signed-out visitor guessing at URLs is asked to sign in rather than
+    // being told which paths exist.
+    element: <RequireAuth />,
+    children: routes.filter((route) => !isPublic(route)),
+  },
+] satisfies RouteObject[];

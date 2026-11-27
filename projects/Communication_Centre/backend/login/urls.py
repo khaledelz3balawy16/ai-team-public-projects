@@ -1,0 +1,13 @@
+from django.urls import path
+
+from .views import access_view, activity_start_view, activity_view, login_view, logout_view, microsoft_callback, microsoft_start
+
+urlpatterns = [
+    path('login/', login_view, name='auth-login'),
+    path('logout/', logout_view, name='auth-logout'),
+    path('activity/start/', activity_start_view, name='auth-activity-start'),
+    path('activity/', activity_view, name='auth-activity'),
+    path('access/', access_view, name='auth-access'),
+    path('microsoft/start/', microsoft_start, name='auth-microsoft-start'),
+    path('microsoft/callback/', microsoft_callback, name='auth-microsoft-callback'),
+]

@@ -1,0 +1,990 @@
+import type { CaseFileProfile } from '@/features/coach/case-file/api/contracts';
+import { subjectRefs } from '@/pages/learner/my-learning/learningSummary';
+import { useCallback, useEffect, useState } from 'react';
+import { useCaseFileSession } from '@/features/coach/case-file/hooks/CaseFileSession';
+import type { LearnerMetrics } from '@/api/learnerMetrics';
+import type { KsbActivityPoint } from '@/api/learnerMetrics';
+import { formatHoursMinutes, systemDateParts } from '@/lib/format';
+import { otjhProgressAsOfToday } from '@/pages/coach/caseload/lib/format';
+import {
+  type LearnerActivityEntry,
+  type LearnerDetail,
+  type LearnerKind,
+  type LearnerQuizAttempt,
+} from '@/api/learnerDetail';
+import {
+  eventDisplayDate,
+  formatDateLabel as formatCalendarDateLabel,
+  formatTimeLabel as formatCalendarTimeLabel,
+  parseLocalDate,
+  sortEvents,
+  statusLabel as calendarStatusLabel,
+  type CoachCalendarEvent,
+  type CoachReviewGenerationIssue,
+} from '@/pages/coach/shared/calendarEvents';
+import { buildLearnerJourney } from '@/utils/learnerJourney';
+import type { StudentActivityResponse } from '@/api/studentActivity';
+import type { CoverMetadata } from '@/pages/learner/my-learning/learningSummary';
+import { buildCaseFileActivityStates, buildFullCaseFileJourney } from './activityState';
+import { normalizeKsbCode } from './domain/ksbSelectors';
+import {
+  fetchCaseFileLearnerDetail,
+  fetchCaseFileLearnerMetrics,
+  fetchCaseFileShell,
+  fetchCaseFileStudentActivity,
+  fetchCaseFileSubjectMetadata,
+  type CaseFileShell,
+} from './api/caseFileApi';
+import type {
+  CaseFileActivityItem,
+  CaseFileOtjhMetrics,
+  CaseFileReviewGroup,
+  CaseFileReviewMeeting,
+  CaseFileUpcomingSession,
+  CoachAttendanceLearner,
+  CoachCaseloadLearner,
+  CoachLearnerCaseFileData,
+  CoachMarkingQueueItem,
+} from './types';
+
+/**
+ * Shared presentation selector for the Case File OTJH values. The values are
+ * selected by buildCaseFileData from the existing audit/detail sources; this
+ * helper only keeps every Case File surface internally consistent.
+ */
+export function selectCaseFileOtjh(data: Pick<CoachLearnerCaseFileData, 'otjhCompleted' | 'otjhTarget' | 'otjhPlanned' | 'totalExpectedOtjh'>): CaseFileOtjhMetrics {
+  const logged = data.otjhCompleted;
+  const target = data.otjhTarget;
+  const programmeTotal = data.totalExpectedOtjh > 0 ? data.totalExpectedOtjh : data.otjhPlanned;
+  const remaining = logged !== null && target !== null ? Math.max(0, target - logged) : null;
+  const progressPercent = logged !== null && target !== null && target > 0
+    ? Math.min(100, Math.round((logged / target) * 100))
+    : null;
+  return { logged, target, programmeTotal, remaining, progressPercent };
+}
+
+type CaseFilePresentationShell = {
+  identity: Pick<CaseFileShell['identity'], 'learnerId' | 'enrolmentId' | 'aptemId' | 'kind'>;
+  profile: CaseFileShell['profile'];
+};
+
+export function useCoachLearnerCaseFileData(args: {
+  learnerId?: string | null;
+  learnerName?: string | null;
+  kind?: LearnerKind | null;
+  /** enrolment."Created_users".id, when the caller already has it (see
+   *  CoachCaseloadLearner.enrolmentId) -- the id /learner-detail/ actually
+   *  needs. learnerId above is the coach-side LearnerProfile id, a different,
+   *  disjoint pk space that always 404s against that endpoint. */
+  enrolmentId?: string | null;
+  enabled?: boolean;
+  activeTab?: string;
+}) {
+  const session = useCaseFileSession();
+  const wantsDetail = !session;
+  const [detailActivated, setDetailActivated] = useState(wantsDetail);
+  useEffect(() => { if (wantsDetail) setDetailActivated(true); }, [wantsDetail]);
+  const wantsJourney = !session;
+  const [journeyActivated, setJourneyActivated] = useState(wantsJourney);
+  useEffect(() => { if (wantsJourney) setJourneyActivated(true); }, [wantsJourney]);
+  const [data, setData] = useState<CoachLearnerCaseFileData | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [reloadToken, setReloadToken] = useState(0);
+  const refresh = useCallback(() => setReloadToken(token => token + 1), []);
+
+  useEffect(() => {
+    const rawLearnerId = args.learnerId?.trim();
+    let cancelled = false;
+
+    if (args.enabled === false) {
+      setData(null);
+      setError(null);
+      setLoading(false);
+      return;
+    }
+
+    if (!rawLearnerId) {
+      setData(null);
+      setError('No learner was selected.');
+      setLoading(false);
+      return;
+    }
+
+    async function load() {
+      setLoading(true);
+      setError(null);
+
+      const directId = numericId(rawLearnerId);
+      if (!directId) {
+        setData(null);
+        setError('A stable learner ID is required.');
+        setLoading(false);
+        return;
+      }
+      let shell: CaseFilePresentationShell;
+      try {
+        shell = session ? profileShell(await session.read<CaseFileProfile>('profile', {}, { refresh: reloadToken > 0 })) : await fetchCaseFileShell(directId);
+      } catch (loadErr) {
+        if (!cancelled) {
+          setData(null);
+          setError(loadErr instanceof Error ? loadErr.message : 'Could not load learner case file details.');
+          setLoading(false);
+        }
+        return;
+      }
+      const resolvedEnrolmentId = shell.identity.enrolmentId;
+      const resolvedKind = shell.identity.kind;
+      let learnerMetrics: CaseFileLearnerMetrics | null = null;
+      let detail: LearnerDetail | null = null;
+      let detailError: string | null = null;
+      let aptemActivity: StudentActivityResponse | null = null;
+      let subjectMetadata: CoverMetadata | null = null;
+      if (resolvedEnrolmentId) {
+        try {
+          // Detail and canonical metrics are independent reads. Loading them
+          // together prevents a slow historical-activity request from holding
+          // the profile's Overall/OTJH/KSB figures behind unrelated work.
+          const detailPending = (
+            detailActivated ? session ? session.read<LearnerDetail>('learning-plan', { resource: 'detail' }, { refresh: reloadToken > 0 }).then(detail => ({ detail, kind: resolvedKind })) : fetchAnyLearnerDetail(resolvedEnrolmentId, resolvedKind) : Promise.resolve({ detail: null })
+          ).then(result => ({ result, error: null }), error => ({ result: null, error }));
+          if (!session) learnerMetrics = await fetchCaseFileMetrics(resolvedKind, resolvedEnrolmentId);
+          const initialData = buildCaseFileData({
+            learnerId: shell.identity.learnerId,
+            enrolmentId: resolvedEnrolmentId,
+            kind: resolvedKind,
+            shell,
+            snapshot: null,
+            attendance: null,
+            evidence: null,
+            detail,
+            aptemActivity,
+            timetableEvents: [],
+            reviewGenerationIssues: [],
+            reviewsLoading: true,
+            learnerMetrics,
+          });
+          if (!cancelled && initialData) {
+            setData(initialData);
+            setLoading(false);
+          }
+          const detailOutcome = await detailPending;
+          if (detailOutcome.error) throw detailOutcome.error;
+          detail = detailOutcome.result?.detail ?? null;
+          if (journeyActivated && detail && (shell.identity.aptemId || detail.studentActivityAvailable)) {
+            try {
+              aptemActivity = session ? await session.read<StudentActivityResponse>('learning-plan', { resource: 'activity' }) : await fetchCaseFileStudentActivity(resolvedKind, resolvedEnrolmentId);
+              subjectMetadata = session ? await session.read<CoverMetadata>('learning-plan', { resource: 'covers', refs: subjectRefs(aptemActivity, detail) }) : await fetchCaseFileSubjectMetadata(resolvedEnrolmentId, aptemActivity, detail);
+            } catch {
+              detailError = 'Could not load the canonical Programme Journey. Please retry.';
+            }
+          }
+        } catch (loadErr) {
+          detailError = loadErr instanceof Error ? loadErr.message : 'Could not load learner details.';
+        }
+      }
+
+      if (cancelled) {
+        return;
+      }
+
+      if (cancelled) {
+        return;
+      }
+
+      const finalData = buildCaseFileData({
+        learnerId: shell.identity.learnerId,
+        enrolmentId: resolvedEnrolmentId,
+        kind: resolvedKind,
+        shell,
+        snapshot: null,
+        attendance: null,
+        evidence: null,
+        detail,
+        aptemActivity,
+        subjectMetadata,
+        timetableEvents: [],
+        reviewGenerationIssues: [],
+        reviewsLoading: false,
+        learnerMetrics,
+      });
+
+      if (!finalData) {
+        setData(null);
+        setError(
+          detailError
+            || buildMissingLearnerMessage(rawLearnerId, null)
+            || 'Could not find that learner in the connected coach data.',
+        );
+        setLoading(false);
+        return;
+      }
+
+      // Tab detail must never replace the persistent profile's header values.
+      if (session) Object.assign(finalData, {
+        displayName: shell.profile.name || '', initials: getInitials(shell.profile.name || ''),
+        programme: shell.profile.programme || '', group: shell.profile.group || '',
+        email: shell.profile.email || '', employer: shell.profile.employer || '',
+        programStatus: shell.profile.status || '', startDate: shell.profile.startDate || '--',
+        plannedEndDate: shell.profile.learnerEndDate || '--',
+      });
+
+      setData(finalData);
+
+      const missingDetailOnly = Boolean(detailError && /learner not found|\b404\b/i.test(detailError));
+      if (detailError && !missingDetailOnly) {
+        setError(detailError);
+      } else {
+        setError(null);
+      }
+
+      setLoading(false);
+    }
+
+    void load();
+    return () => {
+      cancelled = true;
+    };
+  }, [args.enabled, args.kind, args.learnerId, args.learnerName, args.enrolmentId, reloadToken, session, detailActivated, journeyActivated]);
+
+  return { data, loading, error, refresh };
+}
+
+/** Adapt only the compact transport to the existing presentation builder.
+ * The legacy shell endpoint and its other consumers keep their own contract. */
+function profileShell({ learner }: CaseFileProfile): CaseFilePresentationShell {
+  return {
+    identity: { learnerId: learner.id, enrolmentId: learner.enrolmentId, aptemId: learner.aptemId,
+      kind: learner.learnerType },
+    profile: { name: learner.name, email: learner.email, programme: learner.programme,
+      group: learner.group, employer: learner.employer, status: learner.status,
+      startDate: learner.startDate, plannedEndDate: learner.plannedEndDate, learnerEndDate: learner.plannedEndDate,
+      cohort: null, coachName: null, coachEmail: null, coachRag: null, gatewayReviewDate: null },
+  };
+}
+
+export function flattenJourney(data: CoachLearnerCaseFileData) {
+  return data.journey.flatMap((module) =>
+    module.weeks.flatMap((week) =>
+      week.components.map((component) => ({
+        module: module.module,
+        week: week.week,
+        title: component.title,
+        expectedOtjh: component.expectedOtjh,
+        isQuiz: Boolean(component.isQuiz),
+        quizMeta: component.quizMeta,
+        quizAttempts: component.quizAttempts || [],
+      })),
+    ),
+  );
+}
+
+export function formatDisplayDate(value?: string | null, short = false) {
+  const normalized = String(value || '').trim();
+  if (!normalized || normalized === '--') {
+    return '--';
+  }
+
+  const parsed = new Date(normalized);
+  if (!Number.isNaN(parsed.getTime())) {
+    return new Intl.DateTimeFormat('en-GB', short
+      ? { day: 'numeric', month: 'short' }
+      : { day: 'numeric', month: 'short', year: 'numeric' }).format(parsed);
+  }
+
+  return normalized;
+}
+
+export function formatPercent(value: number | null, suffix = true) {
+  if (value === null || Number.isNaN(value)) {
+    return '--';
+  }
+  return suffix ? `${value}%` : String(value);
+}
+
+export function formatHours(value: number | null) {
+  if (value === null || Number.isNaN(value)) {
+    return '--';
+  }
+  return formatHoursMinutes(value);
+}
+
+export function formatFraction(current: number | null, total: number | null) {
+  if (current === null || total === null) {
+    return '--';
+  }
+  return `${Number(current.toFixed(2))}/${Number(total.toFixed(2))}`;
+}
+
+
+
+export function toneFromPercent(value: number | null, amberThreshold = 80) {
+  if (value === null) {
+    return 'neutral';
+  }
+  if (value >= 90) {
+    return 'green';
+  }
+  if (value >= amberThreshold) {
+    return 'amber';
+  }
+  return 'red';
+}
+
+export function ksbCategory(code: string) {
+  const normalized = code.trim().toUpperCase();
+  if (normalized.startsWith('K')) return 'Knowledge';
+  if (normalized.startsWith('S')) return 'Skills';
+  if (normalized.startsWith('B')) return 'Behaviours';
+  return 'Other';
+}
+
+export function quizGradeValue(attempt: LearnerQuizAttempt) {
+  const match = String(attempt.grade || '').match(/-?\d+(\.\d+)?/);
+  return match ? Number(match[0]) : 0;
+}
+
+export function resolveQuizAttemptTitle(detail: LearnerDetail | null, attempt: LearnerQuizAttempt) {
+  const matchedComponent = detail?.components.find((component) => component.quizMeta?.quizId === attempt.quizId);
+  return attempt.componentTitle || matchedComponent?.component || `Quiz ${attempt.quizId}`;
+}
+
+export function resolveQuizAttemptModule(detail: LearnerDetail | null, attempt: LearnerQuizAttempt) {
+  const matchedComponent = detail?.components.find((component) => component.quizMeta?.quizId === attempt.quizId);
+  return attempt.moduleTitle || matchedComponent?.module || null;
+}
+
+export function formatQuizAttemptScore(attempt: LearnerQuizAttempt) {
+  return attempt.achievedScore != null && attempt.totalScore != null
+    ? `${roundNumber(attempt.achievedScore)}/${roundNumber(attempt.totalScore)}`
+    : '';
+}
+
+type CaseFileLearnerMetrics = {
+  programmeCompleted: number | null;
+  programmeTotal: number | null;
+  programmeProgress: number | null;
+  planned: number | null;
+  actual: number | null;
+  ksbCompleted: number | null;
+  ksbTotal: number | null;
+  ksbCodes: string[];
+  ksbCodeProgress: Array<{ code: string; completed: number; total: number }>;
+  ksbActivityPoints: KsbActivityPoint[];
+  ksbProgress: number | null;
+  ksbStatus: 'ready' | 'empty' | 'unavailable';
+};
+
+/** Canonical totals used by the learner dashboard. Programme, OTJH and KSB
+ * figures must describe the same learner facts on both workspaces. */
+async function fetchCaseFileMetrics(kind: LearnerKind | null, enrolmentId: string | null, read?: () => Promise<LearnerMetrics>): Promise<CaseFileLearnerMetrics | null> {
+  if (!kind || !enrolmentId) return null;
+  try {
+    const metrics = read ? await read() : await fetchCaseFileLearnerMetrics(kind, enrolmentId);
+    return {
+      programmeCompleted: metrics.programme.completed,
+      programmeTotal: metrics.programme.total,
+      programmeProgress: metrics.programme.percent,
+      planned: metrics.aptem_planned_total ?? metrics.otjh.planned,
+      actual: metrics.otjh.actual,
+      ksbCompleted: metrics.ksb.completed,
+      ksbTotal: metrics.ksb.total,
+      ksbCodes: (metrics.ksb.codes || []).map((item) => item.code),
+      ksbCodeProgress: (metrics.ksb.codes || []).map((item) => ({
+        code: item.code,
+        completed: item.completed,
+        total: item.total,
+      })),
+      ksbProgress: metrics.ksb.percent,
+      ksbActivityPoints: metrics.ksb.points || [],
+      ksbStatus: metrics.ksb.status,
+    };
+  } catch {
+    // Missing canonical metrics must not make the rest of the case file fail.
+    return null;
+  }
+}
+
+async function fetchAnyLearnerDetail(id: string, kind?: LearnerKind) {
+  if (kind) {
+    return { kind, detail: await fetchCaseFileLearnerDetail(kind, id) };
+  }
+
+  const [commercial, apprenticeship] = await Promise.allSettled([
+    fetchCaseFileLearnerDetail('commercial', id),
+    fetchCaseFileLearnerDetail('apprenticeship', id),
+  ]);
+
+  if (commercial.status === 'fulfilled') {
+    return { kind: 'commercial' as const, detail: commercial.value };
+  }
+  if (apprenticeship.status === 'fulfilled') {
+    return { kind: 'apprenticeship' as const, detail: apprenticeship.value };
+  }
+
+  throw chooseDetailError(commercial, apprenticeship);
+}
+
+function chooseDetailError(
+  commercial: PromiseSettledResult<LearnerDetail>,
+  apprenticeship: PromiseSettledResult<LearnerDetail>,
+) {
+  const commercialMessage = commercial.status === 'rejected' && commercial.reason instanceof Error
+    ? commercial.reason.message
+    : null;
+  const apprenticeshipMessage = apprenticeship.status === 'rejected' && apprenticeship.reason instanceof Error
+    ? apprenticeship.reason.message
+    : null;
+
+  const non404 = [commercialMessage, apprenticeshipMessage].find((message) => message && !message.includes('404'));
+  return new Error(non404 || commercialMessage || apprenticeshipMessage || 'Could not load learner details.');
+}
+
+function numericId(value?: string | null) {
+  if (!value) {
+    return null;
+  }
+  return /^\d+$/.test(value.trim()) ? value.trim() : null;
+}
+
+function isUpcomingCalendarEvent(event: CoachCalendarEvent) {
+  const eventDate = parseLocalDate(eventDisplayDate(event));
+  if (!eventDate) {
+    return false;
+  }
+
+  const today = new Date();
+  const start = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+  return eventDate.getTime() >= start.getTime();
+}
+
+function liveSessionMatchesLearner(
+  event: CoachCalendarEvent,
+  learnerIdentityIds: string[],
+) {
+  if (event.source !== 'live-session') {
+    return false;
+  }
+  const eventIdentityIds = [event.learnerId, event.enrolmentId]
+    .map(value => String(value || '').trim())
+    .filter(Boolean);
+  return eventIdentityIds.some(id => learnerIdentityIds.includes(id));
+}
+
+function reviewEventMatchesLearner(
+  event: CoachCalendarEvent,
+  learner: Pick<CoachLearnerCaseFileData, 'learnerId' | 'learnerIdentityIds'>,
+) {
+  if (!isReviewCalendarEvent(event) || event.status === 'cancelled') {
+    return false;
+  }
+
+  const learnerIds = new Set((learner.learnerIdentityIds || [learner.learnerId])
+    .map(value => String(value || '').trim())
+    .filter(Boolean));
+  const eventIdentityIds = [event.learnerId, event.enrolmentId]
+    .map(value => String(value || '').trim())
+    .filter(Boolean);
+  if (eventIdentityIds.some(id => learnerIds.has(id))) {
+    return true;
+  }
+  return false;
+}
+
+function isReviewCalendarEvent(event: CoachCalendarEvent) {
+  return event.type === 'review'
+    || event.source === 'mcr'
+    || event.source === 'progress-review'
+    || event.source === 'review'
+    || Boolean(event.reviewTemplateId);
+}
+
+function sortLearnerScheduleEvents(events: CoachCalendarEvent[]) {
+  const upcoming: CoachCalendarEvent[] = [];
+  const past: CoachCalendarEvent[] = [];
+
+  for (const event of events) {
+    if (isUpcomingCalendarEvent(event)) {
+      upcoming.push(event);
+    } else {
+      past.push(event);
+    }
+  }
+
+  return [...sortEvents(upcoming), ...sortEvents(past).reverse()];
+}
+
+export function buildReviewMeetingItems(
+  learner: Pick<CoachLearnerCaseFileData, 'learnerId' | 'learnerIdentityIds'>,
+  timetableEvents: CoachCalendarEvent[],
+): CaseFileReviewMeeting[] {
+  const fallbackDetail = 'Review from the coach schedule.';
+  const matchingEvents = sortLearnerScheduleEvents(
+    timetableEvents.filter((event) => reviewEventMatchesLearner(event, learner)),
+  );
+
+  let nextFlagAssigned = false;
+  return matchingEvents.map((event) => {
+    const displayDate = eventDisplayDate(event);
+    const isNext = !nextFlagAssigned && isUpcomingCalendarEvent(event);
+    if (isNext) {
+      nextFlagAssigned = true;
+    }
+
+    const source = event.source || 'review';
+    const reviewTypeName = reviewTypeLabel(event);
+    return {
+      id: event.eventKey || event.id,
+      eventKey: event.eventKey || event.id,
+      source,
+      reviewTypeCode: String(event.reviewTypeCode || '').trim() || null,
+      occurrenceNumber: event.occurrenceNumber ?? event.sequence ?? null,
+      reviewTypeName,
+      title: event.title || reviewTypeName,
+      date: formatCalendarDateLabel(displayDate),
+      plannedDate: formatCalendarDateLabel(event.targetDate || event.scheduledDate),
+      scheduledDate: event.scheduledDate ? formatCalendarDateLabel(event.scheduledDate) : '--',
+      scheduledTime: event.scheduledTime ? event.scheduledTime.slice(0, 5) : '--',
+      completedDate: event.status === 'completed'
+        ? formatCalendarDateLabel(event.reviewCompletedAt || displayDate)
+        : '--',
+      time: formatCalendarTimeLabel(event),
+      detail: [
+        event.sequence ? (source === 'mcr' ? `Meeting ${event.sequence}` : `Review ${event.sequence}`) : 'Additional review',
+        event.meetingProvider || '',
+        event.targetDate && event.scheduledDate && event.scheduledDate !== event.targetDate
+          ? `Target ${formatCalendarDateLabel(event.targetDate)}`
+          : '',
+      ].filter(Boolean).join(' - ') || fallbackDetail,
+      status: event.status,
+      statusLabel: calendarStatusLabel(event.status),
+      isNext,
+      notes: String(event.notes || '').trim() || undefined,
+      reviewer: String(event.reviewerName || event.ownerName || '').trim() || '--',
+      hasTranscript: Boolean(event.hasTranscript),
+      hasAttendance: Boolean(event.hasAttendance),
+    };
+  });
+}
+
+function reviewTypeLabel(event: CoachCalendarEvent) {
+  const metadataLabel = String(event.reviewTypeName || '').trim();
+  if (metadataLabel) return metadataLabel;
+  if (event.source === 'mcr') return 'Monthly Coaching Meeting';
+  if (event.source === 'progress-review') return 'Progress Review';
+  return 'Review';
+}
+
+export type CaseFileReviewCategory = 'mcr' | 'progress-review' | 'review';
+
+/** The displayed system type label wins over stale code metadata; source is retained for legacy rows. */
+export function caseFileReviewCategory(item: Pick<CaseFileReviewMeeting, 'reviewTypeCode' | 'reviewTypeName' | 'source'>): CaseFileReviewCategory {
+  const typeName = String(item.reviewTypeName || '').trim().toLowerCase();
+  // A few older booked rows have a stale reviewTypeCode after their template
+  // was corrected. Keep the filter aligned with the Review Type shown in the
+  // table so a visible Progress Review cannot appear under MCM (or vice versa).
+  if (typeName === 'monthly coaching meeting') return 'mcr';
+  if (typeName === 'progress review') return 'progress-review';
+
+  const typeCode = String(item.reviewTypeCode || '').trim().toLowerCase();
+  if (typeCode === 'mcm') return 'mcr';
+  if (typeCode === 'progress_review') return 'progress-review';
+  if (typeCode) return 'review';
+  if (item.source === 'mcr' || item.source === 'progress-review') return item.source;
+  return 'review';
+}
+
+export function buildReviewGroups(items: CaseFileReviewMeeting[]): CaseFileReviewGroup[] {
+  const groups = new Map<string, CaseFileReviewGroup>();
+  for (const item of items) {
+    const key = item.reviewTypeName.trim().toLowerCase() || 'review';
+    const existing = groups.get(key);
+    if (existing) {
+      existing.items.push(item);
+    } else {
+      groups.set(key, {
+        key,
+        title: item.reviewTypeName || 'Review',
+        items: [item],
+      });
+    }
+  }
+  return Array.from(groups.values()).map(group => ({
+    ...group,
+    // Curriculum's occurrence number is the canonical MCM/Review order. A
+    // booking can be moved to a different date, so sorting by scheduled date
+    // would make MCM2 appear before MCM1 after a reschedule.
+    items: [...group.items].sort((a, b) => {
+      const aOccurrence = Number.isFinite(a.occurrenceNumber) ? a.occurrenceNumber! : Number.POSITIVE_INFINITY;
+      const bOccurrence = Number.isFinite(b.occurrenceNumber) ? b.occurrenceNumber! : Number.POSITIVE_INFINITY;
+      return aOccurrence - bOccurrence;
+    }),
+  })).sort((a, b) => {
+    const aSystemRank = reviewGroupRank(a.title);
+    const bSystemRank = reviewGroupRank(b.title);
+    return aSystemRank - bSystemRank || a.title.localeCompare(b.title);
+  });
+}
+
+function reviewGroupRank(title: string) {
+  const normalized = title.toLowerCase();
+  if (normalized === 'progress review') return 0;
+  if (normalized === 'monthly coaching meeting') return 1;
+  if (normalized === 'review') return 99;
+  return 10;
+}
+
+export function buildUpcomingSchedule(
+  learnerIdentityIds: string[],
+  timetableEvents: CoachCalendarEvent[],
+): CaseFileUpcomingSession[] {
+  if (learnerIdentityIds.length === 0) {
+    return [];
+  }
+
+  return sortEvents(
+    timetableEvents.filter((event) => {
+      const matchesLiveSession = liveSessionMatchesLearner(event, learnerIdentityIds);
+      const matchesReview = reviewEventMatchesLearner(event, {
+        learnerId: learnerIdentityIds[0] || '',
+        learnerIdentityIds,
+      });
+      return (matchesLiveSession || matchesReview)
+      && isUpcomingCalendarEvent(event)
+      && event.status !== 'cancelled'
+      && event.status !== 'completed';
+    }),
+  )
+    .slice(0, 3)
+    .map((event) => {
+      const displayDate = eventDisplayDate(event);
+      const day = formatUpcomingWeekday(displayDate);
+      const dayShort = formatUpcomingWeekday(displayDate, true);
+      const date = formatCalendarDateLabel(displayDate);
+      const dateShort = formatUpcomingDateShort(displayDate);
+      const time = formatCalendarTimeLabel(event);
+      const review = isReviewCalendarEvent(event);
+      return {
+        id: event.eventKey || event.id,
+        kind: review ? 'review' : 'live',
+        status: event.status,
+        statusLabel: calendarStatusLabel(event.status),
+        day,
+        title: event.title || (review ? reviewTypeLabel(event) : event.module || 'Live session'),
+        date,
+        time,
+        summary: `${dayShort} ${dateShort} · ${time}`,
+        detail: [
+          review ? reviewTypeLabel(event) : event.tutor ? `Tutor: ${event.tutor}` : '',
+          event.group ? `Group: ${event.group}` : '',
+        ].filter(Boolean).join(' - ') || (review ? 'Review from the coach schedule.' : 'Live session from the learner delivery plan.'),
+      };
+    });
+}
+
+function buildCaseFileData(args: {
+  learnerId: string;
+  enrolmentId: string | null;
+  kind: LearnerKind | null;
+  shell: CaseFilePresentationShell;
+  snapshot: CoachCaseloadLearner | null;
+  attendance: CoachAttendanceLearner | null;
+  evidence: CoachMarkingQueueItem | null;
+  detail: LearnerDetail | null;
+  aptemActivity?: StudentActivityResponse | null;
+  subjectMetadata?: CoverMetadata | null;
+  timetableEvents: CoachCalendarEvent[];
+  reviewGenerationIssues: CoachReviewGenerationIssue[];
+  reviewsLoading?: boolean;
+  learnerMetrics?: CaseFileLearnerMetrics | null;
+}): CoachLearnerCaseFileData | null {
+  const displayName = args.detail?.name || args.shell.profile.name || args.attendance?.learner || args.evidence?.learner || '';
+  if (!displayName) {
+    return null;
+  }
+
+  const cohort = args.detail?.cohort || args.shell.profile.cohort || args.attendance?.cohort || '';
+  const peers: CoachCaseloadLearner[] = [];
+  const hasAptemId = Boolean(args.shell.identity.aptemId || args.detail?.studentActivityAvailable);
+  const journey = buildFullCaseFileJourney(hasAptemId ? [] : buildLearnerJourney(args.detail), args.aptemActivity || null, args.detail, args.subjectMetadata || null, hasAptemId);
+  const activityStates = buildCaseFileActivityStates(journey, args.detail, args.aptemActivity || null);
+  const touchedKsbCodes = Array.from(
+    new Set(
+      [
+        ...(args.detail?.progressKsbCodes || []),
+        ...(args.detail?.quizAttempts || []).flatMap((attempt) => attempt.ksbs || []),
+        ...(args.detail?.videoProgress || []).flatMap((entry) => entry.ksbs || []),
+        ...(args.detail?.componentProgress || []).flatMap((entry) => entry.ksbs || []),
+        ...(args.snapshot?.ksbCompletedDetails || []).map((entry) => entry.code || ''),
+      ]
+        .map((code) => normalizeKsbCode(code))
+        .filter(Boolean),
+    ),
+  ).sort();
+  const programme = args.detail?.programme || args.attendance?.programme || '';
+  const group = args.detail?.group || args.shell.profile.group || args.attendance?.group || '';
+  const email = args.detail?.email || args.shell.profile.email || args.attendance?.email || args.evidence?.email || '';
+  const learnerIdentityIds = Array.from(new Set([
+    args.learnerId,
+    args.shell.identity.enrolmentId,
+    args.snapshot?.id,
+    args.snapshot?.enrolmentId,
+    args.attendance?.id,
+    args.attendance?.enrolmentId,
+    args.evidence?.learnerId,
+    args.detail?.id,
+  ].map(value => String(value || '').trim()).filter(Boolean)));
+  const upcomingSessions = buildUpcomingSchedule(learnerIdentityIds, args.timetableEvents);
+  const reviewEventContext = {
+    learnerId: args.learnerId,
+    learnerIdentityIds,
+  };
+  const allReviewMeetings = buildReviewMeetingItems(reviewEventContext, args.timetableEvents);
+  const progressReviews = allReviewMeetings.filter(item => caseFileReviewCategory(item) === 'progress-review');
+  const monthlyCoachMeetings = allReviewMeetings.filter(item => caseFileReviewCategory(item) === 'mcr');
+  // Preserve canonical actual/whole-plan totals, but use the coach table's
+  // target-to-date for the Case File target and its dependent calculations.
+  const canonicalActual = args.learnerMetrics?.actual ?? null;
+  const canonicalPlanned = args.learnerMetrics?.planned ?? null;
+  const businessDay = systemDateParts(new Date())!;
+  const targetToDate = otjhProgressAsOfToday({
+    otjhCompleted: canonicalActual,
+    otjhPlanned: canonicalPlanned,
+    startDate: args.shell.profile.startDate,
+    otjhProgrammeStartDate: args.shell.profile.otjhProgrammeStartDate ?? args.shell.profile.startDate,
+    plannedEndDate: args.shell.profile.otjhProgrammeEndDate ?? args.shell.profile.plannedEndDate ?? args.detail?.programmeEndDate,
+  }, new Date(businessDay.year, businessDay.month - 1, businessDay.day)).targetHours;
+  // The caseload API publishes target-to-date rounded to two decimal places.
+  const canonicalTarget = targetToDate === null ? null : Number(targetToDate.toFixed(2));
+  const metricsAvailable = Boolean(args.learnerMetrics);
+  const overallProgress = metricsAvailable ? args.learnerMetrics?.programmeProgress ?? null : null;
+  const learnerEndDate = args.detail?.learnerEndDate;
+  const formattedLearnerEndDate = learnerEndDate && /^\d{4}-\d{2}-\d{2}(?:T|$)/.test(learnerEndDate)
+    ? formatCalendarDateLabel(learnerEndDate)
+    : learnerEndDate;
+  const plannedEndDate = args.detail?.programmeEndDate
+    || args.shell.profile.plannedEndDate
+    || formattedLearnerEndDate
+    || '--';
+
+  return {
+    learnerId: args.learnerId,
+    enrolmentId: args.enrolmentId,
+    kind: args.kind,
+    snapshot: args.snapshot,
+    attendance: args.attendance,
+    evidence: args.evidence,
+    detail: args.detail,
+    learningActivity: args.aptemActivity || null,
+    journey,
+    activityStates,
+    peers,
+    displayName,
+    initials: getInitials(displayName),
+    programme: programme || args.shell.profile.programme || '',
+    employer: args.detail?.employer || args.shell.profile.employer || args.attendance?.employer || '',
+    cohort,
+    group,
+    email,
+    programStatus: args.detail?.programmeStatus || args.shell.profile.status || args.attendance?.programStatus || '',
+    coachName: args.shell.profile.coachName || '',
+    coachEmail: args.shell.profile.coachEmail || '',
+    coachRag: args.shell.profile.coachRag,
+    employerEmail: '',
+    employerPhone: '',
+    overallProgress,
+    activitiesCompleted: args.learnerMetrics?.programmeCompleted ?? null,
+    activitiesTotal: args.learnerMetrics?.programmeTotal ?? null,
+    // Prefer the learner's canonical register. The coach attendance projection
+    // remains a fallback so a temporary register failure does not blank the file.
+    attendanceRate: null,
+    attendancePresentCount: null,
+    attendanceSessionCount: null,
+    attendanceAbsentCount: null,
+    otjhCompleted: metricsAvailable ? canonicalActual : null,
+    otjhTarget: metricsAvailable ? canonicalTarget : null,
+    otjhPlanned: metricsAvailable ? canonicalPlanned : null,
+    ksbProgress: metricsAvailable ? args.learnerMetrics?.ksbProgress ?? null : null,
+    metricsAvailable,
+    ksbStatus: args.learnerMetrics?.ksbStatus,
+    // Counts remain available to the detailed KSB section, while the header
+    // consistently uses the canonical percentage in `ksbProgress`.
+    ksbEvidencedCount: args.learnerMetrics?.ksbCompleted ?? null,
+    ksbTotalCount: args.learnerMetrics?.ksbTotal ?? null,
+    mappedKsbCodes: args.learnerMetrics?.ksbCodes ?? [],
+    ksbCodeProgress: args.learnerMetrics?.ksbCodeProgress ?? [],
+    ksbActivityPoints: args.learnerMetrics?.ksbActivityPoints ?? [],
+    evidenceCount: args.snapshot?.evidenceCount ?? args.evidence?.totalEvidence ?? null,
+    startDate: args.shell.profile.startDate || '--',
+    gatewayReviewDate: args.shell.profile.gatewayReviewDate || '--',
+    plannedEndDate: (args.detail ? args.detail.learnerEndDate : args.shell.profile.learnerEndDate) || '--',
+    programmeStartDate: args.detail?.programmeStartDate || args.shell.profile.otjhProgrammeStartDate || args.shell.profile.startDate,
+    programmeEndDate: args.detail?.programmeEndDate || args.shell.profile.otjhProgrammeEndDate || args.shell.profile.plannedEndDate,
+    totalExpectedOtjh: metricsAvailable ? canonicalPlanned ?? 0 : 0,
+    touchedKsbCodes,
+    activityItems: buildActivityItems(args.snapshot, args.detail, args.evidence),
+    upcomingSessions,
+    progressReviews,
+    monthlyCoachMeetings,
+    reviewGroups: buildReviewGroups(allReviewMeetings),
+    learnerIdentityIds,
+    reviewGenerationIssues: args.reviewGenerationIssues.filter(issue => learnerIdentityIds.includes(String(issue.learnerId))),
+    reviewsLoading: Boolean(args.reviewsLoading),
+    coachNotes: allReviewMeetings.map(item => item.notes || '').filter(Boolean).slice(0, 5),
+  };
+}
+
+function buildActivityItems(
+  snapshot: CoachCaseloadLearner | null,
+  detail: LearnerDetail | null,
+  evidence: CoachMarkingQueueItem | null,
+) {
+  const items: CaseFileActivityItem[] = [];
+
+  const activityStartDate = snapshot?.otjhProgrammeStartDate ?? snapshot?.startDate;
+  if (activityStartDate && activityStartDate !== '--') {
+    items.push({
+      id: 'programme-start',
+      date: activityStartDate,
+      event: 'Programme start',
+      detail: `${snapshot?.name} joined ${snapshot?.cohortName}`,
+      tone: 'primary',
+    });
+  }
+
+  if (evidence?.lastSubmission && evidence.lastSubmission !== '--') {
+    items.push({
+      id: 'last-submission',
+      date: evidence.lastSubmission,
+      event: evidence.pendingEvidence > 0 ? 'Evidence awaiting review' : 'Latest evidence snapshot',
+      detail: `${evidence.totalEvidence} total item(s), ${evidence.acceptedEvidence} accepted, ${evidence.referredEvidence} referred`,
+      tone: evidence.pendingEvidence > 0 ? 'amber' : 'emerald',
+    });
+  }
+
+  if ((detail?.activityFeed || []).length > 0) {
+    for (const entry of detail?.activityFeed || []) {
+      items.push({
+        id: `feed-${entry.kind}-${entry.quizId ?? entry.componentId ?? entry.at}`,
+        date: formatDisplayDate(entry.at),
+        event: entry.action || activityEventLabel(entry),
+        detail: activityDetail(entry),
+        tone: activityTone(entry),
+      });
+    }
+  } else {
+    for (const attempt of sortAttemptsNewestFirst(detail?.quizAttempts || []).slice(0, 6)) {
+      items.push({
+        id: `quiz-${attempt.quizId}-${attempt.attempt ?? 0}-${attempt.submittedAt}`,
+        date: formatDisplayDate(attempt.submittedAt),
+        event: attempt.passed ? 'Quiz passed' : 'Quiz submitted',
+        detail: fallbackQuizAttemptDetail(detail, attempt),
+        tone: attempt.passed ? 'emerald' : 'accent',
+      });
+    }
+  }
+
+  return items
+    .sort((a, b) => sortableDate(b.date) - sortableDate(a.date))
+    .slice(0, 8);
+}
+
+function activityEventLabel(entry: LearnerActivityEntry) {
+  if (entry.kind === 'quiz') {
+    return entry.passed ? 'Quiz passed' : 'Quiz submitted';
+  }
+  if (entry.kind === 'video') {
+    return 'Video watched';
+  }
+  return 'Activity completed';
+}
+
+function activityDetail(entry: LearnerActivityEntry) {
+  const segments = [
+    entry.title,
+    entry.detail,
+    entry.module,
+    entry.week,
+  ].filter((value) => Boolean(String(value || '').trim()));
+
+  return segments.join(' - ') || 'Learner activity recorded.';
+}
+
+function activityTone(entry: LearnerActivityEntry): CaseFileActivityItem['tone'] {
+  if (entry.kind === 'quiz') {
+    return entry.passed ? 'emerald' : 'accent';
+  }
+  if (entry.kind === 'video') {
+    return 'primary';
+  }
+  return 'amber';
+}
+
+export function fallbackQuizAttemptDetail(detail: LearnerDetail | null, attempt: LearnerQuizAttempt) {
+  const title = resolveQuizAttemptTitle(detail, attempt);
+  const grade = formatAttemptGrade(attempt);
+  const score = formatQuizAttemptScore(attempt);
+  return [title, grade, score].filter(Boolean).join(' - ');
+}
+
+export function formatAttemptGrade(attempt: LearnerQuizAttempt) {
+  const rawGrade = Number(attempt.grade);
+  if (Number.isNaN(rawGrade)) {
+    return '--';
+  }
+  const percent = rawGrade <= 1 ? Math.round(rawGrade * 100) : Math.round(rawGrade);
+  return `${percent}%`;
+}
+
+export function sortAttemptsNewestFirst(attempts: LearnerQuizAttempt[]) {
+  return [...attempts].sort((left, right) => sortableDate(right.submittedAt) - sortableDate(left.submittedAt));
+}
+
+function sortableDate(value?: string | null) {
+  const parsed = new Date(String(value || ''));
+  return Number.isNaN(parsed.getTime()) ? 0 : parsed.getTime();
+}
+
+function formatUpcomingWeekday(value?: string | null, short = false) {
+  const parsed = parseLocalDate(value);
+  if (!parsed) {
+    return '--';
+  }
+  return new Intl.DateTimeFormat('en-GB', { weekday: short ? 'short' : 'long' }).format(parsed);
+}
+
+function formatUpcomingDateShort(value?: string | null) {
+  const parsed = parseLocalDate(value);
+  if (!parsed) {
+    return '--';
+  }
+  return new Intl.DateTimeFormat('en-GB', {
+    day: '2-digit',
+    month: 'short',
+  }).format(parsed);
+}
+
+function roundNumber(value: number) {
+  return Number.isInteger(value) ? value : Number(value.toFixed(1));
+}
+
+function getInitials(name: string) {
+  const parts = name.trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) {
+    return '?';
+  }
+  if (parts.length === 1) {
+    return parts[0].slice(0, 2).toUpperCase();
+  }
+  return `${parts[0][0]}${parts[parts.length - 1][0]}`.toUpperCase();
+}
+
+function buildMissingLearnerMessage(learnerId?: string | null, learnerName?: string | null) {
+  if (learnerName) {
+    return `Could not find ${learnerName} in the live coach data.`;
+  }
+  if (learnerId) {
+    return `Could not find learner ${learnerId} in the live coach data.`;
+  }
+  return null;
+}

@@ -1,0 +1,499 @@
+import { storedPdfAction } from '@/features/compliance-documents/persistOriginalPdf';
+import { DocumentSignatureTarget } from '@/features/pending-signatures/DocumentSignatureTarget';
+import { LearnerDocumentRevisions } from '@/features/compliance-documents/LearnerDocumentRevisions';
+import { useCallback, useEffect, useState } from 'react';
+import { useLocation, useNavigate } from 'react-router-dom';
+import { WorkspaceShell } from '@/components/feature/WorkspaceShell';
+import { roleNavMap } from '@/mocks/navigation';
+import { useMyLearner } from '@/hooks/useMyLearner';
+import { useToast } from "@/hooks/useToast.helpers";
+import { useAuth } from "@/hooks/useAuth.helpers";
+import { invalidateLearnerDetailCache } from '@/api/learnerDetail';
+import { markFirstSessionUnlocked } from '@/hooks/useLearnerNavGate';
+import { FIRST_SESSION_ROUTE } from '@/hooks/useOnboardingRedirect';
+import { formatHoursMinutes } from '@/lib/format';
+import {
+  fetchAgreement,
+  signAgreement,
+  fmtAgreementDate,
+  type AgreementResponse,
+} from '@/api/apprenticeshipAgreement';
+import {
+  buildApprenticeshipAgreementPdf,
+  renderAgreementPdf,
+  agreementFilename,
+} from '@/lib/apprenticeshipAgreementPdf';
+import {
+  fetchIlrDocument,
+  signIlrDocument,
+  type IlrResponse,
+} from '@/api/ilrDocument';
+import { buildIlrPdf, renderIlrPdf, ilrFilename } from '@/lib/ilrDocumentPdf';
+import {
+  fetchTrainingPlanDocument,
+  signTrainingPlanDocument,
+  type TrainingPlanResponse,
+} from '@/api/trainingPlanDocument';
+import {
+  buildTrainingPlanPdf,
+  renderTrainingPlanPdf,
+  trainingPlanFilename,
+} from '@/lib/trainingPlanPdf';
+import {
+  fetchWrittenAgreement,
+  signWrittenAgreement,
+  type WrittenAgreementResponse,
+} from '@/api/writtenAgreement';
+import {
+  buildWrittenAgreementPdf,
+  renderWrittenAgreementPdf,
+  writtenAgreementFilename,
+} from '@/lib/writtenAgreementPdf';
+import { DocumentCard, Field, FieldGroup } from './DocumentCard';
+import { RowsSkeleton } from '@/components/feature/Skeletons';
+import { SuitabilityRplIssuedCard } from '@/features/compliance-documents/SuitabilityRplIssuedCard';
+import { Building2, CalendarDays, ClipboardList, FileSignature, FileText, Flag, GraduationCap, Layers3, Phone, UserRound } from 'lucide-react';
+import styles from './compliance.module.css';
+import { currentDocument } from './currentDocument';
+import { signRevision, type RevisionDetail } from '@/features/compliance-documents/revisionApi';
+import { DocumentPreview } from '@/features/compliance-documents/DocumentPreview';
+import { previewPdf } from '@/features/compliance-documents/previewPdf';
+import { PENDING_SIGNATURES_CHANGED } from '@/features/pending-signatures/events';
+import type { PreviewResponse } from '@/features/compliance-documents/types';
+
+// ============================================================================
+// Compliance documents — the learner's statutory paperwork.
+//
+// Four documents, each with its own table, signatories and lifecycle:
+//   * Apprenticeship Agreement — learner + EMPLOYER.
+//   * Individual Learner Record — learner + PROVIDER. The employer has no part
+//     in an ILR and never sees it.
+//   * Training Plan — learner + employer + provider.
+//   * Written Agreement — learner + employer + provider.
+//
+// All are issued by the provider, and each renders its PDF on demand from the
+// record so the file always carries the signatures actually on file.
+// ============================================================================
+
+const learnerNav = roleNavMap.learner;
+
+export default function LearnerCompliancePage() {
+  const signatureTarget = new URLSearchParams(useLocation().search).get('signature');
+  const { kind, id } = useMyLearner();
+  const isCommercial = kind === 'commercial';
+  const toast = useToast();
+  const navigate = useNavigate();
+  const { auth } = useAuth();
+
+  const [agreementData, setAgreementData] = useState<AgreementResponse | null>(null);
+  const [ilrData, setIlrData] = useState<IlrResponse | null>(null);
+  const [planData, setPlanData] = useState<TrainingPlanResponse | null>(null);
+  const [writtenData, setWrittenData] = useState<WrittenAgreementResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [current, setCurrent] = useState<Partial<Record<'agreement' | 'ilr' | 'plan' | 'written', RevisionDetail>>>({});
+  const [currentPreview, setCurrentPreview] = useState<PreviewResponse | null>(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError('');
+    if (isCommercial) {
+      setLoading(false);
+      return;
+    }
+    try {
+      const [agreement, ilr, plan, written] = await Promise.all([
+        fetchAgreement(id),
+        fetchIlrDocument(id),
+        fetchTrainingPlanDocument(id),
+        fetchWrittenAgreement(id),
+      ]);
+      const [a, i, p, w] = await Promise.all([
+        currentDocument(id, 'apprenticeship-agreement', agreement.agreement),
+        currentDocument(id, 'ilr', ilr.document),
+        currentDocument(id, 'training-plan', plan.document),
+        currentDocument(id, 'written-agreement', written.document),
+      ]);
+      const resolved = { agreement: { ...agreement, agreement: a.document }, ilr: { ...ilr, document: i.document },
+        plan: { ...plan, document: p.document }, written: { ...written, document: w.document } };
+      setCurrent({ agreement: a.revision, ilr: i.revision, plan: p.revision, written: w.revision });
+      setAgreementData(resolved.agreement); setIlrData(resolved.ilr);
+      setPlanData(resolved.plan); setWrittenData(resolved.written);
+      return resolved;
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not load your compliance documents.');
+    } finally {
+      setLoading(false);
+    }
+  }, [id, isCommercial]);
+
+  useEffect(() => {
+    void load();
+    const refresh = () => { void load(); };
+    window.addEventListener(PENDING_SIGNATURES_CHANGED, refresh);
+    return () => window.removeEventListener(PENDING_SIGNATURES_CHANGED, refresh);
+  }, [load, signatureTarget]);
+
+  const currentPdf = (kind: keyof typeof current, filename?: string) => {
+    const detail = current[kind];
+    if (!detail) return false;
+    if (!filename) setCurrentPreview(detail.preview);
+    else void previewPdf(detail.preview).then(blob => {
+      const url = URL.createObjectURL(blob), link = document.createElement('a');
+      link.href = url; link.download = filename; link.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }).catch(err => toast.error('Could not download', err.message));
+    return true;
+  };
+
+  // ---- Apprenticeship Agreement ----
+  const agreement = agreementData?.agreement ?? null;
+  const agreementName = agreementData?.particulars.apprenticeName || '';
+  const agreementPdf = () => {
+    if (!agreementData) return null;
+    return agreement
+      ? renderAgreementPdf(agreement)
+      : buildApprenticeshipAgreementPdf(agreementData.particulars);
+  };
+  const agreementShown = agreement ? agreement.particulars : agreementData?.particulars;
+
+  // ---- Individual Learner Record ----
+  const ilr = ilrData?.document ?? null;
+  const ilrPdf = () => {
+    if (!ilrData) return null;
+    return ilr ? renderIlrPdf(ilr) : buildIlrPdf(ilrData.learnerDetails, ilrData.answers);
+  };
+  const ilrShown = ilr ? ilr.learnerDetails : ilrData?.learnerDetails;
+
+  // ---- Training Plan ----
+  const plan = planData?.document ?? null;
+  const planPdf = () => {
+    if (!planData) return null;
+    return plan
+      ? renderTrainingPlanPdf(plan)
+      : buildTrainingPlanPdf(
+          planData.programme,
+          planData.employment,
+          planData.learningPlan,
+          planData.otjh,
+          planData.epa,
+          planData.contacts,
+        );
+  };
+  const planShown = plan ? plan.programme : planData?.programme;
+  const planRows = plan ? plan.learningPlan : planData?.learningPlan ?? [];
+
+  // ---- Written Agreement ----
+  const written = writtenData?.document ?? null;
+  const writtenPdf = () => {
+    if (!writtenData) return null;
+    return written
+      ? renderWrittenAgreementPdf(written)
+      : buildWrittenAgreementPdf(
+          writtenData.particulars,
+          writtenData.delivery,
+          writtenData.epa,
+          writtenData.costs,
+          writtenData.contacts,
+        );
+  };
+  const writtenShown = written ? written.particulars : writtenData?.particulars;
+
+  const openPdf = (doc: ReturnType<typeof agreementPdf>) => {
+    if (doc) window.open(doc.output('bloburl'), '_blank', 'noopener');
+  };
+
+  if (isCommercial) {
+    return (
+      <WorkspaceShell
+        role="learner"
+        roleLabel={learnerNav.label}
+        navItems={learnerNav.items}
+        workspaceLabel={learnerNav.workspaceLabel}
+        pageTitle="Compliance documents"
+        pageSubtitle="Not required for commercial delivery"
+        userName="Learner"
+        userRole="Learner"
+      >
+        <main className=" page-container min-w-0 w-full space-y-3 p-3 md:space-y-4 md:p-6">
+          <div className="mx-auto max-w-2xl rounded-2xl border border-primary-200 bg-primary-50/40 p-8 text-center">
+            <i className="ri-information-line text-3xl text-primary-600" />
+            <h2 className="mt-3 text-lg font-heading font-semibold text-foreground-900">No compliance documents are required</h2>
+            <p className="mt-2 text-[13px] leading-relaxed text-foreground-600">Commercial learners follow a delivery-only programme and do not complete apprenticeship compliance documents.</p>
+          </div>
+        </main>
+      </WorkspaceShell>
+    );
+  }
+
+  const sign = async (
+    kind: 'agreement' | 'ilr' | 'plan' | 'written',
+    mark: string,
+    name: string,
+    otherParty: string,
+  ) => {
+    if (!mark) {
+      toast.error('Signature required', 'Enter your name to sign.');
+      return;
+    }
+    setBusy(true);
+    try {
+      if (current[kind]) await signRevision(id, current[kind]!.revision.id, kind === 'agreement' || kind === 'plan' ? 'apprentice' : 'learner', name, mark);
+      else if (kind === 'agreement') await signAgreement(id, 'apprentice', name, mark);
+      else if (kind === 'plan') await signTrainingPlanDocument(id, 'apprentice', name, mark);
+      else if (kind === 'written') await signWrittenAgreement(id, 'learner', name, mark);
+      else await signIlrDocument(id, 'learner', name, mark);
+      toast.success('Signed', `Your ${otherParty} still needs to sign this document.`);
+      invalidateLearnerDetailCache('apprenticeship', id);
+      const documents = await load();
+      if (auth.account?.role === 'learner' && documents
+        && documents.agreement.agreement?.signatures.apprentice.signed
+        && documents.ilr.document?.signatures.learner.signed
+        && documents.plan.document?.signatures.apprentice.signed
+        && documents.written.document?.signatures.learner.signed) {
+        // Every document now carries their signature, which is what opens the
+        // first learning session booking — so that is where they go next.
+        markFirstSessionUnlocked('apprenticeship', id);
+        navigate(FIRST_SESSION_ROUTE, { replace: true });
+      }
+    } catch (err) {
+      toast.error('Could not sign', err instanceof Error ? err.message : 'Please try again.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <WorkspaceShell
+      role="learner"
+      roleLabel={learnerNav.label}
+      navItems={learnerNav.items}
+      workspaceLabel={learnerNav.workspaceLabel}
+      pageTitle="Compliance documents"
+      pageSubtitle="Your statutory apprenticeship paperwork"
+    >
+      <div className={`page-container min-w-0 w-full space-y-3 p-3 md:space-y-4 md:p-6 ${styles.page}`}>
+        {loading ? (
+          <RowsSkeleton rows={5} className="py-2" />
+        ) : error ? (
+          <div className="rounded-xl border border-foreground-200/60 bg-background-50 p-6 text-center">
+            <p className="text-[13px] text-red-600">{error}</p>
+            <button
+              onClick={() => void load()}
+              className="mt-3 rounded-lg border border-foreground-200 px-3 py-1.5 text-[12px] font-medium text-foreground-600 hover:border-primary-300 hover:bg-primary-50/60 hover:text-primary-700 cursor-pointer"
+            >
+              Try again
+            </button>
+          </div>
+        ) : (
+          <>
+            <DocumentSignatureTarget documentKey="apprenticeship-agreement" sourceId={agreement?.id}>
+            <DocumentCard
+              title="Apprenticeship Agreement"
+              icon={FileText}
+              revisions={agreement && <LearnerDocumentRevisions learnerId={String(id)} documentKey="apprenticeship-agreement" sourceId={agreement.id} />}
+              blurb="The agreement between you and your employer. It sets out your apprenticeship standard, the dates it runs, and your planned off-the-job training hours."
+              signedBy="You and your employer"
+              issued={Boolean(agreement)}
+              fullySigned={Boolean(agreement?.fullySigned)}
+              canSign={!current.agreement || current.agreement.revision.signatureMethod === 'sign-again'}
+              currentVersion={current.agreement?.revision.number}
+              learner={agreement?.signatures.apprentice}
+              other={agreement?.signatures.employer}
+              otherLabel="Employer"
+              signatoryName={agreementName}
+              busy={busy}
+              fmtDate={fmtAgreementDate}
+              onPreview={() => { if (!currentPdf('agreement') && !storedPdfAction(agreement)) openPdf(agreementPdf()); }}
+              onDownload={() => { if (!currentPdf('agreement', agreementFilename(agreementName)) && !storedPdfAction(agreement, agreementFilename(agreementName))) agreementPdf()?.save(agreementFilename(agreementName)); }}
+              onSign={(mark) => void sign('agreement', mark, agreementName, 'employer')}
+              fields={
+                agreementShown && (
+                  <>
+                    <FieldGroup title="Key details" icon={Layers3}>
+                      <Field label="Apprentice" value={agreementShown.apprenticeName} />
+                      <Field label="Start date" value={fmtAgreementDate(agreementShown.startDate)} />
+                    <Field
+                      label="Planned off-the-job training"
+                      value={agreementShown.plannedOtjHours != null ? formatHoursMinutes(agreementShown.plannedOtjHours) : ''}
+                      hint={
+                        agreementData?.meta.moduleCount
+                          ? `from ${agreementData.meta.moduleCount} module${agreementData.meta.moduleCount === 1 ? '' : 's'} on your learning plan`
+                          : undefined
+                      }
+                    />
+                    </FieldGroup>
+                    <FieldGroup title="Employer" icon={Building2}>
+                      <Field label="Employer" value={agreementShown.employerName} />
+                      <Field label="End date" value={fmtAgreementDate(agreementShown.endDate)} />
+                    </FieldGroup>
+                    <FieldGroup title="Apprenticeship details" icon={GraduationCap}>
+                      <Field label="Apprenticeship standard" value={agreementShown.standard} />
+                      <Field label="Duration of practical period" value={agreementShown.durationWeeks != null ? `${agreementShown.durationWeeks} weeks` : ''} />
+                    </FieldGroup>
+                  </>
+                )
+              }
+            />
+            </DocumentSignatureTarget>
+
+            <DocumentSignatureTarget documentKey="ilr" sourceId={ilr?.id}>
+            <DocumentCard
+              title="Individual Learner Record"
+              icon={UserRound}
+              revisions={ilr && <LearnerDocumentRevisions learnerId={String(id)} documentKey="ilr" sourceId={ilr.id} />}
+              blurb="Your enrolment record: your details, eligibility and the information you gave during onboarding. Your training provider confirms they have seen your identity and eligibility evidence."
+              signedBy="You and your training provider"
+              issued={Boolean(ilr)}
+              fullySigned={Boolean(ilr?.fullySigned)}
+              canSign={!current.ilr || current.ilr.revision.signatureMethod === 'sign-again'}
+              currentVersion={current.ilr?.revision.number}
+              learner={ilr?.signatures.learner}
+              other={ilr?.signatures.provider}
+              otherLabel="Provider"
+              signatoryName={ilrData?.learner.name}
+              busy={busy}
+              fmtDate={fmtAgreementDate}
+              onPreview={() => { if (!currentPdf('ilr') && !storedPdfAction(ilr)) openPdf(ilrPdf()); }}
+              onDownload={() => { if (!currentPdf('ilr', ilrFilename(ilrData?.learner.name || '')) && !storedPdfAction(ilr, ilrFilename(ilrData?.learner.name || ''))) ilrPdf()?.save(ilrFilename(ilrData?.learner.name || '')); }}
+              onSign={(mark) => void sign('ilr', mark, ilrData?.learner.name || '', 'training provider')}
+              fields={
+                ilrShown && (
+                  <>
+                    <FieldGroup title="Learner details" icon={UserRound}>
+                    <Field
+                      label="Name"
+                      value={[ilrShown.givenNames, ilrShown.familyName].filter(Boolean).join(' ')}
+                    />
+                    <Field label="National insurance number" value={ilrShown.nationalInsuranceNumber ?? ''} />
+                    </FieldGroup>
+                    <FieldGroup title="Personal details" icon={CalendarDays}>
+                    <Field label="Date of birth" value={fmtAgreementDate(ilrShown.dateOfBirth)} />
+                    <Field label="Sex" value={ilrShown.sex ?? ''} />
+                    </FieldGroup>
+                    <FieldGroup title="Contact details" icon={Phone}>
+                    <Field label="ULN" value={ilrShown.uln ?? ''} />
+                    <Field label="Telephone" value={ilrShown.telephone ?? ''} />
+                    </FieldGroup>
+                  </>
+                )
+              }
+            />
+            </DocumentSignatureTarget>
+
+            <DocumentSignatureTarget documentKey="training-plan" sourceId={plan?.id}>
+            <DocumentCard
+              title="Training Plan"
+              icon={ClipboardList}
+              revisions={plan && <LearnerDocumentRevisions learnerId={String(id)} documentKey="training-plan" sourceId={plan.id} />}
+              blurb="How you, your employer and your training provider will each support your apprenticeship, together with the learning plan and off-the-job hours that deliver it."
+              signedBy="You, your employer and your training provider"
+              issued={Boolean(plan)}
+              fullySigned={Boolean(plan?.fullySigned)}
+              canSign={!current.plan || current.plan.revision.signatureMethod === 'sign-again'}
+              currentVersion={current.plan?.revision.number}
+              learner={plan?.signatures.apprentice}
+              other={plan?.signatures.employer}
+              otherLabel="Employer"
+              third={plan?.signatures.provider}
+              thirdLabel="Provider"
+              signatoryName={planData?.learner.name}
+              busy={busy}
+              fmtDate={fmtAgreementDate}
+              onPreview={() => { if (!currentPdf('plan') && !storedPdfAction(plan)) openPdf(planPdf()); }}
+              onDownload={() => { if (!currentPdf('plan', trainingPlanFilename(planData?.learner.name || '')) && !storedPdfAction(plan, trainingPlanFilename(planData?.learner.name || ''))) planPdf()?.save(trainingPlanFilename(planData?.learner.name || '')); }}
+              onSign={(mark) => void sign('plan', mark, planData?.learner.name || '', 'employer and provider')}
+              fields={
+                planShown && (
+                  <>
+                    <FieldGroup title="Programme details" icon={GraduationCap}>
+                    <Field label="Programme" value={planShown.programme ?? ''} />
+                    <Field
+                      label="Duration of practical period"
+                      value={planShown.durationWeeks != null ? `${planShown.durationWeeks} weeks` : ''}
+                    />
+                    </FieldGroup>
+                    <FieldGroup title="Plan schedule" icon={CalendarDays}>
+                    <Field label="Start date" value={fmtAgreementDate(planShown.startDate)} />
+                    <Field
+                      label="ILR planned hours"
+                      value={planShown.ilrPlannedHours != null ? `${planShown.ilrPlannedHours} hours` : ''}
+                    />
+                    </FieldGroup>
+                    <FieldGroup title="Completion" icon={Flag}>
+                    <Field label="End date" value={fmtAgreementDate(planShown.endDate)} />
+                    <Field
+                      label="Learning plan"
+                      value={planRows.length ? `${planRows.length} activities` : ''}
+                    />
+                    </FieldGroup>
+                  </>
+                )
+              }
+            />
+            </DocumentSignatureTarget>
+
+            <DocumentSignatureTarget documentKey="written-agreement" sourceId={written?.id}>
+            <DocumentCard
+              title="Written Agreement"
+              icon={FileSignature}
+              revisions={written && <LearnerDocumentRevisions learnerId={String(id)} documentKey="written-agreement" sourceId={written.id} />}
+              blurb="The agreement between your employer and your training provider: what will be delivered, the end-point assessment arrangements, and the costs against the funding band."
+              signedBy="You, your employer and your training provider"
+              issued={Boolean(written)}
+              fullySigned={Boolean(written?.fullySigned)}
+              canSign={!current.written || current.written.revision.signatureMethod === 'sign-again'}
+              currentVersion={current.written?.revision.number}
+              learner={written?.signatures.learner}
+              other={written?.signatures.employer}
+              otherLabel="Employer"
+              third={written?.signatures.provider}
+              thirdLabel="Provider"
+              signatoryName={writtenData?.learner.name}
+              busy={busy}
+              fmtDate={fmtAgreementDate}
+              onPreview={() => { if (!currentPdf('written') && !storedPdfAction(written)) openPdf(writtenPdf()); }}
+              onDownload={() => { if (!currentPdf('written', writtenAgreementFilename(writtenData?.learner.name || '')) && !storedPdfAction(written, writtenAgreementFilename(writtenData?.learner.name || ''))) writtenPdf()?.save(writtenAgreementFilename(writtenData?.learner.name || '')); }}
+              onSign={(mark) => void sign('written', mark, writtenData?.learner.name || '', 'employer and provider')}
+              fields={
+                writtenShown && (
+                  <>
+                    <FieldGroup title="Key details" icon={Layers3}>
+                    <Field label="Apprentice" value={writtenShown.apprenticeName ?? ''} />
+                    <Field label="Apprenticeship title" value={writtenShown.apprenticeshipTitle ?? ''} />
+                    </FieldGroup>
+                    <FieldGroup title="Provider details" icon={Building2}>
+                    <Field label="Main provider" value={writtenShown.mainProvider ?? ''} />
+                    </FieldGroup>
+                    <FieldGroup title="Plan schedule" icon={CalendarDays}>
+                    <Field label="Start date" value={fmtAgreementDate(writtenShown.startDate)} />
+                    <Field label="Planned end date" value={fmtAgreementDate(writtenShown.plannedEndDate)} />
+                    <Field
+                      label="Planned off-the-job training"
+                      value={
+                        (written ?? writtenData)?.delivery?.totalOtjHours != null
+                          ? formatHoursMinutes((written ?? writtenData)!.delivery.totalOtjHours!)
+                          : ''
+                      }
+                      hint={
+                        writtenData?.meta.activityCount
+                          ? `across ${writtenData.meta.activityCount} delivery activities`
+                          : undefined
+                      }
+                    />
+                    </FieldGroup>
+                  </>
+                )
+              }
+            />
+            </DocumentSignatureTarget>
+            {written && <LearnerDocumentRevisions learnerId={String(id)} documentKey="written-agreement" sourceId={written.id} />}
+            <SuitabilityRplIssuedCard kind={kind} learnerId={String(id)} signatoryName={agreementName || writtenData?.learner.name || ''} />
+          </>
+        )}
+      </div>
+      {currentPreview && <DocumentPreview value={currentPreview} onClose={() => setCurrentPreview(null)} />}
+    </WorkspaceShell>
+  );
+}

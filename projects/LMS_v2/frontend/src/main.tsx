@@ -1,0 +1,24 @@
+import { StrictMode } from 'react'
+import './i18n'
+import { createRoot } from 'react-dom/client'
+import './components/feature/WorkspaceColourTheme.css'
+import './index.css'
+import './learner-theme.css'
+import App from './App.tsx'
+import './coach-theme.css'
+import './components/feature/WorkspaceSidebarTheme.css'
+import './components/feature/WorkspaceChromeTheme.css'
+import './components/feature/WorkspaceEnrolmentTheme.css'
+import './styles/dropdowns.css'
+import './styles/search-fields.css'
+import { installAuditRequestContext } from './lib/auditRequestContext'
+import { installPerformanceDiagnostics } from './lib/performanceDiagnostics'
+
+installPerformanceDiagnostics()
+installAuditRequestContext()
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+)

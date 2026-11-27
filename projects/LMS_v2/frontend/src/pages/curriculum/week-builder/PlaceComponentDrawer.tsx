@@ -1,0 +1,310 @@
+import { LoadingSkeleton } from '@/components/feature/LoadingSkeleton';
+import { useEffect, useMemo, useState } from 'react';
+import { AppIcon } from '@/components/feature/AppIcon';
+import { showCurriculumAlert, showCurriculumConfirm } from '@/components/feature/CurriculumSweetAlert';
+import { type CurriculumModule } from '@/lib/curriculumApi';
+import { loadCurriculumScope } from './weekTemplateData';
+import { modulesForGroup } from '../shared/entities/groupModuleMatch';
+import {
+  copyComponentToWeek,
+  SESSION_DATE_SETTING_KEYS,
+  TEAMS_MEETING_SETTING_KEYS,
+  loadModuleStructure,
+  saveModuleStructure,
+  type ModuleCatalogueItem,
+  type ModuleComponent,
+  type ModuleWeek,
+} from '@/pages/curriculum/module-builder/moduleAuthoringData';
+
+type Step = 'module' | 'week';
+
+const catalogueIdOf = (module: CurriculumModule) => module.moduleCatalogueId || module.catalogueId || module.id;
+const weekLabel = (week: ModuleWeek) => week.title || `Week ${week.weekNumber}`;
+
+/**
+ * Modal launched from an unassigned group in "Assigned groups": lets the
+ * tutor pick which of that group's modules a copy of the component being
+ * edited should land in, then which of that module's weeks — any number of
+ * them — get a copy appended to their rail.
+ *
+ * A popup rather than an inline panel: the inline version rendered wherever
+ * the group card sat in the (often long) group grid, so opening it silently
+ * scrolled the picker out of view every time.
+ *
+ * Always a snapshot copy per week (see copyComponentToWeek) — editing here
+ * never reaches back into the original component. On success, the caller
+ * (AssignedGroupsSection) marks the group as assigned.
+ */
+export interface PlacementResult {
+  moduleCatalogueId: string;
+  weekId: string;
+  componentId: string;
+}
+
+export function GroupPlacementPanel({ component, groupId, groupName, programmeId, onClose, onPlaced }: {
+  component: ModuleComponent;
+  groupId?: string;
+  groupName: string;
+  programmeId: string;
+  onClose: () => void;
+  onPlaced: (results: PlacementResult[]) => void;
+}) {
+  const [step, setStep] = useState<Step>('module');
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [modules, setModules] = useState<CurriculumModule[]>([]);
+  const [targetModule, setTargetModule] = useState<CurriculumModule | null>(null);
+  const [targetStructure, setTargetStructure] = useState<ModuleCatalogueItem | null>(null);
+  const [CHANGE_MEWeekIds, setSelectedWeekIds] = useState<Set<string>>(new Set());
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    // This picker can be opened after a module was created or attached in
+    // another drawer. Do not reuse the week-builder's long-lived scope cache:
+    // the programme page is already showing the new module, so this list must
+    // revalidate before deciding which modules belong to the CHANGE_ME group.
+    loadCurriculumScope({ force: true })
+      .then(scope => {
+        if (!active) return;
+        setModules(scope.modules);
+        setLoading(false);
+      })
+      .catch(err => {
+        if (!active) return;
+        setError(err instanceof Error ? err.message : 'Unable to load modules.');
+        setLoading(false);
+      });
+    return () => { active = false; };
+  }, []);
+
+  const groupModules = useMemo(
+    () => modulesForGroup(modules, { groupId, groupName, programmeId }),
+    [groupId, modules, groupName, programmeId],
+  );
+
+  const selectModule = async (module: CurriculumModule) => {
+    setTargetModule(module);
+    setLoading(true);
+    setError('');
+    try {
+      const structure = await loadModuleStructure(catalogueIdOf(module));
+      if (!structure) {
+        setError('That module has no structure yet.');
+        return;
+      }
+      setTargetStructure(structure);
+      setSelectedWeekIds(new Set());
+      setStep('week');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to load that module.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const toggleWeek = (weekId: string) => {
+    setSelectedWeekIds(current => {
+      const next = new Set(current);
+      if (next.has(weekId)) next.delete(weekId); else next.add(weekId);
+      return next;
+    });
+  };
+
+  const place = async () => {
+    if (!targetStructure || CHANGE_MEWeekIds.size === 0) return;
+    setSaving(true);
+    setError('');
+    try {
+      const catalogueId = targetStructure.catalogueId;
+      // Re-fetch right before saving rather than reusing the snapshot from
+      // when the module was opened: picking weeks can take a while, and this
+      // module's *other* weeks/components may have been edited (by this
+      // tutor elsewhere, or someone else) in that time. Saving the stale
+      // snapshot would silently revert those.
+      const freshStructure = await loadModuleStructure(catalogueId, { skipCache: true });
+      if (!freshStructure) { setError('That module no longer exists.'); return; }
+      const missing = Array.from(CHANGE_MEWeekIds).filter(id => !freshStructure.weekStructure.some(week => week.id === id));
+      if (missing.length) { setError('One of the CHANGE_ME weeks no longer exists — go back and pick again.'); return; }
+      const hasLiveSession = component.type === 'live-session';
+      // A live session in an unCHANGE_ME week is not a conflict: the copy is
+      // being placed into the CHANGE_ME weeks only. The old module-wide check
+      // showed the warning even for empty weeks (and made a zero-component
+      // week look as though it already contained a session).
+      const CHANGE_MEWeeks = freshStructure.weekStructure.filter(week => CHANGE_MEWeekIds.has(week.id));
+      const targetHasLiveSession = CHANGE_MEWeeks.some(week =>
+        week.components.some(item => item.type === 'live-session'));
+      const sourceTeamsLink = hasLiveSession
+        ? String(component.settings.liveSessionUrl || component.settings.teamsMeetingUrl || '').trim()
+        : '';
+      let replaceExisting = false;
+      let copyWithLink = false;
+      if (hasLiveSession && targetHasLiveSession) {
+        const copyChoice = sourceTeamsLink ? 'Copy with Teams link' : 'Copy without Teams link';
+        const copyDescription = sourceTeamsLink
+          ? 'add another copy with its Teams link'
+          : 'add another copy without a Teams link (the source has no link to copy)';
+        await showCurriculumConfirm({
+          title: 'Live session already exists',
+          text: `One or more CHANGE_ME weeks already contain a Live Session. Replace those CHANGE_ME sessions with the source session's Teams link, calendar identity and dates, or ${copyDescription}? Sessions in other weeks are not affected.`,
+          icon: 'warning',
+          confirmButtonText: 'Replace CHANGE_ME session',
+          cancelButtonText: 'Reject',
+          denyButtonText: copyChoice,
+          onConfirm: async () => { replaceExisting = true; },
+          onDeny: async () => { copyWithLink = true; },
+        });
+        if (!replaceExisting && !copyWithLink) {
+          setError('Placement rejected. The existing Live Session was kept.');
+          return;
+        }
+      }
+      const results: PlacementResult[] = [];
+      const nextWeekStructure = freshStructure.weekStructure.map(week => {
+        if (!CHANGE_MEWeekIds.has(week.id)) return week;
+        const existingLive = week.components.find(item => item.type === 'live-session');
+        const copy = copyComponentToWeek(component, week.id, catalogueId);
+        // An Assigned Groups replacement is an CHANGE_ME request to make the
+        // destination use the source delivery. Carry the source Teams identity
+        // and schedule so the destination resolves to the same meeting/link
+        // and dates. This also makes the destination's existing "Update Teams
+        // meeting" action operate on the shared calendar instead of its old
+        // meeting.
+        const clone = replaceExisting && existingLive ? {
+          ...copy,
+          settings: {
+            ...copy.settings,
+            ...Object.fromEntries([...TEAMS_MEETING_SETTING_KEYS, ...SESSION_DATE_SETTING_KEYS]
+              .filter(key => component.settings[key] !== undefined)
+              .map(key => [key, component.settings[key]])),
+          },
+        } : copy;
+        const components = replaceExisting
+          ? week.components.filter(item => item.type !== 'live-session')
+          : week.components;
+        results.push({ moduleCatalogueId: catalogueId, weekId: week.id, componentId: clone.id });
+        return { ...week, components: [...components, clone] };
+      });
+      // A replacement that carries a booked Teams session is a shared-module
+      // alias, not seven new owners of the same live_sessions row. Persist the
+      // source module once so the backend strips duplicate calendar identities
+      // from the destination payload and projects the source calendar when it
+      // is read back.
+      const sharedTeamsSourceModuleId = hasLiveSession && sourceTeamsLink
+        ? String(component.moduleId || '').trim()
+        : '';
+      await saveModuleStructure(catalogueId, {
+        ...freshStructure,
+        ...(replaceExisting && sharedTeamsSourceModuleId ? { teamsSharedSourceModuleId: sharedTeamsSourceModuleId } : {}),
+        weekStructure: nextWeekStructure,
+      });
+      void showCurriculumAlert({
+        title: 'Placed',
+        text: `Copied into ${groupName}'s ${results.length} week${results.length === 1 ? '' : 's'}.`,
+        icon: 'success',
+        timer: 2200,
+      });
+      onPlaced(results);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to place this component there.');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const back = () => {
+    setError('');
+    setStep('module');
+    setTargetModule(null);
+    setTargetStructure(null);
+    setSelectedWeekIds(new Set());
+  };
+
+  const close = () => { if (!saving) onClose(); };
+
+  const stepTitle = step === 'module' ? `${groupName}'s modules` : `${groupName} › ${targetModule?.name ?? ''}`;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-foreground-950/50 backdrop-blur-sm" onClick={close}>
+      <div role="dialog" aria-modal="true" aria-labelledby="place-component-title" className="flex max-h-[85vh] w-full max-w-lg flex-col overflow-hidden rounded-2xl border border-background-200 bg-background-50 shadow-2xl" onClick={event => event.stopPropagation()}>
+        <div className="flex items-center justify-between gap-3 border-b border-background-200 bg-primary-50 px-4 py-3">
+          <div className="flex min-w-0 items-center gap-1.5">
+            {step !== 'module' && (
+              <button type="button" onClick={back} disabled={saving} className="grid h-6 w-6 shrink-0 place-items-center rounded-md text-foreground-500 hover:bg-background-100 hover:text-foreground-800 disabled:opacity-50">
+                <AppIcon className="ri-arrow-left-line text-[13px]"></AppIcon>
+              </button>
+            )}
+            <span id="place-component-title" className="truncate text-[12px] font-bold text-foreground-800">{stepTitle}</span>
+          </div>
+          <button type="button" onClick={close} disabled={saving} aria-label="Close" className="grid h-6 w-6 shrink-0 place-items-center rounded-md text-foreground-400 hover:bg-background-100 hover:text-foreground-800 disabled:opacity-50">
+            <AppIcon className="ri-close-line text-[13px]"></AppIcon>
+          </button>
+        </div>
+
+        <div className="min-h-0 flex-1 overflow-y-auto p-4">
+          {loading ? (
+            <div className="flex items-center justify-center gap-2 py-8 text-[12px] text-foreground-500">
+              <span className="h-4 w-4 animate-spin rounded-full border-2 border-background-300 border-t-primary-500" />
+              <LoadingSkeleton label="Loading…" variant="text" /></div>
+          ) : step === 'module' ? (
+            groupModules.length ? (
+              <div className="space-y-1.5">
+                {groupModules.map(module => (
+                  <button key={catalogueIdOf(module)} type="button" onClick={() => void selectModule(module)} className="flex w-full items-center justify-between gap-2 rounded-lg border border-background-200 bg-background-50 px-3 py-2 text-left transition-smooth hover:border-primary-300">
+                    <span className="truncate text-[12px] font-bold text-foreground-900">{module.name}</span>
+                    <AppIcon className="ri-arrow-right-s-line shrink-0 text-foreground-300"></AppIcon>
+                  </button>
+                ))}
+              </div>
+            ) : <p className="py-8 text-center text-[12px] text-foreground-400">No modules for {groupName} in this programme.</p>
+          ) : targetStructure?.weekStructure.length ? (
+            <div className="space-y-1.5">
+              {targetStructure.weekStructure.map(week => {
+                const checked = CHANGE_MEWeekIds.has(week.id);
+                return (
+                  <div
+                    key={week.id}
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => toggleWeek(week.id)}
+                    onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); toggleWeek(week.id); } }}
+                    className={`flex w-full items-center gap-3 rounded-lg border px-3 py-2 text-left cursor-pointer transition-colors ${checked ? 'border-primary-300 bg-primary-50' : 'border-background-200 bg-background-50 hover:border-primary-200'}`}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      onClick={event => event.stopPropagation()}
+                      onChange={() => toggleWeek(week.id)}
+                      className="shrink-0 accent-primary-600"
+                    />
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-[12px] font-bold text-foreground-900">{weekLabel(week)}</span>
+                      <span className="mt-0.5 block text-[10px] text-foreground-400">{week.components.length} component{week.components.length === 1 ? '' : 's'}</span>
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          ) : <p className="py-8 text-center text-[12px] text-foreground-400">This module has no weeks yet.</p>}
+          {error && <p className="mt-3 rounded-lg border border-red-100 bg-red-50 px-3 py-2 text-[11px] font-semibold text-red-700">{error}</p>}
+        </div>
+
+        {step === 'week' && (
+          <div className="flex items-center justify-between gap-3 border-t border-background-200 bg-background-100 px-4 py-3">
+            <span className="text-[11px] font-semibold text-foreground-500">
+              {CHANGE_MEWeekIds.size > 0 ? `${CHANGE_MEWeekIds.size} week${CHANGE_MEWeekIds.size === 1 ? '' : 's'} CHANGE_ME` : 'Pick one or more weeks above'}
+            </span>
+            <button
+              type="button"
+              onClick={() => void place()}
+              disabled={CHANGE_MEWeekIds.size === 0 || saving}
+              className="rounded-lg bg-primary-600 px-3 py-1.5 text-[12px] font-bold text-white hover:bg-primary-700 disabled:opacity-40"
+            >
+              {saving ? 'Placing…' : `Place in ${CHANGE_MEWeekIds.size || ''} week${CHANGE_MEWeekIds.size === 1 ? '' : 's'}`}
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

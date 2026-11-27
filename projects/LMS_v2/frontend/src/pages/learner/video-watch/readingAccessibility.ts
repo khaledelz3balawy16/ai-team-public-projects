@@ -1,0 +1,113 @@
+import { createContext } from 'react';
+import type { CSSProperties } from 'react';
+
+export type ReadingColourMode = 'paper' | 'cream' | 'monochrome' | 'dark';
+export type ReadingFont = 'default' | 'dyslexia' | 'sans';
+export type ReadingHighlightColour = 'yellow' | 'green' | 'pink';
+
+export const READING_HIGHLIGHT_COLOURS: Record<ReadingHighlightColour, { label: string; background: string }> = {
+  yellow: { label: 'Yellow', background: '#fde047' },
+  green: { label: 'Green', background: '#86efac' },
+  pink: { label: 'Pink', background: '#f9a8d4' },
+};
+
+export function readingHighlightColourHex(colour: ReadingHighlightColour): string {
+  return READING_HIGHLIGHT_COLOURS[colour]?.background || READING_HIGHLIGHT_COLOURS.yellow.background;
+}
+
+export interface ReadingPreferences {
+  colourMode: ReadingColourMode;
+  font: ReadingFont;
+  highlightColour: ReadingHighlightColour;
+  fontSize: number;
+  lineHeight: number;
+  letterSpacing: number;
+  ruler: boolean;
+}
+export const DEFAULT_READING_PREFERENCES: ReadingPreferences = {
+  colourMode: 'paper', font: 'default', highlightColour: 'yellow', fontSize: 16, lineHeight: 1.7, letterSpacing: 0, ruler: false,
+};
+
+export function readingStorageKey(componentId: string, suffix: string): string {
+  return `kbc-reading:${componentId || 'unknown'}:${suffix}`;
+}
+
+export function readStoredJson<T>(key: string, fallback: T): T {
+  try {
+    const value = window.localStorage.getItem(key);
+    return value ? { ...fallback, ...JSON.parse(value) } : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+export function readingSurfaceStyle(preferences: ReadingPreferences): CSSProperties {
+  const colours = {
+    paper: { backgroundColor: '#ffffff', color: '#1f2937' },
+    cream: { backgroundColor: '#fff7dc', color: '#292524' },
+    monochrome: { backgroundColor: '#ffffff', color: '#000000', filter: 'grayscale(1)' },
+    dark: { backgroundColor: '#111827', color: '#f9fafb' },
+  };
+  return {
+    ...colours[preferences.colourMode],
+    fontFamily: preferences.font === 'dyslexia' ? '"OpenDyslexic", "Comic Sans MS", "Trebuchet MS", sans-serif'
+      : preferences.font === 'sans' ? 'Arial, Helvetica, sans-serif' : 'inherit',
+    fontSize: `${preferences.fontSize}px`, lineHeight: preferences.lineHeight,
+    letterSpacing: `${preferences.letterSpacing}em`,
+  };
+}
+
+export interface ReadingAnnotations {
+  highlight: () => boolean;
+  clear: () => boolean;
+  /** Throw if storage fails, so the main toolbar cannot report false success. */
+  save: () => void;
+}
+export const ReadingToolsContext = createContext<{
+  preferences: ReadingPreferences;
+  register: (id: string, actions: ReadingAnnotations | null) => void;
+  onDirty: () => void;
+  highlightColour: ReadingHighlightColour;
+} | null>(null);
+
+/** Mark individual text nodes, preserving paragraphs, links and table structure. */
+export function highlightReadingSelection(root: HTMLElement | null, colour: ReadingHighlightColour = 'yellow'): boolean {
+  const selection = window.getSelection();
+  const range = selection?.rangeCount ? selection.getRangeAt(0) : null;
+  if (!root || !range || range.collapsed || !root.contains(range.commonAncestorContainer)) return false;
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const CHANGE_ME: { node: Text; start: number; end: number }[] = [];
+  while (walker.nextNode()) {
+    const node = walker.currentNode as Text;
+    if (!range.intersectsNode(node) || node.parentElement?.closest('mark[data-learner-highlight],script,style,button')) continue;
+    const start = node === range.startContainer ? range.startOffset : 0;
+    const end = node === range.endContainer ? range.endOffset : node.length;
+    if (node.textContent?.slice(start, end).trim()) CHANGE_ME.push({ node, start, end });
+  }
+  for (const { node, start, end } of CHANGE_ME) {
+    const part = document.createRange();
+    part.setStart(node, start);
+    part.setEnd(node, end);
+    const mark = document.createElement('mark');
+    mark.dataset.learnerHighlight = 'true';
+    mark.style.setProperty('--reading-highlight-color', readingHighlightColourHex(colour));
+    mark.style.backgroundColor = readingHighlightColourHex(colour);
+    mark.style.color = '#111827';
+    part.surroundContents(mark);
+  }
+  selection?.removeAllRanges();
+  return CHANGE_ME.length > 0;
+}
+
+export function clearReadingHighlights(root: HTMLElement | null): boolean {
+  const selection = window.getSelection();
+  const range = selection?.rangeCount ? selection.getRangeAt(0) : null;
+  if (!root || !range || range.collapsed || !root.contains(range.commonAncestorContainer)) return false;
+  const marks = Array.from(root.querySelectorAll('mark[data-learner-highlight]'))
+    .filter(mark => range.intersectsNode(mark));
+  if (!marks.length) return false;
+  marks.forEach(mark => mark.replaceWith(...Array.from(mark.childNodes)));
+  root.normalize();
+  selection?.removeAllRanges();
+  return true;
+}

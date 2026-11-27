@@ -1,0 +1,74 @@
+"""Standalone service configuration; no configuration is read from LMS_v2."""
+import os
+from pathlib import Path
+from urllib.parse import urlparse
+from django.core.exceptions import ImproperlyConfigured
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Preserve process environment precedence and load only this service's .env.
+for raw in (BASE_DIR / '.env').read_text(encoding='utf-8-sig').splitlines() if (BASE_DIR / '.env').exists() else []:
+    line = raw.strip()
+    if line and not line.startswith('#') and '=' in line:
+        key, value = line.split('=', 1)
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+database_url = os.environ.get('DATABASE_URL', '')
+if not database_url:
+    raise ImproperlyConfigured('DATABASE_URL must point to the Enrolment Corner database.')
+for alias in ('Database_url', 'DATABASEURL', 'ENROLMENT_DATABASE_URL'):
+    if os.environ.get(alias) and os.environ[alias] != database_url:
+        raise ImproperlyConfigured(f'{alias} must match DATABASE_URL in the standalone service.')
+    os.environ[alias] = database_url
+
+expected_host = os.environ.get('ENROLLMENT_DATABASE_HOST', '')
+if expected_host and urlparse(database_url).hostname != expected_host:
+    raise ImproperlyConfigured('DATABASE_URL does not match ENROLLMENT_DATABASE_HOST.')
+
+os.environ.setdefault('CURRICULUM_WARM', '0')
+os.environ.setdefault('ENGLAND_HOLIDAY_AUTO_SYNC', '0')
+os.environ.setdefault('CHAT_DEMO_BOOTSTRAP_ENABLED', '0')
+
+from config.legacy_settings import *  # noqa: F401,F403,E402
+
+INSTALLED_APPS = [*INSTALLED_APPS, 'programme_suitability']
+
+ROOT_URLCONF = 'enrollment_service.urls'
+WSGI_APPLICATION = 'enrollment_service.wsgi.application'
+ASGI_APPLICATION = 'enrollment_service.asgi.application'
+SESSION_COOKIE_NAME = 'enrollment_django_session'
+CSRF_COOKIE_NAME = 'enrollment_csrftoken'
+if DEBUG:
+    # Local Vite must stay trusted even when a deployment-origin env override is present.
+    CSRF_TRUSTED_ORIGINS = list(dict.fromkeys([
+        *CSRF_TRUSTED_ORIGINS, 'http://localhost:3000', 'http://127.0.0.1:3000',
+    ]))
+ENROLLMENT_SESSION_COOKIE_NAME = 'enrollment_session'
+LMS_URL = os.environ.get('LMS_URL', '').rstrip('/')
+ENROLLMENT_ONLY = True
+# The approved ULN expansion/reconciliation has been applied centrally.
+# New backends use canonical storage; explicit legacy mode is retained only for
+# a coordinated rollback (see sql/uln_created_users/README.md).
+ENROLMENT_ULN_STORAGE = os.environ.get('ENROLMENT_ULN_STORAGE', 'created_users')
+if ENROLMENT_ULN_STORAGE not in ('legacy', 'created_users'):
+    raise ImproperlyConfigured('ENROLMENT_ULN_STORAGE must be legacy or created_users.')
+# Programme Structure owns new programme/cohort placement. The old reader is
+# retained for a controlled rollback and historical compatibility tests.
+ENROLMENT_PROGRAMME_SOURCE = os.environ.get('ENROLMENT_PROGRAMME_SOURCE', 'catalogue')
+if ENROLMENT_PROGRAMME_SOURCE not in ('catalogue', 'legacy'):
+    raise ImproperlyConfigured('ENROLMENT_PROGRAMME_SOURCE must be catalogue or legacy.')
+STATIC_ROOT = BASE_DIR / 'staticfiles'
+
+# Background LMS projections are not processes owned by this service.
+READ_MODEL_OUTBOX_ENABLED = False
+READ_MODEL_DUAL_WRITE_ENABLED = False
+CURRICULUM_HOME_SHARED_READ_MODEL_ENABLED = False
+COACH_DASHBOARD_SHARED_READ_MODEL_ENABLED = False
+LEARNER_HOME_SHARED_READ_MODEL_ENABLED = False
+
+# Workplace screening remains a development preview; never activate live here.
+ELIGIBILITY_WORKPLACE_PREVIEW_ENABLED = os.environ.get('ELIGIBILITY_WORKPLACE_PREVIEW_ENABLED', 'false').lower() == 'true'
+PROGRAMME_STRUCTURE_SHADOW_ENABLED = os.environ.get('PROGRAMME_STRUCTURE_SHADOW_ENABLED', 'false').lower() == 'true'
+PROGRAMME_STRUCTURE_PUBLISHING_ENABLED = os.environ.get('PROGRAMME_STRUCTURE_PUBLISHING_ENABLED', 'false').lower() == 'true'
+PROGRAMME_STRUCTURE_AUTOMATIC_COHORT_ASSIGNMENT_ENABLED = os.environ.get('PROGRAMME_STRUCTURE_AUTOMATIC_COHORT_ASSIGNMENT_ENABLED', 'false').lower() == 'true'
+PROGRAMME_STRUCTURE_COHORT_LEARNER_ENABLED = os.environ.get('PROGRAMME_STRUCTURE_COHORT_LEARNER_ENABLED', 'false').lower() == 'true'

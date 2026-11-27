@@ -1,0 +1,80 @@
+import { lazy } from 'react';
+import { type RouteObject } from 'react-router-dom';
+import { AccessGate, Home, LearnerOnboardingGate, LearnerStart, WelcomeEntry } from './enrollmentGuards';
+
+const Login = lazy(() => import('@/pages/login/page'));
+const ForgotPassword = lazy(() => import('@/pages/forgot-password/page'));
+const SetPassword = lazy(() => import('@/pages/set-password/page'));
+const Application = lazy(() => import('@/pages/apprenticeship-application/page'));
+const Users = lazy(() => import('@/pages/users/page'));
+const Organisations = lazy(() => import('@/pages/users/organisations/page'));
+const Board = lazy(() => import('@/pages/users/BoardPage'));
+const Wizard = lazy(() => import('@/pages/users/wizard/WizardPage'));
+const WizardBuilder = lazy(() => import('@/pages/users/wizard-builder/page'));
+const ProgrammeStructure = lazy(() => import('@/pages/users/programme-structure/catalogPage'));
+const ProgrammeCataloguePreview = lazy(() => import('@/pages/users/programme-structure/catalogPreview'));
+const LegacyProgrammeStructure = lazy(() => import('@/pages/users/programme-structure/page'));
+const EligibilityBuilder = lazy(() => import('@/pages/users/eligibility-builder/page'));
+const ComplianceDocumentsBuilder = lazy(() => import('@/features/compliance-documents/page'));
+const EligibilityApplications = lazy(() => import('@/pages/users/eligibility-applications/page'));
+const FirstSessions = lazy(() => import('@/pages/users/first-sessions/page'));
+const CoachDirectory = lazy(() => import('@/pages/admin/coach-directory/page'));
+const CoachBooking = lazy(() => import('@/pages/coach-booking/page'));
+const Introduction = lazy(() => import('@/pages/lms-introduction/page'));
+const Welcome = lazy(() => import('@/pages/learner/welcome/page'));
+const Onboarding = lazy(() => import('@/pages/learner/onboarding/page'));
+const PendingOnboarding = lazy(() => import('@/pages/learner/pending/page'));
+const Reviews = lazy(() => import('@/pages/learner/onboarding/reviews/page'));
+const ReviewForm = lazy(() => import('@/pages/learner/onboarding/reviews/form'));
+const Documents = lazy(() => import('@/pages/learner/compliance/page'));
+const FirstSession = lazy(() => import('@/pages/learner/first-session/page'));
+const EmployerDocuments = lazy(() => import('@/pages/employer/EmployerDocumentsPage'));
+const ContinueInLms = lazy(() => import('@/pages/continue-lms/page'));
+const Profile = lazy(() => import('@/pages/profile/page'));
+
+export const enrollmentRoutes: RouteObject[] = [
+  { path: '/login', element: <Login /> },
+  { path: '/forgot-password', element: <ForgotPassword /> },
+  { path: '/set-password', element: <SetPassword mode="invitation" /> },
+  { path: '/reset-password', element: <SetPassword mode="reset" /> },
+  { path: '/apprenticeship_application', element: <Application /> },
+  { path: '/coach-booking/:slug', element: <CoachBooking /> },
+  { path: '/lms-introduction', element: <Introduction /> },
+  { element: <AccessGate />, children: [
+    ...['/', '/enrollment', '/choose-workspace'].map(path => ({ path, element: <Home /> })),
+    { path: '/users', element: <Users /> },
+    { path: '/users/organisations', element: <Organisations /> },
+    { path: '/users/wizard-builder', element: <WizardBuilder /> },
+    { path: '/users/programme-structure', element: <ProgrammeStructure /> },
+    ...(import.meta.env.DEV ? [{ path: '/users/programme-structure/preview', element: <ProgrammeCataloguePreview /> }] : []),
+    { path: '/users/programme-structure/legacy', element: <LegacyProgrammeStructure /> },
+    { path: '/users/eligibility-builder', element: <EligibilityBuilder /> },
+    { path: '/users/compliance-documents', element: <ComplianceDocumentsBuilder /> },
+    { path: '/users/eligibility-applications', element: <EligibilityApplications /> },
+    { path: '/users/eligibility-applications/:applicationId', element: <EligibilityApplications /> },
+    { path: '/users/first-sessions', element: <FirstSessions /> },
+    { path: '/users/coach-directory', element: <CoachDirectory workspaceRole="compliance" /> },
+    { path: '/users/:userId', element: <Board /> },
+    { path: '/users/:userId/reviews/:eventKey', element: <ReviewForm /> },
+    { path: '/users/:userId/wizard', element: <LearnerOnboardingGate><Wizard /></LearnerOnboardingGate> },
+    { path: '/users/:userId/wizard/:stepSlug', element: <LearnerOnboardingGate><Wizard /></LearnerOnboardingGate> },
+    { path: '/learner/welcome', element: <WelcomeEntry><Welcome /></WelcomeEntry> },
+    { path: '/learner/pending', element: <PendingOnboarding /> },
+    { path: '/learner/onboarding', element: <LearnerOnboardingGate><Onboarding /></LearnerOnboardingGate> },
+    { path: '/learner/onboarding/reviews', element: <LearnerOnboardingGate><Reviews /></LearnerOnboardingGate> },
+    { path: '/learner/onboarding/reviews/:eventKey', element: <LearnerOnboardingGate><ReviewForm /></LearnerOnboardingGate> },
+    { path: '/learner/onboarding/:stepSlug', element: <LearnerOnboardingGate><Onboarding /></LearnerOnboardingGate> },
+    { path: '/learner/compliance-documents', element: <Documents /> },
+    { path: '/learner/first-session', element: <FirstSession /> },
+    ...['/learner', '/learner/home', '/workspace/learner', '/workspace/learner/dashboard'].map(path => ({ path, element: <LearnerStart /> })),
+    { path: '/employers/:employerId/documents', element: <EmployerDocuments /> },
+    { path: '/lms', element: <ContinueInLms /> },
+    { path: '/profile', element: <Profile /> },
+    { path: '/learner/profile', element: <Profile /> },
+    { path: '/learner/account-settings', element: <Profile view="home" /> },
+    { path: '/learner/account-settings/about-you', element: <Profile view="about" /> },
+    { path: '/learner/account-settings/signature', element: <Profile view="signature" /> },
+    { path: '/learner/account-settings/security', element: <Profile view="security" /> },
+    { path: '*', element: <ContinueInLms /> },
+  ] },
+];

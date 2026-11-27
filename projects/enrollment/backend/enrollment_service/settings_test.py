@@ -1,0 +1,74 @@
+"""No dotenv loading, no PostgreSQL connection, no external credentials."""
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+SECRET_KEY = 'CHANGE_ME'
+DEBUG = True
+ALLOWED_HOSTS = ['testserver', 'localhost', '127.0.0.1']
+INSTALLED_APPS = [
+    'django.contrib.auth', 'django.contrib.contenttypes', 'django.contrib.sessions',
+    'django.contrib.messages', 'django.contrib.staticfiles',
+    'login', 'learner_api', 'enrolment_api', 'coach_api', 'curriculum_api',
+    'audit_api', 'manual_audit_api', 'engagement_api', 'quiz_api', 'chat',
+    'read_models', 'old_otjh', 'system_audit', 'progress_reviews_api', 'knowledge_base', 'mobile_comms',
+    'programme_suitability',
+]
+DATABASES = {name: {'ENGINE': 'django.db.backends.sqlite3', 'NAME': ':memory:'} for name in ('default', 'enrolment')}
+# Keep the isolated test database single-store.  Production routes enrolment
+# models to the Neon-backed ``enrolment`` alias, but the PCP integration
+# fixtures intentionally create those rows on ``default``.  Disabling that
+# production router here makes reads and writes deterministic and prevents a
+# test from crossing aliases while both aliases remain SQLite-only below.
+DATABASE_ROUTERS = []
+MIDDLEWARE = [
+    'django.contrib.sessions.middleware.SessionMiddleware',
+    'django.middleware.csrf.CsrfViewMiddleware',
+    'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'login.middleware.LoginSessionMiddleware',
+    'login.api_gate.ApiSessionGateMiddleware',
+]
+ROOT_URLCONF = 'enrollment_service.urls'
+USE_TZ = True
+TIME_ZONE = 'Europe/London'
+DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+TEMPLATES = [{'BACKEND': 'django.template.backends.django.DjangoTemplates', 'APP_DIRS': True}]
+STATIC_URL = '/static/'
+MEDIA_URL = '/media/'
+MEDIA_ROOT = BASE_DIR / 'media'
+SESSION_COOKIE_SECURE = False
+CSRF_COOKIE_SECURE = False
+CSRF_COOKIE_NAME = 'enrollment_csrftoken'
+CSRF_TRUSTED_ORIGINS = [
+    'http://localhost:3000',
+    'http://127.0.0.1:3000',
+    'http://localhost:3001',
+    'http://127.0.0.1:3001',
+    'http://localhost:3002',
+    'http://127.0.0.1:3002',
+]
+CACHES = {'default': {'BACKEND': 'django.core.cache.backends.locmem.LocMemCache'}}
+PASSWORD_HASHERS = ['django.contrib.auth.hashers.MD5PasswordHasher']
+AZURE_STORAGE_ACCOUNT = ''
+AZURE_STORAGE_KEY = ''
+AZURE_ENROLMENT_DOCS_CONTAINER = 'CHANGE_ME-enrolment-docs'
+AZURE_QUARANTINE_CONTAINER = 'CHANGE_ME-quarantine'
+AZURE_APPROVED_CONTAINER = 'CHANGE_ME-approved'
+AZURE_REJECTED_CONTAINER = 'CHANGE_ME-rejected'
+AZURE_SAS_TTL_MINUTES = 15
+AZURE_LEARNER_PHOTOS_CONTAINER = 'CHANGE_ME-photos'
+KNOWLEDGE_BASE_STORAGE = 'local'
+KNOWLEDGE_BASE_AZURE_CONTAINER = ''
+CHANNEL_LAYERS = {'default': {'BACKEND': 'channels.layers.InMemoryChannelLayer'}}
+READ_MODEL_OUTBOX_ENABLED = False
+READ_MODEL_DUAL_WRITE_ENABLED = False
+CURRICULUM_ALLOW_RUNTIME_SCHEMA_BOOTSTRAP = False
+ENROLLMENT_SESSION_COOKIE_NAME = 'enrollment_session'
+LMS_URL = 'https://lms.example.test'
+SUITABILITY_RPL_AI_ENABLED = False
+OPENAI_API_KEY = ''
+TEST_RUNNER = 'programme_suitability.test_runner.SuitabilityRunner'
+PROGRAMME_STRUCTURE_PUBLISHING_ENABLED = False
+PROGRAMME_STRUCTURE_SHADOW_ENABLED = False
+PROGRAMME_STRUCTURE_AUTOMATIC_COHORT_ASSIGNMENT_ENABLED = False
+PROGRAMME_STRUCTURE_COHORT_LEARNER_ENABLED = False
+PROGRAMME_STRUCTURE_SHADOW_REPORTER = None

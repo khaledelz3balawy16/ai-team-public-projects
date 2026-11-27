@@ -1,0 +1,49 @@
+time="2026-10-28T16:20:51+03:00" level=info msg="signed in as role=admin subject=staff; 1 API paths per iteration" source=console
+
+
+  █ THRESHOLDS 
+
+    checks
+    ✓ 'rate>0.95' rate=99.98%
+
+    http_req_duration{kind:api}
+    ✗ 'p(95)<5000' p(95)=5.26s
+
+    http_req_duration{kind:page}
+    ✓ 'p(95)<1000' p(95)=611.69ms
+
+    http_req_failed
+    ✓ 'rate<0.05' rate=0.01%
+
+
+  █ TOTAL RESULTS 
+
+    checks_total.......: 18249  139.376419/s
+    checks_succeeded...: 99.98% 18247 out of 18249
+    checks_failed......: 0.01%  2 out of 18249
+
+    ✓ page 200
+    ✗ api 200
+      ↳  99% — ✓ 8896 / ✗ 2
+
+    HTTP
+    http_req_duration..............: avg=1.06s    med=302.47ms p(90)=3.63s    p(95)=4.35s    p(99)=5.69s max=7.17s 
+      { expected_response:true }...: avg=1.06s    med=302.44ms p(90)=3.63s    p(95)=4.35s    p(99)=5.69s max=7.17s 
+      { kind:api }.................: avg=1.97s    med=1.47s    p(90)=4.38s    p(95)=5.26s    p(99)=5.91s max=7.17s 
+      { kind:page }................: avg=188.66ms med=85.39ms  p(90)=440.66ms p(95)=611.69ms p(99)=1.29s max=6.49s 
+    http_req_failed................: 0.01%  2 out of 18251
+    http_reqs......................: 18251  139.391694/s
+
+    EXECUTION
+    iteration_duration.............: avg=4.09s    med=3.74s    p(90)=6.53s    p(95)=7.15s    p(99)=8.21s max=13.39s
+    iterations.....................: 8688   66.354448/s
+    vus............................: 669    min=0          max=669 
+    vus_max........................: 1000   min=1000       max=1000
+
+    NETWORK
+    data_received..................: 96 MB  731 kB/s
+    data_sent......................: 2.4 MB 19 kB/s
+
+
+
+time="2026-10-28T16:23:02+03:00" level=error msg="thresholds on metrics 'http_req_duration{kind:api}' were crossed; at least one has abortOnFail enabled, stopping test prematurely"

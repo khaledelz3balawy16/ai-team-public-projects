@@ -1,0 +1,59 @@
+# Environment variables — NEVER commit these
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+db.sqlite3
+
+# Uploaded media files
+media/
+
+# Node
+node_modules/
+dist/
+dist-ssr/
+
+# Secrets / service account keys
+*.json
+!package.json
+!package-lock.json
+!tsconfig*.json
+!vite.config.*
+
+# VS Code
+.vscode/
+
+# Claude
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+*.log
+
+__pycache__/
+*.pyc
+
+# Portfolio: local runtime credentials, data, and caches
+.env
+.env.*
+!.env.example
+!.env.*.example
+!*.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.sqlite
+*.sqlite3
+*.db
+*.dump
+*.log
+node_modules/
+.venv/
+__pycache__/

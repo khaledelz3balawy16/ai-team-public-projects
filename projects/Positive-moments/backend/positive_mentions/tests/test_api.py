@@ -1,0 +1,592 @@
+import base64
+import json
+from datetime import datetime, timezone
+from urllib.parse import parse_qs, urlsplit
+
+from django.contrib.auth import get_user_model
+from django.db import connection
+from django.test import TransactionTestCase, override_settings
+from rest_framework.test import APIClient
+
+from positive_mentions.models import DoctorSession, PositiveClipAsset
+from positive_mentions.utils import encode_session_id
+
+
+@override_settings(
+    DASHBOARD_USERNAME="shared-dashboard",
+    DASHBOARD_PASSWORD='CHANGE_ME',
+)
+class PositiveMentionsApiTests(TransactionTestCase):
+    reset_sequences = True
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        DoctorSession._meta.managed = True
+        PositiveClipAsset._meta.managed = True
+        with connection.schema_editor() as editor:
+            editor.create_model(DoctorSession)
+            editor.create_model(PositiveClipAsset)
+
+    @classmethod
+    def tearDownClass(cls):
+        with connection.schema_editor() as editor:
+            editor.delete_model(PositiveClipAsset)
+            editor.delete_model(DoctorSession)
+        DoctorSession._meta.managed = False
+        PositiveClipAsset._meta.managed = False
+        super().tearDownClass()
+
+    def setUp(self):
+        self.client = APIClient()
+        response = self.client.post("/api/auth/login/", {
+            "username": "shared-dashboard",
+            "password": 'CHANGE_ME',
+        }, format="json")
+        self.token = response.data["token"]
+        self.client.credentials(HTTP_AUTHORIZATION=f"Token {self.token}")
+
+    def make_lecture(self, session_id, **overrides):
+        values = {
+            "date": datetime(2026, 7, 1, 10, tzinfo=timezone.utc),
+            "subject": "Communication Skills",
+            "trainer": "Dr Example",
+            "positive_clips": [],
+            "positive_clips_count": 0,
+            "clips_status": "completed",
+            "clips_analyzed_at": datetime(2026, 7, 26, 14, 50, tzinfo=timezone.utc),
+            "clips_analysis_completeness": "positive_clips_v5_final",
+            "has_positive_clips": False,
+            "recording_url": "",
+            "recording_link_status": "missing",
+        }
+        values.update(overrides)
+        return DoctorSession.objects.create(session_id=session_id, **values)
+
+    def make_asset(self, clip_key, session_id, **overrides):
+        now = datetime.now(timezone.utc)
+        values = {
+            "clip_index": 1,
+            "source_start": "00:00:01.000",
+            "source_end": "00:00:02.000",
+            "trim_start_seconds": "1.000",
+            "trim_end_seconds": "2.000",
+            "duration_seconds": "1.000",
+            "clip_filename": "positive-clip.mp4",
+            "clip_url": "https://tenant.sharepoint.com/clip.mp4",
+            "trim_status": "completed",
+            "created_at": now,
+            "updated_at": now,
+        }
+        values.update(overrides)
+        return PositiveClipAsset.objects.create(
+            clip_key=clip_key,
+            session_id=session_id,
+            **values,
+        )
+
+    def test_endpoints_require_authentication(self):
+        anonymous = APIClient()
+        self.assertEqual(anonymous.get("/api/positive-mentions/summary/").status_code, 401)
+        self.assertEqual(anonymous.get("/api/positive-mentions/lectures/").status_code, 401)
+
+    def test_environment_login_rejects_bad_credentials_and_logout_revokes_token(self):
+        bad = APIClient().post("/api/auth/login/", {
+            "username": "shared-dashboard",
+            "password": 'CHANGE_ME',
+        }, format="json")
+        self.assertEqual(bad.status_code, 400)
+
+        shared_user = get_user_model().objects.get(username="shared-dashboard")
+        self.assertFalse(shared_user.has_usable_password())
+        self.assertTrue(shared_user.email.endswith("@local.invalid"))
+
+        self.assertEqual(self.client.post("/api/auth/logout/").status_code, 204)
+        self.assertEqual(self.client.get("/api/auth/me/").status_code, 401)
+
+    def test_list_scope_uses_all_v5_rows_without_an_implicit_date_window(self):
+        self.make_lecture("included")
+        self.make_lecture(
+            "wrong-version", clips_analysis_completeness="positive_clips_v4_final"
+        )
+        self.make_lecture(
+            "too-early",
+            clips_analyzed_at=datetime(2026, 7, 26, 14, 47, tzinfo=timezone.utc),
+        )
+        self.make_lecture(
+            "at-exclusive-end",
+            clips_analyzed_at=datetime(2026, 7, 26, 14, 58, tzinfo=timezone.utc),
+        )
+        self.make_lecture(
+            "outside-old-test-window",
+            clips_analyzed_at=datetime(2026, 7, 26, 14, 47, tzinfo=timezone.utc),
+        )
+        self.make_lecture(
+            "outside-new-test-window",
+            clips_analyzed_at=datetime(2026, 7, 26, 14, 58, tzinfo=timezone.utc),
+        )
+        response = self.client.get("/api/positive-mentions/lectures/")
+        self.assertEqual(response.data["count"], 5)
+        self.assertEqual(
+            {row["session_id"] for row in response.data["results"]},
+            {
+                "included",
+                "too-early",
+                "at-exclusive-end",
+                "outside-old-test-window",
+                "outside-new-test-window",
+            },
+        )
+
+    def test_pagination_search_and_filters(self):
+        self.make_lecture("alpha", subject="Alpha Course", trainer="Trainer A")
+        self.make_lecture("beta", subject="Beta Course", trainer="Trainer B")
+        response = self.client.get(
+            "/api/positive-mentions/lectures/",
+            {"search": "trainer", "trainer": "Trainer A", "page_size": 1},
+        )
+        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(response.data["total_pages"], 1)
+        self.assertEqual(response.data["results"][0]["session_id"], "alpha")
+        self.assertNotIn("positive_clips", response.data["results"][0])
+
+    def test_clip_production_filters_use_ready_asset_exists_without_duplicates(self):
+        self.make_lecture(
+            "ready",
+            trainer="Trainer A",
+            positive_clips=[{"start": "00:00:01"}, {"start": "00:00:02"}],
+            positive_clips_count=2,
+        )
+        self.make_lecture(
+            "pending-a",
+            trainer="Trainer A",
+            positive_clips=[{"start": "00:00:01"}],
+            positive_clips_count=1,
+        )
+        self.make_lecture(
+            "pending-b",
+            trainer="Trainer B",
+            positive_clips=[{"start": "00:00:01"}],
+            positive_clips_count=1,
+        )
+        self.make_lecture("no-moments", trainer="Trainer A")
+
+        self.make_asset("ready-1", "ready", clip_index=0)
+        self.make_asset("ready-2", "ready", clip_index=1)
+        self.make_asset("failed", "pending-a", trim_status="failed")
+        self.make_asset("timed-out", "pending-a", trim_status="timed_out")
+        self.make_asset("rendered", "pending-a", trim_status="rendered")
+        self.make_asset("no-url", "pending-a", clip_url="")
+        self.make_asset("invalid-url", "pending-a", clip_url="not-a-web-url")
+
+        unfiltered = self.client.get("/api/positive-mentions/lectures/", {"page_size": 20})
+        self.assertEqual(unfiltered.data["count"], 4)
+        ready_row = next(row for row in unfiltered.data["results"] if row["session_id"] == "ready")
+        self.assertTrue(ready_row["has_ready_clips"])
+        self.assertEqual(ready_row["ready_clips_count"], 2)
+
+        ready = self.client.get(
+            "/api/positive-mentions/lectures/", {"clip_production_status": "ready"}
+        )
+        self.assertEqual(ready.data["count"], 1)
+        self.assertEqual([row["session_id"] for row in ready.data["results"]], ["ready"])
+
+        pending = self.client.get(
+            "/api/positive-mentions/lectures/", {"clip_production_status": "pending"}
+        )
+        self.assertEqual(pending.data["count"], 2)
+        self.assertEqual(
+            {row["session_id"] for row in pending.data["results"]},
+            {"pending-a", "pending-b"},
+        )
+
+        no_moments = self.client.get(
+            "/api/positive-mentions/lectures/",
+            {"clip_production_status": "no_positive_moments"},
+        )
+        self.assertEqual(no_moments.data["count"], 1)
+        self.assertEqual(no_moments.data["results"][0]["session_id"], "no-moments")
+
+        combined = self.client.get(
+            "/api/positive-mentions/lectures/",
+            {"clip_production_status": "pending", "trainer": "Trainer A"},
+        )
+        self.assertEqual(combined.data["count"], 1)
+        self.assertEqual(combined.data["results"][0]["session_id"], "pending-a")
+
+        summary = self.client.get(
+            "/api/positive-mentions/summary/", {"clip_production_status": "ready"}
+        )
+        self.assertEqual(summary.data["processed_lectures"], 1)
+        self.assertEqual(summary.data["total_positive_clips"], 2)
+
+    def test_summary_is_calculated_from_database(self):
+        self.make_lecture(
+            "with",
+            positive_clips=[{"start": "00:00:01"}, {"start": "00:00:02"}],
+            positive_clips_count=99,
+            has_positive_clips=False,
+            recording_url="https://tenant.sharepoint.com/video",
+        )
+        self.make_lecture(
+            "without", positive_clips=[], positive_clips_count=99, has_positive_clips=True
+        )
+        response = self.client.get("/api/positive-mentions/summary/")
+        self.assertEqual(response.data, {
+            "processed_lectures": 2,
+            "lectures_with_positive_clips": 1,
+            "lectures_without_positive_clips": 1,
+            "total_positive_clips": 2,
+            "recordings_available": 1,
+            "recordings_missing": 1,
+            # Clip PRODUCTION is counted separately from clip DETECTION. Two
+            # detected moments and no cut media is the normal state, and the
+            # Positive Moments page has to be able to say so.
+            "lectures_with_ready_clips": 0,
+            "ready_clips": 0,
+        })
+
+    def test_the_list_reports_the_categories_recorded_in_the_analysis(self):
+        """
+        Most common first, every category, counted from the stored JSON.
+
+        It reports what the analysis wrote. It must not reclassify anything,
+        and a lecture with no categories must come back with an empty list
+        rather than an invented one.
+        """
+        self.make_lecture(
+            "categorised",
+            positive_clips=[
+                {"start": "00:00:01", "category": "learning_experience"},
+                {"start": "00:00:02", "category": "learning_experience"},
+                {"start": "00:00:03", "category": "trainer"},
+            ],
+        )
+        self.make_lecture("uncategorised", positive_clips=[{"start": "00:00:01"}])
+
+        rows = {row["session_id"]: row
+                for row in self.client.get(
+                    "/api/positive-mentions/lectures/").data["results"]}
+
+        self.assertEqual(rows["categorised"]["top_categories"], [
+            {"category": "learning_experience", "count": 2},
+            {"category": "trainer", "count": 1},
+        ])
+        self.assertEqual(rows["categorised"]["moment_count"], 3)
+        self.assertEqual(rows["uncategorised"]["top_categories"], [])
+        self.assertEqual(rows["uncategorised"]["moment_count"], 1)
+
+    def test_the_list_counts_moments_exactly_as_the_full_record_does(self):
+        """
+        The list reads a slimmed copy of `positive_clips` (category only). For
+        every shape the column can hold, its moment count and categories must
+        equal what the detail page derives from the full value.
+        """
+        shapes = {
+            "array": [{"start": "00:00:02", "category": " trainer ", "dialogue": ["x"]},
+                      "not-a-moment", {"start": "00:00:01"}, {"category": ""}],
+            "wrapped-clips": {"clips": [{"category": "content"}, {"category": "content"}]},
+            "wrapped-positive": {"positive_clips": [{"category": "learning_experience"}]},
+            "clips-wins": {"clips": [{"category": "content"}],
+                           "positive_clips": [{"category": "trainer"}, {}]},
+            "clips-null": {"clips": None, "positive_clips": [{"category": "trainer"}]},
+            "not-a-list": {"clips": "broken"},
+            "scalar": "text",
+            "empty": [],
+        }
+        for key, value in shapes.items():
+            self.make_lecture(key, positive_clips=value)
+        self.make_lecture("null", positive_clips=None)
+
+        listed = {row["session_id"]: row for row in self.client.get(
+            "/api/positive-mentions/lectures/", {"page_size": 100}).data["results"]}
+        for key in [*shapes, "null"]:
+            with self.subTest(shape=key):
+                detail = self.client.get(
+                    f"/api/positive-mentions/lectures/{encode_session_id(key)}/").data
+                self.assertEqual(listed[key]["moment_count"], detail["moment_count"])
+                self.assertEqual(listed[key]["top_categories"], detail["top_categories"])
+                self.assertEqual(detail["moment_count"], len(detail["clips"]))
+        self.assertEqual(listed["array"]["moment_count"], 3)
+        self.assertEqual(listed["clips-wins"]["moment_count"], 1)
+
+    def test_a_category_filter_keeps_only_lectures_with_that_kind_of_moment(self):
+        self.make_lecture("mixed", positive_clips=[
+            {"start": "00:00:01", "category": "content"},
+            {"start": "00:00:02", "category": "Learning_Experience "},
+            {"start": "00:00:03", "category": "content"},
+            {"start": "00:00:04", "category": "content"},
+            {"start": "00:00:05", "category": "trainer"},
+        ])
+        self.make_lecture("experience-only", positive_clips=[
+            {"start": "00:00:01", "category": "learning_experience"},
+            {"start": "00:00:02", "category": "learning_experience"},
+        ])
+        self.make_lecture("content-only", positive_clips=[{"start": "00:00:01", "category": "content"}])
+        self.make_lecture("none", positive_clips=[])
+        self.make_lecture("not-a-list", positive_clips={"clips": "broken"})
+
+        listed = self.client.get("/api/positive-mentions/lectures/",
+                                 {"category": "learning_experience"}).data
+        self.assertEqual({row["session_id"] for row in listed["results"]},
+                         {"mixed", "experience-only"})
+        # The fourth category of a row is still shown, so the filter's chip is there.
+        mixed = next(row for row in listed["results"] if row["session_id"] == "mixed")
+        self.assertIn({"category": "trainer", "count": 1}, mixed["top_categories"])
+
+        summary = self.client.get("/api/positive-mentions/summary/",
+                                  {"category": "learning_experience"}).data
+        self.assertEqual(summary["processed_lectures"], 2)
+        self.assertEqual(summary["lectures_with_positive_clips"], 2)
+        self.assertEqual(summary["total_positive_clips"], 3)   # that category only
+
+        everything = self.client.get("/api/positive-mentions/summary/").data
+        self.assertEqual(everything["total_positive_clips"], 8)
+
+    def test_summary_uses_the_same_filters_as_the_unpaginated_list_scope(self):
+        self.make_lecture(
+            "alpha-with",
+            trainer="Trainer A",
+            positive_clips=[{"start": "00:00:01"}],
+        )
+        self.make_lecture("alpha-without", trainer="Trainer A", positive_clips=[])
+        self.make_lecture(
+            "beta-with",
+            trainer="Trainer B",
+            positive_clips=[{"start": "00:00:01"}, {"start": "00:00:02"}],
+        )
+        response = self.client.get(
+            "/api/positive-mentions/summary/", {"trainer": "Trainer A", "page_size": 1}
+        )
+        self.assertEqual(response.data["processed_lectures"], 2)
+        self.assertEqual(response.data["lectures_with_positive_clips"], 1)
+        self.assertEqual(response.data["total_positive_clips"], 1)
+
+    def test_detail_adds_ready_asset_without_changing_full_recording_watch(self):
+        session_id = "asset-mapping"
+        recording_url = "https://tenant.sharepoint.com/full-lecture.mp4?source=app"
+        lecture = self.make_lecture(
+            session_id,
+            positive_clips=[
+                {
+                    "start": "00:02:00.000",
+                    "end": "00:02:20.000",
+                    "start_cue": 20,
+                    "end_cue": 21,
+                    "positive_quote": "Later ready moment",
+                },
+                {
+                    "start": "00:01:00.000",
+                    "end": "00:01:10.000",
+                    "start_cue": 10,
+                    "end_cue": 11,
+                    "positive_quote": "Earlier pending moment",
+                },
+            ],
+            positive_clips_count=2,
+            recording_url=recording_url,
+        )
+        clip_url = "https://tenant.sharepoint.com/trimmed-ready.mp4"
+        self.make_asset(
+            f"{session_id}:20:21",
+            session_id,
+            clip_index=1,
+            source_start="00:02:00.000",
+            source_end="00:02:20.000",
+            duration_seconds="24.500",
+            clip_filename="ready-later.mp4",
+            clip_url=clip_url,
+        )
+        self.make_asset(
+            f"{session_id}:10:11:failed",
+            session_id,
+            clip_index=2,
+            source_start="00:01:00.000",
+            source_end="00:01:10.000",
+            trim_status="failed",
+        )
+        self.make_asset(
+            f"{session_id}:10:11:temporary",
+            session_id,
+            clip_index=2,
+            source_start="00:01:00.000",
+            source_end="00:01:10.000",
+            clip_url="https://creatomate.com/temporary-render.mp4",
+        )
+
+        session_key = encode_session_id(lecture.session_id)
+        detail = self.client.get(f"/api/positive-mentions/lectures/{session_key}/")
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(detail.data["recording_url"], recording_url)
+        self.assertEqual(detail.data["ready_clips_count"], 1)
+        self.assertEqual(detail.data["clips"][0]["positive_quote"], "Earlier pending moment")
+        self.assertIsNone(detail.data["clips"][0]["clip_asset"])
+        ready = detail.data["clips"][1]["clip_asset"]
+        self.assertEqual(ready["url"], clip_url)
+        self.assertNotEqual(ready["url"], detail.data["recording_url"])
+        self.assertEqual(ready["filename"], "ready-later.mp4")
+        self.assertEqual(ready["duration_seconds"], 24.5)
+
+        watch = self.client.get(
+            f"/api/positive-mentions/lectures/{session_key}/clips/1/watch/"
+        )
+        self.assertEqual(watch.status_code, 200)
+        self.assertIn("nav=", watch.data["url"])
+        self.assertIn("source=app", watch.data["url"])
+        self.assertNotEqual(watch.data["url"], clip_url)
+
+    def test_details_normalize_json_and_watch_endpoint_uses_database_values(self):
+        lecture = self.make_lecture(
+            "special/id?yes",
+            positive_clips=[
+                {"start": "00:02:00.000", "positive_quote": "Second"},
+                {"start": "00:01:00.500", "positive_quote": "First"},
+            ],
+            positive_clips_count=2,
+            has_positive_clips=True,
+            recording_url="https://tenant.sharepoint.com/video?source=app",
+        )
+        key = encode_session_id(lecture.session_id)
+        detail = self.client.get(f"/api/positive-mentions/lectures/{key}/")
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(detail.data["clips"][0]["positive_quote"], "First")
+        watch = self.client.get(
+            f"/api/positive-mentions/lectures/{key}/clips/0/watch/"
+        )
+        self.assertEqual(watch.status_code, 200)
+        self.assertIn("nav=", watch.data["url"])
+        self.assertIn("source=app", watch.data["url"])
+        nav_value = parse_qs(urlsplit(watch.data["url"]).query)["nav"][0]
+        nav = json.loads(base64.urlsafe_b64decode(
+            nav_value + "=" * (-len(nav_value) % 4)
+        ))
+        self.assertEqual(nav["playbackOptions"]["startTimeInSeconds"], 0.5)
+
+    def test_watch_endpoint_never_seeks_before_recording_start(self):
+        lecture = self.make_lecture(
+            "early-moment",
+            positive_clips=[{"start": "00:00:30.000", "positive_quote": "Early"}],
+            recording_url="https://tenant.sharepoint.com/video",
+        )
+        key = encode_session_id(lecture.session_id)
+        watch = self.client.get(
+            f"/api/positive-mentions/lectures/{key}/clips/0/watch/"
+        )
+        nav_value = parse_qs(urlsplit(watch.data["url"]).query)["nav"][0]
+        nav = json.loads(base64.urlsafe_b64decode(
+            nav_value + "=" * (-len(nav_value) % 4)
+        ))
+        self.assertEqual(nav["playbackOptions"]["startTimeInSeconds"], 0)
+
+    def test_missing_recording_and_invalid_indices_are_controlled(self):
+        missing = self.make_lecture(
+            "missing", positive_clips=[{"start": "00:00:10.000"}]
+        )
+        key = encode_session_id(missing.session_id)
+        response = self.client.get(
+            f"/api/positive-mentions/lectures/{key}/clips/0/watch/"
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.data["code"], "recording_not_available")
+
+        recorded = self.make_lecture(
+            "recorded",
+            recording_url="https://tenant.sharepoint.com/video",
+            positive_clips=[{"start": "00:00:10.000"}],
+        )
+        recorded_key = encode_session_id(recorded.session_id)
+        invalid_clip = self.client.get(
+            f"/api/positive-mentions/lectures/{recorded_key}/clips/9/watch/"
+        )
+        self.assertEqual(invalid_clip.status_code, 404)
+        invalid_lecture = self.client.get(
+            f"/api/positive-mentions/lectures/{encode_session_id('unknown')}/"
+        )
+        self.assertEqual(invalid_lecture.status_code, 404)
+
+    # --- "Clip" on a positive moment -> n8n clip-on-demand --------------------
+
+    def clip_lecture(self):
+        self.make_lecture("clip-demand", positive_clips=[
+            {"start": "00:05:50.000", "end": "00:06:00.000", "start_cue": 350, "end_cue": 360,
+             "positive_quote": "Clip A"},
+            {"start": "00:09:00.000", "end": "00:09:20.000", "start_cue": 540, "end_cue": 547,
+             "positive_quote": "Clip B"},
+        ])
+        return encode_session_id("clip-demand")
+
+    def request_clip(self, key, start_cue, end_cue, *, reply_status=200, error=None):
+        from unittest import mock
+        from positive_mentions import views
+
+        sent = []
+
+        def urlopen(req, timeout):
+            sent.append((req.full_url, req.get_method(), req.headers, json.loads(req.data)))
+            if error:
+                raise error
+            response = mock.MagicMock(status=reply_status)
+            response.__enter__.return_value = response
+            return response
+
+        with mock.patch.object(views.urllib.request, "urlopen", side_effect=urlopen):
+            response = self.client.post(
+                f"/api/positive-mentions/lectures/{key}/clip-requests/",
+                {"start_cue": start_cue, "end_cue": end_cue}, format="json")
+        return response, sent
+
+    @override_settings(CLIP_ON_DEMAND_WEBHOOK_URL="https://n8n.example/webhook/qa-clip-on-demand")
+    def test_clip_a_sends_only_its_own_identity_to_n8n(self):
+        response, sent = self.request_clip(self.clip_lecture(), 350, 360)
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.data, {"status": "requested"})
+        ((url, method, headers, body),) = sent
+        self.assertEqual((url, method), ("https://n8n.example/webhook/qa-clip-on-demand", "POST"))
+        self.assertEqual(headers["Content-type"], "application/json")
+        self.assertEqual(body, {"session_id": "clip-demand", "start_cue": 350, "end_cue": 360})
+
+    def test_clip_b_sends_clip_b_cues_not_clip_a(self):
+        _, sent = self.request_clip(self.clip_lecture(), 540, 547)
+        self.assertEqual(sent[0][3], {"session_id": "clip-demand", "start_cue": 540, "end_cue": 547})
+
+    def test_a_cue_pair_that_is_not_in_this_lecture_is_refused_without_calling_n8n(self):
+        key = self.clip_lecture()
+        for start_cue, end_cue in ((350, 547), (999, 1000), ("350", "360"), (True, 360), (None, 360)):
+            response, sent = self.request_clip(key, start_cue, end_cue)
+            self.assertIn(response.status_code, (400, 404), (start_cue, end_cue))
+            self.assertEqual(sent, [])
+
+    def test_an_n8n_failure_is_a_clear_error(self):
+        import urllib.error
+        key = self.clip_lecture()
+        refused, _ = self.request_clip(key, 350, 360, error=urllib.error.HTTPError(
+            "https://n8n.example", 500, "err", {}, None))
+        self.assertEqual((refused.status_code, refused.data["code"]), (502, "clip_request_failed"))
+        unreachable, _ = self.request_clip(key, 350, 360, error=urllib.error.URLError("down"))
+        self.assertEqual(unreachable.status_code, 502)
+
+    def test_an_already_produced_clip_is_not_requested_again(self):
+        key = self.clip_lecture()
+        self.make_asset("clip-demand:350:360", "clip-demand", clip_index=1,
+                        source_start="00:05:50.000", source_end="00:06:00.000",
+                        clip_url="https://tenant.sharepoint.com/clip-a.mp4")
+        response, sent = self.request_clip(key, 350, 360)
+        self.assertEqual((response.status_code, response.data["code"]), (409, "clip_already_produced"))
+        self.assertEqual(response.data["clip_asset"]["url"], "https://tenant.sharepoint.com/clip-a.mp4")
+        self.assertEqual(sent, [])
+
+    def test_requesting_a_clip_needs_a_signed_in_user(self):
+        response = APIClient().post(
+            f"/api/positive-mentions/lectures/{self.clip_lecture()}/clip-requests/",
+            {"start_cue": 350, "end_cue": 360}, format="json")
+        self.assertEqual(response.status_code, 401)
+
+    def test_any_2xx_from_n8n_counts_as_accepted(self):
+        # The webhook answers "onReceived" with its default 200, not 202.
+        key = self.clip_lecture()
+        for reply in (200, 201, 204, 299):
+            response, sent = self.request_clip(key, 350, 360, reply_status=reply)
+            self.assertEqual((response.status_code, len(sent)), (202, 1), reply)
+        for reply in (199, 304):
+            response, _ = self.request_clip(key, 350, 360, reply_status=reply)
+            self.assertEqual(response.status_code, 502, reply)

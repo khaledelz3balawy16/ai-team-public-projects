@@ -1,0 +1,62 @@
+import Swal from 'sweetalert2';
+
+const applyKbcSwalBackdrop = () => {
+  const container = document.querySelector<HTMLElement>('.swal2-container');
+  if (!container) return;
+
+  container.style.setProperty('backdrop-filter', 'blur(8px)', 'important');
+  container.style.setProperty('-webkit-backdrop-filter', 'blur(8px)', 'important');
+  container.style.setProperty('background', 'rgba(15, 23, 42, 0.5)', 'important');
+};
+
+export const kbcSwal = Swal.mixin({
+  customClass: {
+    container: 'kbc-swal-container',
+    popup: 'kbc-swal-popup',
+    title: 'kbc-swal-title',
+    htmlContainer: 'kbc-swal-html',
+    confirmButton: 'kbc-swal-confirm',
+    denyButton: 'kbc-swal-deny',
+    cancelButton: 'kbc-swal-cancel',
+  },
+  buttonsStyling: false,
+  backdrop: 'rgba(15, 23, 42, 0.5)',
+  didOpen: applyKbcSwalBackdrop,
+});
+
+export const kbcSuccessSwal = Swal.mixin({
+  customClass: {
+    container: 'kbc-swal-container',
+    popup: 'kbc-swal-popup kbc-swal-popup-success',
+    title: 'kbc-swal-title kbc-swal-title-success',
+    htmlContainer: 'kbc-swal-html kbc-swal-html-success',
+    confirmButton: 'kbc-swal-confirm kbc-swal-confirm-success',
+  },
+  buttonsStyling: false,
+  backdrop: 'rgba(15, 23, 42, 0.5)',
+  didOpen: applyKbcSwalBackdrop,
+});
+
+export async function confirmDeleteEvent(title: string) {
+  const result = await kbcSwal.fire({
+    title: 'Delete Event?',
+    html: `The event <strong>${title}</strong> will be removed from the calendar and cards.`,
+    icon: 'warning',
+    showCancelButton: true,
+    confirmButtonText: 'Delete',
+    cancelButtonText: 'Keep Event',
+    reverseButtons: true,
+    focusCancel: true,
+  });
+
+  return result.isConfirmed;
+}
+
+export async function showCalendarExportInfo() {
+  await kbcSuccessSwal.fire({
+    title: 'Calendar File Downloaded',
+    html: 'An <strong>.ics</strong> file was downloaded. You can open it in Outlook, Apple Calendar, or import it into Google Calendar to add this event to your personal calendar.',
+    icon: 'success',
+    confirmButtonText: 'OK',
+  });
+}

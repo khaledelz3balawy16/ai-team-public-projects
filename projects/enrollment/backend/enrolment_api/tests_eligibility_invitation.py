@@ -1,0 +1,272 @@
+"""An eligible public application stages an invitation, without an account.
+
+SimpleTestCase throughout: the learner table, the login account and the mail
+transport are all stubbed, so no query reaches a database and no email is sent.
+"""
+import json
+from contextlib import nullcontext
+from datetime import date
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+from django.db import DatabaseError, IntegrityError
+from django.test import SimpleTestCase
+
+from enrolment_api import eligibility_form as ef
+from enrolment_api import eligibility_invitation as ei
+from enrolment_api import eligibility_layout as el
+from enrolment_api.tests_eligibility_form import FakeCursor, URL, application, stub_lookup
+from learner_api import profile_email
+from learner_api.models import EnrolmentUser
+from login import services
+from login.models import SUBJECT_LEARNER
+
+ROW = {
+    "first_name": "Sam",
+    "surname": "Example",
+    "work_email": "sam@employer.example",
+    "phone_number": None,
+    "full_address": "1 Example Street",
+    "postcode": "EX1 2MP",
+    "date_of_birth": date(1995, 4, 3),
+    "employer_name": "Example Ltd",
+    "employer_address": "2 Business Park",
+    "programme": "Associate Project Manager Level 4",
+}
+
+
+def started(test, target, attribute, **kwargs):
+    p = patch.object(target, attribute, **kwargs)
+    test.addCleanup(p.stop)
+    return p.start()
+
+
+class SubmitInvitesTests(SimpleTestCase):
+    """Which submissions the form sends on to be invited."""
+
+    def setUp(self):
+        from django.test import RequestFactory
+        started(self, ef.transaction, 'atomic', side_effect=lambda **_: nullcontext())
+
+        self.factory = RequestFactory()
+        self.lookup = stub_lookup(self)
+        started(self, ef, "_published_layout", return_value=(None, None))
+        self.invite = started(self, ei, "invite_applicant", return_value=ei.INVITED)
+        p = patch('enrolment_api.eligibility_link.refresh_response', side_effect=lambda _id, response: response)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def post(self, body):
+        request = self.factory.post(
+            URL, data=json.dumps(body), content_type="application/json", HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+        )
+        cursor = FakeCursor()
+        with patch.object(ef, "connections", {ef.CONN: SimpleNamespace(cursor=lambda: cursor)}):
+            response = ef.submit_application(request)
+        return response, json.loads(response.content), cursor
+
+    def test_an_eligible_applicant_is_saved_then_invited(self):
+        response, data, cursor = self.post(application())
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(data, {"submitted": True, "eligible": True, "reasons": [], "outcome": "invited"})
+        self.assertEqual(len(cursor.executed), 3)  # programme lookup, application, receipt
+        self.invite.assert_called_once()
+        row = self.invite.call_args.args[0]
+        self.assertEqual((row["work_email"], row["eligible"]), ("sam@employer.example", True))
+
+    def test_an_eligible_applicant_with_structured_address_and_no_postcode_is_still_invited(self):
+        response, data, _cursor = self.post(application(fullAddress="", postcode=""))
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(data["outcome"], "invited")
+        row = self.invite.call_args.args[0]
+        self.assertEqual(row["full_address"], "1 Example Street, Exampletown")
+        self.assertIsNone(row["postcode"])
+
+    def test_the_outcome_of_the_invitation_is_reported(self):
+        for outcome in (ei.INVITE_PENDING, ei.EXISTING_ACCOUNT, ei.RETRY_LATER):
+            self.invite.return_value = outcome
+            self.assertEqual(self.post(application())[1]["outcome"], outcome)
+
+    def test_an_applicant_ruled_out_by_postcode_is_not_invited(self):
+        _response, data, cursor = self.post(application(postcode="EH1 1YZ"))
+        self.assertEqual(data["outcome"], "notEligible")
+        self.assertEqual(data["reasons"], ["Your postcode (EH1 1YZ) is outside England (Scotland)."])
+        self.assertEqual(len(cursor.executed), 3)
+        self.invite.assert_not_called()
+
+    def test_postcodes_that_could_not_be_checked_invite_nobody(self):
+        from enrolment_api import postcode_lookup
+
+        def down(_postcode):
+            if _postcode == "EX3 4MP":
+                return {"postcode": "EX3 4MP", "country": "England", "region": "", "district": ""}
+            raise postcode_lookup.PostcodeLookupUnavailable("timed out")
+
+        self.lookup.side_effect = down
+        with self.assertLogs("enrolment_api.eligibility_form", level="WARNING"):
+            response, data, cursor = self.post(application())
+        self.assertEqual(response.status_code, 503)
+        self.assertNotIn("outcome", data)
+        self.assertEqual(cursor.executed, [])
+        self.invite.assert_not_called()
+
+    def test_employment_validation_failures_never_save_or_invite(self):
+        from enrolment_api import postcode_lookup
+
+        for changes in (
+            {"majorityHoursInEngland": None},
+            {"majorityHoursInEngland": "true"},
+            {"employerPostcode": "ss", "eligible": True},
+            {"employerPostcode": "ZZ9 9ZZ"},
+            {"employerPostcode": ""},
+        ):
+            with self.subTest(changes=changes):
+                response, data, cursor = self.post(application(**changes))
+                self.assertEqual(response.status_code, 400)
+                self.assertNotIn("outcome", data)
+                self.assertNotIn("eligible", data)
+                self.assertEqual(cursor.executed, [])
+                self.invite.assert_not_called()
+
+        self.lookup.side_effect = postcode_lookup.PostcodeLookupUnavailable("timeout")
+        with self.assertLogs("enrolment_api.eligibility_form", level="WARNING"):
+            response, data, cursor = self.post(application())
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(cursor.executed, [])
+        self.invite.assert_not_called()
+
+    def test_no_hours_declaration_is_not_eligible_and_never_invited(self):
+        response, data, cursor = self.post(application(majorityHoursInEngland=False, eligible=True, outcome="invited"))
+        self.assertEqual(response.status_code, 201)
+        self.assertIs(data["eligible"], False)
+        self.assertEqual(data["outcome"], "notEligible")
+        self.assertIn("50%", data["reasons"][0])
+        self.assertEqual(len(cursor.executed), 3)
+        self.invite.assert_not_called()
+
+    def test_invalid_answers_invite_nobody(self):
+        response, _data, _cursor = self.post(application(surname=""))
+        self.assertEqual(response.status_code, 400)
+        self.invite.assert_not_called()
+
+
+class LearnerFieldsTests(SimpleTestCase):
+    def test_an_application_becomes_an_apprenticeship_learner(self):
+        fields = ei.learner_fields(ROW)
+        self.assertEqual(fields["learner_type"], "apprenticeship")
+        self.assertEqual(fields["username"], "Sam Example")
+        self.assertEqual(fields["email"], "sam@employer.example")
+        self.assertEqual(fields["date_of_birth"], "1995-04-03")
+        self.assertEqual((fields["address"], fields["current_postcode"]), ("1 Example Street", "EX1 2MP"))
+        self.assertEqual((fields["employer"], fields["employer_address"]), ("Example Ltd", "2 Business Park"))
+        self.assertEqual(fields["programme_status"], "Fresh user")
+        self.assertIs(fields["invite_to_platform"], True)
+        self.assertTrue(fields["enrolled_time_and_user"].endswith(" by Eligibility form"))
+
+    def test_eligibility_programme_is_never_an_enrolment_target_or_placement(self):
+        fields = ei.learner_fields(ROW)
+        for placement in ("target_programme", "programme", "cohort", "group", "start_date", "end_date"):
+            self.assertNotIn(placement, fields)
+
+    def test_a_date_of_birth_the_form_did_not_ask_is_left_empty(self):
+        self.assertIsNone(ei.learner_fields({**ROW, "date_of_birth": None})["date_of_birth"])
+
+    def test_missing_personal_address_and_postcode_are_left_empty(self):
+        fields = ei.learner_fields({**ROW, "full_address": None, "postcode": None})
+        self.assertIsNone(fields["address"])
+        self.assertIsNone(fields["current_postcode"])
+
+
+class InviteApplicantTests(SimpleTestCase):
+    def setUp(self):
+        self.has_account = started(self, ei, "has_account", return_value=False)
+        started(self, ei, "transaction", new=SimpleNamespace(
+            atomic=lambda using=None: nullcontext(),
+            on_commit=lambda callback, **_: callback(),
+        ))
+        from enrolment_api import eligibility_link
+        self.add_link = started(self, eligibility_link, "add_link")
+        self.dispatch = started(self, eligibility_link, "dispatch", return_value=ei.INVITED)
+
+    def test_stages_an_invitation_without_creating_an_account(self):
+        self.assertEqual(ei.invite_applicant(ROW, application_id=42,
+                         ip="203.0.113.5", user_agent="UA"), ei.INVITED)
+        self.add_link.assert_called_once_with(42, None)
+        self.dispatch.assert_called_once_with(42, ip="203.0.113.5", user_agent="UA")
+
+    def test_an_address_with_an_account_is_neither_created_nor_invited(self):
+        self.has_account.return_value = True
+        self.assertEqual(ei.invite_applicant(ROW), ei.EXISTING_ACCOUNT)
+        self.add_link.assert_not_called()
+        self.dispatch.assert_not_called()
+
+    def test_the_same_address_submitted_twice_at_once_is_an_existing_account(self):
+        self.add_link.side_effect = IntegrityError("duplicate key")
+        self.assertEqual(ei.invite_applicant(ROW, application_id=42), ei.EXISTING_ACCOUNT)
+        self.dispatch.assert_not_called()
+
+    def test_a_link_that_could_not_be_created_asks_for_a_retry(self):
+        self.add_link.side_effect = DatabaseError("boom")
+        with self.assertLogs("enrolment_api.eligibility_invitation", level="ERROR"):
+            self.assertEqual(ei.invite_applicant(ROW, application_id=42), ei.RETRY_LATER)
+        self.dispatch.assert_not_called()
+
+    def test_an_email_that_could_not_be_sent_is_pending_not_invited(self):
+        self.dispatch.return_value = ei.INVITE_PENDING
+        self.assertEqual(ei.invite_applicant(ROW, application_id=42), ei.INVITE_PENDING)
+
+
+class HasAccountTests(SimpleTestCase):
+    def setUp(self):
+        self.in_use = started(self, profile_email, "profile_email_in_use", new=MagicMock(return_value=False))
+
+    def test_a_login_account_counts_whatever_the_case_of_the_address(self):
+        self.in_use.return_value = True
+        self.assertTrue(ei.has_account("  Sam@Employer.Example "))
+        self.in_use.assert_called_once_with("  Sam@Employer.Example ")
+
+    def test_a_learner_record_without_an_account_counts(self):
+        self.in_use.return_value = True
+        self.assertTrue(ei.has_account("sam@employer.example"))
+        self.in_use.assert_called_once_with("sam@employer.example")
+
+    def test_a_new_address_has_no_account(self):
+        self.assertFalse(ei.has_account("new@employer.example"))
+
+
+class InviteEligibleApplicantTests(SimpleTestCase):
+    """login.services.invite_eligible_applicant: the one invitation with no inviter."""
+
+    def setUp(self):
+        self.learner = SimpleNamespace(id=812)
+        self.account = SimpleNamespace(has_password=False, subject_type=SUBJECT_LEARNER)
+        self.ensure = started(self, services, "ensure_account", return_value=(self.account, True))
+        self.send = started(self, services, "send_invitation", return_value=(object(), True, None))
+        self.template = started(self, el, "activation_email_for_application", return_value="<p>{{greeting}} Welcome.</p>")
+
+    def test_a_new_learner_account_is_sent_the_invitation(self):
+        self.assertEqual(services.invite_eligible_applicant(self.learner, ip="ip", user_agent="ua"), (True, None))
+        self.ensure.assert_called_once_with(SUBJECT_LEARNER, 812, subject=self.learner)
+        self.send.assert_called_once_with(self.account, invited_by="eligibility form", ip="ip", user_agent="ua",
+                                          intro_html="<p>{{greeting}} Welcome.</p>")
+
+    def test_no_invitation_is_created_without_a_published_email(self):
+        self.template.return_value = None
+        self.assertEqual(services.invite_eligible_applicant(self.learner), (False, "activation-email-template-unavailable"))
+        self.send.assert_not_called()
+
+    def test_an_existing_account_is_never_sent_a_set_password_link(self):
+        self.ensure.return_value = (self.account, False)
+        self.assertEqual(services.invite_eligible_applicant(self.learner), (False, "existing-account"))
+        self.send.assert_not_called()
+
+    def test_an_account_with_a_password_or_another_role_is_never_invited(self):
+        for account in (SimpleNamespace(has_password=True, subject_type=SUBJECT_LEARNER),
+                        SimpleNamespace(has_password=False, subject_type="staff")):
+            self.ensure.return_value = (account, True)
+            self.assertEqual(services.invite_eligible_applicant(self.learner), (False, "existing-account"))
+        self.send.assert_not_called()
+
+    def test_a_mail_failure_is_returned_not_raised(self):
+        self.send.return_value = (object(), False, "graph-error: 503")
+        self.assertEqual(services.invite_eligible_applicant(self.learner), (False, "graph-error: 503"))

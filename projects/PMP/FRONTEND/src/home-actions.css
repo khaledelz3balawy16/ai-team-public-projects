@@ -1,0 +1,12 @@
+.hero-actions{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.report-button{background:#fff;color:#6f31b5;border:1px solid #d7c5ea;box-shadow:none}
+.report-button:hover{background:#f6effd;border-color:#8b45dc}
+
+.cta{position:relative;overflow:hidden;background:linear-gradient(115deg,#160c21 0%,#2d143e 64%,#4c1d6c 100%);color:#fff;padding:42px 46px;border:1px solid #5d2a7d;border-radius:18px;box-shadow:0 18px 45px rgba(30,12,42,.2)}
+.cta:before{content:"";position:absolute;width:260px;height:260px;border-radius:50%;right:120px;top:-170px;background:rgba(169,91,238,.18);filter:blur(2px)}
+.cta>div{position:relative;z-index:1}
+.cta h2{font:800 27px/1.2 Manrope;margin:0 0 10px;letter-spacing:-.5px}
+.cta p{margin:0;color:#cfc1d9;font-size:15px;line-height:1.6}
+.cta .button.light{position:relative;z-index:1;background:linear-gradient(135deg,#ffb000,#ffc341);color:#21132d;border:0;padding:14px 23px;border-radius:10px;box-shadow:0 10px 24px rgba(245,164,0,.27);white-space:nowrap}
+.cta .button.light:hover{transform:translateY(-2px);box-shadow:0 14px 28px rgba(245,164,0,.35)}
+@media(max-width:700px){.cta{padding:30px 25px}.cta .button.light{margin-top:20px;width:100%}}

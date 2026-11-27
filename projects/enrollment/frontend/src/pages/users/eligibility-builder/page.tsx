@@ -1,0 +1,813 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
+import { WorkspaceShell } from '@/components/feature/WorkspaceShell';
+import { AppIcon } from '@/components/feature/AppIcon';
+import './eligibilityBuilder.css';
+import { SelectMenu } from '@/components/feature/SelectField';
+import { AdminPageHeader } from '@/pages/admin/_shared/AdminPage';
+import { useToast } from "@/hooks/useToast.helpers";
+import { roleNavMap } from '@/mocks/navigation';
+import { archiveEligibilityDraft, fetchEligibilityLayout, fetchEligibilityVersion, publishEligibilityLayout, saveEligibilityDraft } from '@/api/eligibilityFormLayout';
+import {
+  BUILTIN_ITEMS,
+  ITEM_TEXT_SLOTS,
+  PAGE_TEXT_SLOTS,
+  RETIRED_PUBLIC_ITEMS,
+  REQUIRED_ADDRESS_FIELDS,
+  SCREENING_PROTECTED_FIELDS,
+  WORKPLACE_FIELDS,
+  builtinSection,
+  isBuiltinQuestion,
+  textFor,
+} from '@/pages/apprenticeship-application/layout/registry';
+import { builtinOptions, isLocked, isRemovalProtected, itemLabel, resolveLayout, sectionDescription } from '@/pages/apprenticeship-application/layout/resolve';
+import { QUESTION_TYPES, type EligibilityItem, type EligibilityLayout, type EligibilityPublishedVersion, type EligibilitySection } from '@/pages/apprenticeship-application/layout/types';
+import { btnPrimary, btnSecondary, iconBtn, inputClass } from '../components/ui';
+import { TextEditor } from '../wizard-builder/TextEditor';
+import { OptionsEditor } from './OptionsEditor';
+import { QuestionEditor } from './QuestionEditor';
+import {
+  addSection,
+  dependents,
+  findItem,
+  moveItem,
+  moveItemToSection,
+  moveSection,
+  problems,
+  removeItem,
+  saveCustomQuestion,
+  setText,
+  updateItem,
+  updateSection,
+  type QuestionDraft,
+} from './builderOps';
+
+const enrolmentNav = roleNavMap.apprentice;
+
+/** The left-hand entry for the page heading, ahead of the sections. */
+const PAGE = '__page';
+const EMAIL = '__activation_email';
+
+const TYPE_LABEL: Record<string, string> = Object.fromEntries(QUESTION_TYPES.map((t) => [t.value, t.label]));
+
+const clone = (layout: EligibilityLayout): EligibilityLayout => JSON.parse(JSON.stringify(layout)) as EligibilityLayout;
+
+/**
+ * The "Edit eligibility form" builder, for the public form at
+ * /apprenticeship_application.
+ *
+ * Edits a draft of the public form. Publishing creates an immutable version.
+ * Answers to new questions are stored in eligibility_form.answers JSONB.
+ */
+export default function EligibilityBuilderPage() {
+  const { success, error } = useToast();
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [version, setVersion] = useState<number | null>(null);
+  const [updatedAt, setUpdatedAt] = useState('');
+  const [updatedBy, setUpdatedBy] = useState('');
+  const [published, setPublished] = useState<EligibilityLayout | null>(null);
+  const [savedLayout, setSavedLayout] = useState<EligibilityLayout | null>(null);
+  const [draftId, setDraftId] = useState<number | null>(null);
+  const [versions, setVersions] = useState<EligibilityPublishedVersion[]>([]);
+  const [sourceVersion, setSourceVersion] = useState<number | null>(null);
+  const [copiedFromVersion, setCopiedFromVersion] = useState<number | null>(null);
+  const [layout, setLayout] = useState<EligibilityLayout | null>(null);
+  const [selected, setSelected] = useState<string>('');
+  const [editing, setEditing] = useState<string | 'new' | null>(null);
+  const [confirming, setConfirming] = useState(false);
+  const [publishing, setPublishing] = useState(false);
+  const [reloadToken, setReloadToken] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setLoadError(null);
+    fetchEligibilityLayout()
+      .then((res) => {
+        if (cancelled) return;
+        const resolved = resolveLayout(res.layout, res.workplaceEnabled === true);
+        setPublished(resolved);
+        const initial = res.draft ? resolveLayout(res.draft.layout, res.workplaceEnabled === true) : resolved;
+        setLayout(clone(initial));
+        setSavedLayout(clone(initial));
+        setDraftId(res.draft?.id ?? null);
+        setVersions(res.versions ?? []);
+        setSourceVersion(null);
+        setCopiedFromVersion(initial.copiedFromVersion ?? null);
+        setVersion(res.version);
+        setUpdatedAt(res.updatedAt ?? '');
+        setUpdatedBy(res.updatedBy ?? '');
+        setSelected((cur) => (cur === PAGE || cur === EMAIL || resolved.sections.some((s) => s.slug === cur) ? cur : resolved.sections[0]?.slug ?? PAGE));
+      })
+      .catch((e: Error) => { if (!cancelled) setLoadError(e.message); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [reloadToken]);
+
+  const dirty = useMemo(() => Boolean(layout && published && JSON.stringify(layout) !== JSON.stringify(published)), [layout, published]);
+  const unsaved = useMemo(() => Boolean(layout && savedLayout && JSON.stringify(layout) !== JSON.stringify(savedLayout)), [layout, savedLayout]);
+
+  // Unpublished edits are easy to lose by navigating away; ask first.
+  useEffect(() => {
+    if (!unsaved) return;
+    const warn = (e: BeforeUnloadEvent) => { e.preventDefault(); e.returnValue = ''; };
+    window.addEventListener('beforeunload', warn);
+    return () => window.removeEventListener('beforeunload', warn);
+  }, [unsaved]);
+
+  const edit = useCallback((fn: (l: EligibilityLayout) => EligibilityLayout) => setLayout((l) => (l ? fn(l) : l)), []);
+
+  const discardChanges = () => {
+    if (!savedLayout) return;
+    setLayout(clone(savedLayout));
+    setCopiedFromVersion(savedLayout.copiedFromVersion ?? null);
+    setSourceVersion(null);
+    setEditing(null);
+    setSelected((cur) => (cur === PAGE || cur === EMAIL || savedLayout.sections.some((s) => s.slug === cur)
+      ? cur : savedLayout.sections[0]?.slug ?? PAGE));
+  };
+
+  const publish = async () => {
+    if (!layout) return;
+    setPublishing(true);
+    try {
+      const saved = await publishEligibilityLayout(layout, version);
+      const resolved = resolveLayout(saved.layout, saved.workplaceEnabled === true);
+      setPublished(resolved);
+      setLayout(clone(resolved));
+      setSavedLayout(clone(resolved));
+      setVersion(saved.version);
+      setDraftId(null);
+      setCopiedFromVersion(null);
+      setSourceVersion(null);
+      fetchEligibilityLayout().then((res) => setVersions(res.versions ?? [])).catch(() => {});
+      setUpdatedAt(saved.updatedAt ?? '');
+      setUpdatedBy(saved.updatedBy ?? '');
+      // A new section's temporary slug is replaced by the server's.
+      setSelected((cur) => (cur === PAGE || cur === EMAIL || resolved.sections.some((s) => s.slug === cur) ? cur : resolved.sections[resolved.sections.length - 1]?.slug ?? PAGE));
+      setConfirming(false);
+      success('Eligibility form published', 'Form changes apply to new visitors; email changes apply to eligible applicants who submit this version.');
+    } catch (e) {
+      error('Could not publish the eligibility form', e instanceof Error ? e.message : 'Unexpected error');
+    } finally {
+      setPublishing(false);
+    }
+  };
+
+  const saveDraft = async () => {
+    if (!layout) return;
+    setPublishing(true);
+    try {
+      const saved = await saveEligibilityDraft(layout, version, draftId);
+      setDraftId(saved.draft?.id ?? null);
+      if (saved.draft) {
+        const resolved = resolveLayout(saved.draft.layout, saved.workplaceEnabled === true);
+        setLayout(clone(resolved));
+        setSavedLayout(clone(resolved));
+      }
+      success('Draft saved', 'Applicants continue to see the published form.');
+    } catch (e) {
+      error('Could not save draft', e instanceof Error ? e.message : 'Unexpected error');
+    } finally { setPublishing(false); }
+  };
+
+  const archiveDraft = async () => {
+    if (draftId === null || !published) return;
+    if (unsaved && !window.confirm('This will discard your unsaved edits and archive the saved draft. Return to the published form?')) return;
+    setPublishing(true);
+    try {
+      await archiveEligibilityDraft(version, draftId);
+      setDraftId(null);
+      setCopiedFromVersion(null);
+      setSourceVersion(null);
+      setLayout(clone(published));
+      setSavedLayout(clone(published));
+      success('Draft archived', 'The published form remains available.');
+    } catch (e) {
+      error('Could not archive draft', e instanceof Error ? e.message : 'Unexpected error');
+    } finally { setPublishing(false); }
+  };
+
+  const copyVersion = async () => {
+    if (sourceVersion === null || !published || draftId !== null) return;
+    if (unsaved && !window.confirm('This will discard your unsaved edits and open a copy of the selected published version. Continue?')) return;
+    setPublishing(true);
+    try {
+      const source = await fetchEligibilityVersion(sourceVersion);
+      const copy = clone(source.layout);
+      copy.copiedFromVersion = sourceVersion;
+      // Historical layouts may predate the editable email. Keep the current
+      // published template so a restored form can still be published safely.
+      if (!copy.activationEmailHtml && published.activationEmailHtml) {
+        copy.activationEmailHtml = published.activationEmailHtml;
+      }
+      const resolved = resolveLayout(copy, source.workplaceEnabled === true);
+      setLayout(clone(resolved));
+      setSelected(PAGE);
+      setEditing(null);
+      setCopiedFromVersion(sourceVersion);
+      setSourceVersion(null);
+      success('Version copied to editor', 'The copy is unsaved. Save a draft or publish to keep it.');
+    } catch (e) {
+      error('Could not copy version', e instanceof Error ? e.message : 'Unexpected error');
+    } finally { setPublishing(false); }
+  };
+
+  const section = layout?.sections.find((s) => s.slug === selected) ?? null;
+
+  return (
+    <WorkspaceShell role="compliance" roleLabel={enrolmentNav.label} navItems={enrolmentNav.items} workspaceLabel={enrolmentNav.workspaceLabel} pageTitle="Eligibility form" pageSubtitle="Edit the public apprenticeship eligibility form">
+      <div className="eligibility-builder-page admin-console-page min-w-0">
+        <header className="eb-page-heading">
+          <nav aria-label="Breadcrumb" className="eb-breadcrumb"><Link to="/users"><AppIcon className="ri-home-4-line" /> Users</Link><span aria-hidden="true">&rsaquo;</span><span>Eligibility Form Builder</span></nav>
+          <h1>Apprenticeship eligibility form</h1>
+          <p>Edit the public eligibility form and its eligible applicant activation email. Published changes apply to new form visitors and applicants who submit the new version.</p>
+        </header>
+        <section className="eb-hero" aria-labelledby="eb-hero-title">
+          <svg className="eb-hero-wave" viewBox="0 0 1600 120" preserveAspectRatio="none" aria-hidden="true"><defs><linearGradient id="eb-wave-fill"><stop stopColor="#f5eafa"/><stop offset="1" stopColor="#dfc1f7"/></linearGradient></defs><path fill="url(#eb-wave-fill)" d="M0 0H800C940 0 930 120 1110 120C1340 120 1390 -25 1550 30Q1600 45 1600 80V120H0Z"/><path fill="none" stroke="#e9bd43" strokeWidth="1.5" d="M630 0H800C940 0 930 120 1110 120"/></svg>
+          <div className="eb-hero-copy"><span className="eb-hero-icon" aria-hidden="true"><AppIcon className="ri-survey-line" /></span><div><h2 id="eb-hero-title">Build and manage your eligibility form</h2><p>Customise the sections and questions, set which fields are mandatory, and control what information is shown to applicants.</p></div></div>
+          <img className="eb-hero-image" src="/images/eligibility/eligibility-builder-hero.png" alt="" />
+        </section>
+        <div className="eb-publication-row">
+          <div className="eb-version-slot">{!loading && !loadError && layout && (<p className="text-[12px] text-foreground-500" aria-live="polite">
+              {draftId !== null && <span className="mr-2 font-medium text-primary-700">Editing saved draft &middot; </span>}
+              {dirty ? (
+                <span className="font-medium text-amber-700"><AppIcon className="ri-edit-circle-line mr-1 inline" />You have unpublished changes.</span>
+              ) : version ? (
+                <>Published version {version}{updatedAt ? ` · ${new Date(updatedAt).toLocaleString('en-GB')}` : ''}{updatedBy ? ` · ${updatedBy}` : ''}</>
+              ) : (
+                'Showing the standard form — nothing has been published from the builder yet.'
+              )}
+            </p>)}</div>
+            <div className="eb-publication-actions flex flex-wrap items-start gap-2">
+              <Link className={btnSecondary} to="/apprenticeship_application" target="_blank" rel="noopener noreferrer">
+                <AppIcon className="ri-external-link-line" />Open the form
+              </Link>
+              <button type="button" className={btnSecondary} disabled={!unsaved || publishing} onClick={discardChanges}>
+                <AppIcon className="ri-arrow-go-back-line" />Discard changes
+              </button>
+              <button type="button" className={btnSecondary} disabled={!unsaved || publishing} onClick={saveDraft}>
+                <AppIcon className="ri-save-line" />Save draft
+              </button>
+              {draftId !== null && <button type="button" className={btnSecondary} disabled={publishing} onClick={archiveDraft}>
+                <AppIcon className="ri-archive-line" />Archive draft &amp; return to published
+              </button>}
+              <button type="button" className={btnPrimary} disabled={!dirty || publishing} onClick={() => setConfirming(true)}>
+                <AppIcon className="ri-upload-cloud-2-line" />Publish layout
+              </button>
+            </div>
+        </div>
+
+        {loading && <p className="text-[13px] text-foreground-400"><AppIcon className="ri-loader-4-line mr-2 inline animate-spin" />Loading the eligibility form…</p>}
+        {!loading && loadError && (
+          <div className="rounded-2xl border border-red-200 bg-red-50 p-4 text-[13px] text-red-700">
+            <AppIcon className="ri-error-warning-line mr-1.5 inline" />{loadError}
+            <button type="button" className={`${btnSecondary} ml-3`} onClick={() => setReloadToken((n) => n + 1)}><AppIcon className="ri-refresh-line" />Retry</button>
+          </div>
+        )}
+
+        {!loading && !loadError && layout && (
+          <>
+            <div className="flex flex-wrap items-end gap-3 rounded-2xl border border-foreground-200 bg-background-50 p-4">
+              <div className="flex min-w-[16rem] flex-1 flex-col gap-1 text-[12px] font-medium text-foreground-700">
+                <span id="eligibility-copy-version-label">Copy from an earlier published version</span>
+                <SelectMenu
+                  value={sourceVersion?.toString() ?? ''}
+                  onChange={(value) => setSourceVersion(value ? Number(value) : null)}
+                  options={versions.filter((entry) => entry.version !== version).map((entry) => ({
+                    value: String(entry.version),
+                    label: `v${entry.version}${entry.publishedAt ? ` · ${new Date(entry.publishedAt).toLocaleDateString('en-GB')}` : ''}${entry.publishedBy ? ` · ${entry.publishedBy}` : ''}`,
+                  }))}
+                  placeholder="Select a version..."
+                  ariaLabelledBy="eligibility-copy-version-label"
+                  disabled={publishing}
+                  searchable={false}
+                  size="sm"
+                />
+              </div>
+              <button type="button" className={btnSecondary} disabled={sourceVersion === null || publishing || draftId !== null} onClick={copyVersion}>
+                <AppIcon className="ri-file-copy-line" />Copy to editor
+              </button>
+              <p className="w-full text-[12px] text-foreground-500">
+                {draftId !== null
+                  ? copiedFromVersion !== null
+                    ? `Editing a saved draft copied from v${copiedFromVersion}. Archive the draft to return to the current published form before copying another version.`
+                    : 'Archive the saved draft before copying an earlier version. Its archived record will be retained.'
+                  : copiedFromVersion !== null
+                    ? `Editing an unsaved copy of v${copiedFromVersion}. Save draft to keep it, publish to make it live, or discard to return to the current published form.`
+                    : 'Copying opens the selected version in the editor without saving it. The live form stays unchanged until you publish.'}
+              </p>
+            </div>
+            <p className="text-[12px] text-foreground-500" aria-live="polite">
+              {draftId !== null && <span className="mr-2 font-medium text-primary-700">Editing saved draft · </span>}
+              {draftId === null && copiedFromVersion !== null && <span className="mr-2 font-medium text-primary-700">Editing unsaved copy · </span>}
+              {dirty ? (
+                <span className="font-medium text-amber-700"><AppIcon className="ri-edit-circle-line mr-1 inline" />You have unpublished changes.</span>
+              ) : version ? (
+                <>Published version {version}{updatedAt ? ` · ${new Date(updatedAt).toLocaleString('en-GB')}` : ''}{updatedBy ? ` · ${updatedBy}` : ''}</>
+              ) : (
+                'Showing the standard form — nothing has been published from the builder yet.'
+              )}
+            </p>
+            <div className="flex flex-col gap-4 lg:flex-row lg:items-start">
+              <SectionList
+                layout={layout}
+                selected={selected}
+                onSelect={(slug) => { setSelected(slug); setEditing(null); }}
+                onMove={(slug, delta) => edit((l) => moveSection(l, slug, delta))}
+                onAdd={() => {
+                  const res = addSection(layout, 'New section');
+                  setLayout(res.layout);
+                  setSelected(res.slug);
+                  setEditing(null);
+                }}
+              />
+              {selected === PAGE ? (
+                <PageEditor layout={layout} edit={edit} />
+              ) : selected === EMAIL ? (
+                <ActivationEmailEditor layout={layout} edit={edit} />
+              ) : (
+                section && (
+                  <SectionEditor
+                    key={section.slug}
+                    layout={layout}
+                    section={section}
+                    editing={editing}
+                    setEditing={setEditing}
+                    edit={edit}
+                  />
+                )
+              )}
+            </div>
+          </>
+        )}
+
+        {confirming && layout && (
+          <PublishDialog layout={layout} publishing={publishing} onCancel={() => setConfirming(false)} onConfirm={publish} />
+        )}
+      </div>
+    </WorkspaceShell>
+  );
+}
+
+function SectionList({
+  layout,
+  selected,
+  onSelect,
+  onMove,
+  onAdd,
+}: {
+  layout: EligibilityLayout;
+  selected: string;
+  onSelect: (slug: string) => void;
+  onMove: (slug: string, delta: -1 | 1) => void;
+  onAdd: () => void;
+}) {
+  let number = 0;
+  const pageActive = selected === PAGE;
+  return (
+    <nav aria-label="Form sections" className="eb-sections shrink-0 overflow-hidden rounded-2xl border border-foreground-200/60 bg-background-50 shadow-sm lg:w-72">
+      <div className="border-b border-foreground-100 px-4 py-3">
+        <p className="text-[11px] font-semibold uppercase tracking-wider text-foreground-400">Sections</p>
+      </div>
+      <div className="border-b border-foreground-100 p-2">
+        <button
+          type="button"
+          onClick={() => onSelect(PAGE)}
+          aria-current={pageActive ? 'step' : undefined}
+          className={`flex w-full cursor-pointer items-center gap-2.5 rounded-xl px-2.5 py-2 text-left ${pageActive ? 'bg-primary-50 text-primary-700' : 'text-foreground-700 hover:bg-background-100'}`}
+        >
+          <span className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-full border text-[11px] ${pageActive ? 'border-primary-300 bg-primary-100' : 'border-foreground-200'}`}>
+            <AppIcon className="ri-layout-top-line text-[11px]" />
+          </span>
+          <span className="min-w-0">
+            <span className={`block truncate text-[12.5px] ${pageActive ? 'font-semibold' : 'font-medium'}`}>Form heading</span>
+            <span className="block text-[10.5px] text-foreground-400">Title and introduction</span>
+          </span>
+        </button>
+      </div>
+      <div className="border-b border-foreground-100 p-2">
+        <button
+          type="button"
+          onClick={() => onSelect(EMAIL)}
+          aria-current={selected === EMAIL ? 'step' : undefined}
+          className={`flex w-full cursor-pointer items-center gap-2.5 rounded-xl px-2.5 py-2 text-left ${selected === EMAIL ? 'bg-primary-50 text-primary-700' : 'text-foreground-700 hover:bg-background-100'}`}
+        >
+          <span className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-full border text-[11px] ${selected === EMAIL ? 'border-primary-300 bg-primary-100' : 'border-foreground-200'}`}>
+            <AppIcon className="ri-mail-line text-[11px]" />
+          </span>
+          <span className="min-w-0">
+            <span className={`block truncate text-[12.5px] ${selected === EMAIL ? 'font-semibold' : 'font-medium'}`}>Activation email</span>
+            <span className="block text-[10.5px] text-foreground-400">Sent to eligible applicants</span>
+          </span>
+        </button>
+      </div>
+      <ol className="space-y-0.5 p-2">
+        {layout.sections.map((s, i) => {
+          if (!s.hidden) number += 1;
+          const active = s.slug === selected;
+          return (
+            <li key={s.slug} className={`flex items-center gap-1 rounded-xl ${active ? 'bg-primary-50' : 'hover:bg-background-100'}`}>
+              <button
+                type="button"
+                onClick={() => onSelect(s.slug)}
+                aria-current={active ? 'step' : undefined}
+                aria-label={s.hidden ? `${s.title} (hidden)` : s.title}
+                className={`flex min-w-0 flex-1 cursor-pointer items-center gap-2.5 px-2.5 py-2 text-left ${s.hidden ? 'text-foreground-300' : active ? 'text-primary-700' : 'text-foreground-700'}`}
+              >
+                <span className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-full border text-[11px] font-semibold ${active ? 'border-primary-300 bg-primary-100' : 'border-foreground-200'}`}>
+                  {s.hidden ? <AppIcon className="ri-eye-off-line text-[11px]" /> : number}
+                </span>
+                <span className="min-w-0">
+                  <span className={`block truncate text-[12.5px] ${active ? 'font-semibold' : 'font-medium'}`}>{s.title || 'Untitled section'}</span>
+                  <span className="block text-[10.5px] text-foreground-400">{s.hidden ? 'Hidden' : s.builtin ? 'Standard section' : 'Added section'}</span>
+                </span>
+              </button>
+              <button type="button" className={iconBtn} disabled={i === 0} aria-label={`Move ${s.title} up`} onClick={() => onMove(s.slug, -1)}>
+                <AppIcon className="ri-arrow-up-s-line" />
+              </button>
+              <button type="button" className={iconBtn} disabled={i === layout.sections.length - 1} aria-label={`Move ${s.title} down`} onClick={() => onMove(s.slug, 1)}>
+                <AppIcon className="ri-arrow-down-s-line" />
+              </button>
+            </li>
+          );
+        })}
+      </ol>
+      <div className="border-t border-foreground-100 p-2">
+        <button type="button" onClick={onAdd} className="flex w-full cursor-pointer items-center justify-center gap-1.5 rounded-xl border border-dashed border-foreground-200 px-3 py-2 text-[12px] font-medium text-primary-700 hover:bg-primary-50">
+          <AppIcon className="ri-add-line" />Add section
+        </button>
+      </div>
+    </nav>
+  );
+}
+
+function PageEditor({ layout, edit }: { layout: EligibilityLayout; edit: (fn: (l: EligibilityLayout) => EligibilityLayout) => void }) {
+  return (
+    <section aria-label="Form heading" className="eb-editor min-w-0 flex-1 space-y-4 overflow-hidden rounded-2xl border border-foreground-200/60 bg-background-50 p-5 shadow-sm">
+      <p className="text-[12px] text-foreground-500">The purple banner at the top of the form.</p>
+      {PAGE_TEXT_SLOTS.map((slot) => (
+        <TextEditor key={slot.key} slot={slot} texts={layout.texts} onChange={(v) => edit((l) => setText(l, slot.key, v))} />
+      ))}
+    </section>
+  );
+}
+
+function ActivationEmailEditor({ layout, edit }: {
+  layout: EligibilityLayout;
+  edit: (fn: (l: EligibilityLayout) => EligibilityLayout) => void;
+}) {
+  const value = layout.activationEmailHtml ?? '';
+  const preview = value.replaceAll('{{greeting}}', 'Hello Learner,').replaceAll('{{start_text}}', 'Getting started is simple: set your password and log in.');
+  const setEmail = (html: string) => edit((current) => ({ ...current, activationEmailHtml: html }));
+  return (
+    <section aria-label="Activation email" className="eb-editor min-w-0 flex-1 space-y-4 overflow-hidden rounded-2xl border border-foreground-200/60 bg-background-50 p-5 shadow-sm">
+      <div>
+        <h2 className="text-lg font-semibold text-foreground-800">Eligible applicant activation email</h2>
+        <p className="mt-1 text-[12px] text-foreground-500">Edit the HTML content above the set password button. The subject, activation link, expiry information, booking step and footer remain in place.</p>
+      </div>
+      <label htmlFor="activation-email-html" className="block text-[12px] font-medium text-foreground-700">Email content (HTML)</label>
+      <textarea
+        id="activation-email-html"
+        className={`${inputClass} min-h-64 font-mono text-[12px]`}
+        value={value}
+        maxLength={40000}
+        spellCheck={false}
+        onChange={(e) => setEmail(e.target.value)}
+      />
+      <p className="text-[11px] text-foreground-500">Use {'{{greeting}}'} and {'{{start_text}}'} for the learner greeting and relevant next step. A published HTML template is required before eligible applicants can be invited.</p>
+      <div>
+        <h3 className="mb-2 text-[12px] font-medium text-foreground-700">Preview of editable content</h3>
+        <iframe title="Activation email content preview" sandbox="" srcDoc={`<!doctype html><html><body style="font-family:Segoe UI,Arial,sans-serif;padding:16px;color:#241b35">${preview}</body></html>`} className="h-80 w-full rounded-xl border border-foreground-200 bg-white" />
+      </div>
+    </section>
+  );
+}
+
+function SectionEditor({
+  layout,
+  section,
+  editing,
+  setEditing,
+  edit,
+}: {
+  layout: EligibilityLayout;
+  section: EligibilitySection;
+  editing: string | 'new' | null;
+  setEditing: (v: string | 'new' | null) => void;
+  edit: (fn: (l: EligibilityLayout) => EligibilityLayout) => void;
+}) {
+  const shown = section.items.filter((it) => !it.hidden && !RETIRED_PUBLIC_ITEMS.has(it.key));
+  const removed = section.items.filter((it) => it.hidden && !RETIRED_PUBLIC_ITEMS.has(it.key));
+  const [showRemoved, setShowRemoved] = useState(false);
+  const addRef = useRef<HTMLButtonElement>(null);
+  // Hiding this section would hide identity or screening questions.
+  const holdsLocked = shown.some(isRemovalProtected);
+
+  const saveQuestion = (draft: QuestionDraft) => {
+    if (editing) {
+      const key = editing === 'new' ? null : editing;
+      edit((l) => saveCustomQuestion(l, section.slug, key, draft).layout);
+    }
+    setEditing(null);
+    addRef.current?.focus();
+  };
+
+  return (
+    <section aria-label={`${section.title || 'Untitled'} section`} className="eb-editor min-w-0 flex-1 rounded-2xl border border-foreground-200/60 bg-background-50 shadow-sm">
+      <div className="grid gap-3 border-b border-foreground-100 px-5 py-4 sm:grid-cols-[1fr_auto] sm:items-end">
+        <label className="min-w-[220px] text-[12px] font-medium text-foreground-600" htmlFor="eligibility-section-name">
+          Section name
+          <input id="eligibility-section-name" className={`${inputClass} mt-1`} value={section.title} onChange={(e) => edit((l) => updateSection(l, section.slug, { title: e.target.value }))} />
+        </label>
+        <label className={`flex items-center gap-2 pb-2 text-[12px] font-medium ${holdsLocked ? 'text-foreground-400' : 'text-foreground-700'}`}>
+          <input
+            type="checkbox"
+            className="accent-primary-500"
+            checked={!section.hidden}
+            disabled={holdsLocked && !section.hidden}
+            onChange={(e) => edit((l) => updateSection(l, section.slug, { hidden: !e.target.checked }))}
+          />
+          Show this section to applicants
+        </label>
+        <label className="text-[12px] font-medium text-foreground-600 sm:col-span-2" htmlFor="eligibility-section-description">
+          Description
+          <input
+            id="eligibility-section-description"
+            className={`${inputClass} mt-1`}
+            value={sectionDescription(section)}
+            onChange={(e) => {
+              // Typing the standard description back is no edit.
+              const standard = builtinSection(section.slug)?.description;
+              edit((l) => updateSection(l, section.slug, { description: e.target.value === standard ? undefined : e.target.value }));
+            }}
+          />
+        </label>
+        {holdsLocked && <p className="text-[11px] text-foreground-400 sm:col-span-2"><AppIcon className="ri-lock-line mr-1 inline" />This section contains identity or screening questions, so it is always shown.</p>}
+      </div>
+      {section.hidden && (
+        <p className="mx-5 mt-4 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[12px] text-amber-800">
+          <AppIcon className="ri-eye-off-line mr-1 inline" />This section is hidden. Applicants skip it, and none of its questions are asked. Answers already given are kept.
+        </p>
+      )}
+      {!section.title.trim() && <p role="alert" className="mx-5 mt-3 text-[12px] text-red-600">Give the section a name before publishing.</p>}
+
+      <ol className="space-y-2 p-5" aria-label={`Questions in ${section.title}`}>
+        {shown.length === 0 && <li className="rounded-xl border border-dashed border-foreground-200 p-4 text-center text-[12px] text-foreground-400">Nothing in this section yet. Add a question below.</li>}
+        {shown.map((item, i) => (
+          <li key={item.key}>
+            {editing === item.key ? (
+              <QuestionEditor layout={layout} item={item} onSave={saveQuestion} onCancel={() => setEditing(null)} />
+            ) : (
+              <ItemRow
+                layout={layout}
+                section={section}
+                item={item}
+                first={i === 0}
+                last={i === shown.length - 1}
+                edit={edit}
+                onEdit={() => setEditing(item.key)}
+              />
+            )}
+          </li>
+        ))}
+      </ol>
+
+      <div className="px-5 pb-5">
+        {editing === 'new' ? (
+          <QuestionEditor layout={layout} onSave={saveQuestion} onCancel={() => setEditing(null)} />
+        ) : (
+          <button ref={addRef} type="button" className={btnSecondary} onClick={() => setEditing('new')}>
+            <AppIcon className="ri-add-line" />Add question
+          </button>
+        )}
+      </div>
+
+      {removed.length > 0 && (
+        <div className="border-t border-foreground-100 px-5 py-4">
+          <button type="button" className="cursor-pointer text-[12px] font-medium text-foreground-600 hover:text-primary-700" aria-expanded={showRemoved} onClick={() => setShowRemoved((v) => !v)}>
+            <AppIcon className={showRemoved ? 'ri-arrow-down-s-line' : 'ri-arrow-right-s-line'} /> Removed from this section ({removed.length})
+          </button>
+          {showRemoved && (
+            <ul className="mt-2 space-y-1.5">
+              {removed.map((item) => (
+                <li key={item.key} className="flex items-center justify-between gap-3 rounded-lg border border-foreground-100 px-3 py-2">
+                  <span className="min-w-0 break-words text-[12px] text-foreground-500">{itemLabel(layout, item)}</span>
+                  <button type="button" className="shrink-0 cursor-pointer text-[12px] font-medium text-primary-600 hover:underline" onClick={() => edit((l) => updateItem(l, item.key, { hidden: false }))}>
+                    Restore
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+          <p className="mt-2 text-[11px] text-foreground-400">Removed questions keep every answer already given; restoring one brings it back.</p>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function ItemRow({
+  layout,
+  section,
+  item,
+  first,
+  last,
+  edit,
+  onEdit,
+}: {
+  layout: EligibilityLayout;
+  section: EligibilitySection;
+  item: EligibilityItem;
+  first: boolean;
+  last: boolean;
+  edit: (fn: (l: EligibilityLayout) => EligibilityLayout) => void;
+  onEdit: () => void;
+}) {
+  const def = item.builtin ? BUILTIN_ITEMS[item.key] : undefined;
+  const question = isBuiltinQuestion(def) ? def : undefined;
+  const note = def?.kind === 'note';
+  const contentOnly = !item.builtin && (item.type === 'heading' || item.type === 'description');
+  const label = itemLabel(layout, item);
+  const locked = isLocked(item);
+  const removalProtected = isRemovalProtected(item);
+  const usedInScreening = Boolean(item.screeningRule || (item.builtin && SCREENING_PROTECTED_FIELDS.has(item.key)));
+  const workplace = item.builtin && WORKPLACE_FIELDS.has(item.key);
+  const addressRequired = item.builtin && REQUIRED_ADDRESS_FIELDS.has(item.key);
+  const required = addressRequired || (workplace ? item.key === 'workplaceArrangement' : locked || (item.builtin ? item.required ?? question?.required ?? false : Boolean(item.required)));
+  const deps = dependents(layout, item.key);
+  const slots = item.builtin ? ITEM_TEXT_SLOTS[item.key] ?? [] : [];
+  const list = builtinOptions(item);
+  const otherSections = layout.sections.filter((s) => s.slug !== section.slug);
+  const trigger = item.condition ? findItem(layout, item.condition.field) : question?.followUpOf ? findItem(layout, question.followUpOf.key) : undefined;
+  const shownFor = item.condition?.values ?? (question?.followUpOf ? [question.followUpOf.value ? 'Yes' : 'No'] : []);
+  const conditionText = trigger && shownFor.length > 0 ? `Asked when “${itemLabel(layout, trigger)}” is ${shownFor.join(' / ')}` : '';
+  const hint = question ? textFor(layout.texts, `${item.key}.hint`) : item.helpText;
+  // Information is all wording, so it opens with its wording showing.
+  const [expanded, setExpanded] = useState(note);
+  const [showAnswers, setShowAnswers] = useState(false);
+
+  const remove = () => {
+    if (deps.length && !window.confirm(`${deps.length} question${deps.length === 1 ? '' : 's'} only asked for an answer to this question will stop being asked.\n\nRemove it from the form?`)) return;
+    edit((l) => removeItem(l, item.key));
+  };
+
+  return (
+    <div className="eb-question rounded-xl border border-foreground-100 bg-background-50 px-3 py-2.5">
+      <div className="eb-question-summary flex flex-wrap items-center gap-2">
+        <div className="eb-question-copy min-w-0 flex-[1_1_16rem]">
+          <p className="break-words text-[13px] font-medium text-foreground-900">{label}</p>
+          {hint && !note && <p className="mt-0.5 break-words text-[12px] text-foreground-500">{hint}</p>}
+          <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[10.5px]">
+            <span className="rounded-full bg-background-200 px-2 py-0.5 text-foreground-600">
+              {note ? 'Information' : item.builtin ? 'Standard question' : `Custom · ${TYPE_LABEL[item.type ?? 'text']}`}
+            </span>
+            {removalProtected && (
+              <span
+                className="rounded-full bg-background-200 px-2 py-0.5 text-foreground-600"
+                title={usedInScreening ? 'Used in screening — cannot remove' : locked ? 'Identifies the applicant — cannot remove' : 'Protected — cannot remove'}
+                role={usedInScreening ? undefined : 'img'}
+                aria-label={usedInScreening ? undefined : locked ? 'Identifies the applicant — cannot remove' : 'Protected — cannot remove'}
+              >
+                <AppIcon className={`ri-lock-line inline${usedInScreening ? ' mr-0.5' : ''}`} />
+                {usedInScreening && 'Used in screening'}
+              </span>
+            )}
+            {item.screeningRule && <span className="rounded-full bg-amber-100 px-2 py-0.5 text-amber-800">Eligibility rule — {item.screeningRule.eligibleAnswers.join(' / ')} pass</span>}
+            {question?.postcode && <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-emerald-800">Postcode checked and located</span>}
+            {conditionText && (
+              <span className="group relative inline-flex cursor-help items-center rounded-full bg-sky-100 px-2 py-0.5 text-sky-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-sky-500" tabIndex={0} role="img" aria-label={conditionText}>
+                <AppIcon className="ri-link" />
+                <span aria-hidden="true" className="pointer-events-none invisible absolute bottom-full left-0 z-20 mb-1 w-72 max-w-[80vw] rounded-lg bg-foreground-900 px-3 py-2 text-left text-[11px] leading-4 text-white shadow-lg group-hover:visible group-focus:visible">
+                  {conditionText}
+                </span>
+              </span>
+            )}
+            {item.builtin && item.options && <span className="rounded-full bg-primary-100 px-2 py-0.5 text-primary-700">Answers edited</span>}
+          </div>
+        </div>
+
+        {!note && !contentOnly && (
+          <label className={`flex shrink-0 items-center gap-1.5 text-[12px] ${locked ? 'text-foreground-400' : 'text-foreground-700'}`}>
+            <input
+              type="checkbox"
+              className="accent-primary-500"
+              checked={required}
+              disabled={locked || workplace || addressRequired || Boolean(item.screeningRule)}
+              onChange={(e) => edit((l) => updateItem(l, item.key, { required: e.target.checked }))}
+            />
+            Mandatory
+          </label>
+        )}
+        {otherSections.length > 0 && (
+          <select
+            aria-label={`Move ${label} to another section`}
+            className={`${inputClass} !w-28 shrink-0 cursor-pointer !border-foreground-100 !bg-background-50/70 !px-2 !py-1 !text-[11px] !text-foreground-600`}
+            value=""
+            disabled={workplace}
+            onChange={(e) => e.target.value && edit((l) => moveItemToSection(l, item.key, e.target.value))}
+          >
+            <option value="">Move to…</option>
+            {otherSections.filter(s => !removalProtected || !s.hidden).map((s) => <option key={s.slug} value={s.slug}>{s.title || 'Untitled section'}{s.hidden ? ' (hidden)' : ''}</option>)}
+          </select>
+        )}
+        <div className="flex shrink-0 items-center">
+          <button type="button" className={iconBtn} disabled={first || workplace} aria-label={`Move ${label} up`} onClick={() => edit((l) => moveItem(l, section.slug, item.key, -1))}>
+            <AppIcon className="ri-arrow-up-line" />
+          </button>
+          <button type="button" className={iconBtn} disabled={last || workplace} aria-label={`Move ${label} down`} onClick={() => edit((l) => moveItem(l, section.slug, item.key, 1))}>
+            <AppIcon className="ri-arrow-down-line" />
+          </button>
+          {((item.builtin && (slots.length > 0 || list)) || !item.builtin) && (
+            <button
+              type="button"
+              className={`${iconBtn}${item.builtin && expanded ? ' !bg-primary-50 !text-primary-700' : ''}`}
+              aria-label={`Edit ${label}`}
+              aria-expanded={item.builtin ? expanded : undefined}
+              onClick={item.builtin ? () => { setShowAnswers(false); setExpanded((open) => !open); } : onEdit}
+            >
+              <AppIcon className="ri-pencil-line" />
+            </button>
+          )}
+          {!removalProtected && !workplace && (
+            <button type="button" className={`${iconBtn} hover:!text-red-600`} aria-label={`Remove ${label}`} onClick={remove}>
+              <AppIcon className="ri-delete-bin-line" />
+            </button>
+          )}
+        </div>
+      </div>
+      {item.builtin && expanded && (
+        <div className="mt-3 space-y-4 border-t border-foreground-100 pt-3">
+          {slots.map((slot) => (
+            <TextEditor key={slot.key} slot={slot} texts={layout.texts} onChange={(v) => edit((l) => setText(l, slot.key, v))} />
+          ))}
+          {list && (question?.optionLabels || question?.options) && (
+            <div className="space-y-2">
+              <button type="button" className="flex w-full cursor-pointer items-center justify-between gap-2 rounded-lg border border-primary-100 bg-primary-50/40 px-3 py-2 text-left text-[12px] font-medium text-foreground-700 transition-colors hover:bg-primary-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary-500" aria-expanded={showAnswers} onClick={() => setShowAnswers((open) => !open)}>
+                Answers applicants choose from
+                <AppIcon className={showAnswers ? 'ri-arrow-up-s-line' : 'ri-arrow-down-s-line'} />
+              </button>
+              {showAnswers && (question.optionLabels ? (
+                <p className="text-[12px] text-foreground-600">These verification choices are fixed: {Object.values(question.optionLabels).join(' ')}</p>
+              ) : (
+                <div className="space-y-2">
+                  {item.options && (
+                    <button type="button" className="cursor-pointer text-[11.5px] font-medium text-primary-600 hover:underline" onClick={() => edit((l) => updateItem(l, item.key, { options: undefined }))}>
+                      Reset to standard answers
+                    </button>
+                  )}
+                  <OptionsEditor
+                    options={list}
+                    name={label}
+                    showInvalid
+                    onChange={(next) => {
+                      const standard = question.options!;
+                      const same = next.length === standard.length && next.every((o, i) => o === standard[i]);
+                      edit((l) => updateItem(l, item.key, { options: same ? undefined : next }));
+                    }}
+                  />
+                  <p className="text-[11px] text-foreground-400">Applications already submitted keep the answer they gave, even if it is no longer listed.</p>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PublishDialog({ layout, publishing, onCancel, onConfirm }: { layout: EligibilityLayout; publishing: boolean; onCancel: () => void; onConfirm: () => void }) {
+  const issues = problems(layout);
+  const confirmRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    confirmRef.current?.focus();
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape' && !publishing) onCancel(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onCancel, publishing]);
+  return (
+    <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/40 p-4">
+      <div role="dialog" aria-modal="true" aria-labelledby="publish-eligibility-title" className="w-full max-w-lg rounded-2xl bg-background-50 p-5 shadow-xl">
+        <h2 id="publish-eligibility-title" className="font-heading text-[16px] font-semibold text-foreground-900">Publish the eligibility form?</h2>
+        <p className="mt-2 text-[13px] text-foreground-600">
+          Everyone who opens the form from now on sees these changes. Applications already submitted are not changed;
+          anyone part-way through is asked to check their answers before submitting.
+        </p>
+        <p className="mt-3 text-[12px] text-foreground-600">New question answers will be saved in the application answers record.</p>
+        {issues.length > 0 && (
+          <ul role="alert" className="mt-3 list-disc space-y-0.5 rounded-lg border border-red-200 bg-red-50 py-2 pl-7 pr-3 text-[12px] text-red-700">
+            {issues.map((issue) => <li key={issue}>{issue}</li>)}
+          </ul>
+        )}
+        <div className="mt-5 flex justify-end gap-2">
+          <button type="button" className={btnSecondary} onClick={onCancel} disabled={publishing}>Cancel</button>
+          <button ref={confirmRef} type="button" className={btnPrimary} onClick={onConfirm} disabled={publishing || issues.length > 0}>
+            {publishing ? <><AppIcon className="ri-loader-4-line animate-spin" />Publishing…</> : <><AppIcon className="ri-upload-cloud-2-line" />Publish</>}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}

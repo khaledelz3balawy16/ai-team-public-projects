@@ -1,0 +1,310 @@
+import { invalidateLearnerReads } from '@/api/learnerRead';
+import { useCallback, useMemo, useRef, useState, type CSSProperties } from 'react';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
+import { WorkspaceShell } from '@/components/feature/WorkspaceShell';
+import { AppIcon } from '@/components/feature/AppIcon';
+import { roleNavMap } from '@/mocks/navigation';
+import { useMyLearner } from '@/hooks/useMyLearner';
+import { useLiveLearnerRead } from '@/hooks/useLiveLearnerRead';
+import { learningSchedule } from '@/api/learnerOverview';
+import { useRefreshOnReturn } from '@/hooks/useRefreshOnReturn';
+import { useLearnerWorkspaceAccess } from '@/hooks/useLearnerWorkspaceAccess';
+import { RowsSkeleton } from '@/components/feature/Skeletons';
+import { PageContainer } from '@/components/ui/PageContainer';
+import { Panel } from '@/components/ui/Panel';
+import { SectionHeader } from '@/components/ui/SectionHeader';
+import { LearnerLoadError } from '@/components/feature/LearnerLoadError';
+import type { PageTabItem } from '@/components/ui/PageTabs';
+import { RowAction } from '@/components/ui/ActionRow';
+import {
+  confirmAttendance, fetchAttendanceWorkspace, peekAttendanceWorkspace, updateAttendanceMode,
+  type AttendanceLecture,
+} from '@/api/attendanceLectures';
+import AbsenceReportForm from './components/AbsenceReportForm';
+import AbsenceReportDialog from './components/AbsenceReportDialog';
+import AttendanceModePanel from './components/AttendanceModePanel';
+import AttendanceLectureList, { type AttendanceFilter } from './components/AttendanceLectureList';
+import FeaturedLecture from './components/FeaturedLecture';
+import CatchupBooking from './components/CatchupBooking';
+import RecoveryPlansDialog from './components/RecoveryPlansDialog';
+import type { LearnerCalendarEvent } from '@/api/learnerCalendar';
+import { featuredLecture, useLectureClock } from './liveLecture';
+import { learnerHeaderPlan } from '@/pages/workspace/learner/learnerHeaderPlan';
+import { learningToday } from '../my-learning/subjectLearning';
+import { dateKey } from '../training-plan-timeline/model';
+import styles from './attendance.module.css';
+import { lectureCounts } from './lectureCounts';
+import { attendanceLecturesForDisplay, attendanceModuleGroups, isLearningOnlyModule } from './moduleGroups';
+
+const learnerNav = roleNavMap.learner;
+
+// The Join endpoint returns here, in the tab it opened, when it cannot send the learner to Teams.
+function joinErrorMessage(reason: string) {
+  if (reason === 'ended') return 'That session has already ended, so it can no longer be joined.';
+  if (reason === 'not-found') return 'That session could not be found in your current modules. Please refresh your lectures or contact support.';
+  return 'The Teams link for that session is not available right now. Please try again in a few minutes or contact your tutor.';
+}
+
+export default function AttendancePage() {
+  const learner = useMyLearner();
+  const access = useLearnerWorkspaceAccess(learner.id);
+  const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const joinError = searchParams.get('joinError');
+  const dismissJoinError = () => {
+    const next = new URLSearchParams(searchParams);
+    next.delete('joinError');
+    setSearchParams(next, { replace: true });
+  };
+  const read = useLiveLearnerRead(learner.kind, learner.id, true, fetchAttendanceWorkspace, peekAttendanceWorkspace);
+  const schedule = useLiveLearnerRead(learner.kind, learner.id, true, learningSchedule.read, learningSchedule.peek);
+  useRefreshOnReturn(() => { read.refresh(); schedule.refresh(); }, { enabled: Boolean(learner.kind && learner.id) });
+  const data = read.data;
+  const learnerKey = `${learner.kind}:${learner.id}`;
+  const [moduleSelection, setModuleSelection] = useState<{ learnerKey: string; moduleId: string } | null>(null);
+  const [filter, setFilter] = useState<AttendanceFilter>('all');
+  const [report, setReport] = useState<AttendanceLecture | 'choose' | null>(null);
+  const [showRecoveryPlans, setShowRecoveryPlans] = useState(false);
+  const [showAllActivity, setShowAllActivity] = useState(false);
+  const [modeBusy, setModeBusy] = useState(false);
+  const [modeError, setModeError] = useState('');
+  const [modeNotice, setModeNotice] = useState('');
+  const [catchup, setCatchup] = useState<AttendanceLecture | null>(null);
+  const [catchupBooking, setCatchupBooking] = useState<LearnerCalendarEvent | null>(null);
+  const [bookingBusy, setBookingBusy] = useState(false);
+  const [attendBusy, setAttendBusy] = useState(false);
+  const attendInFlight = useRef(false);
+  const [attendError, setAttendError] = useState('');
+  const [attendNotice, setAttendNotice] = useState('');
+  const [confirmations, setConfirmations] = useState<Record<string, number>>({});
+  const allLectures = useMemo(() => {
+    const modules = [...(data?.modules || []), ...(schedule.data?.modules || []).map(module => ({
+      id: `native:${module.id}`, title: module.title,
+    }))];
+    return attendanceLecturesForDisplay(data?.lectures || [], modules).map(row => {
+      const minutes = confirmations[`${learner.kind}:${learner.id}:${row.id}`];
+      return minutes == null ? row : { ...row, status: 'completed' as const, attendanceConfirmed: true,
+        creditedMinutes: minutes, canReportAbsence: false, catchupStatus: null };
+    });
+  }, [data, schedule.data, confirmations, learner.kind, learner.id]);
+  const now = useLectureClock(allLectures);
+  const featured = featuredLecture(allLectures, now, data?.timeZone);
+  const today = learningToday();
+  const currentModule = useMemo(() => {
+    if (!schedule.data) return null;
+    const modules = schedule.data.modules.filter(module => !isLearningOnlyModule(module.title)).map(module => {
+      const storedEnd = dateKey(module.end_date);
+      const deliveryEnd = dateKey(module.effectiveEndDate);
+      return deliveryEnd > storedEnd ? { ...module, end_date: deliveryEnd } : module;
+    });
+    const plan = learnerHeaderPlan(modules, {}, today);
+    return plan.label.startsWith('Current') ? plan.modules[0] || null : null;
+  }, [schedule.data, today]);
+  const moduleOptions = useMemo(() => {
+    const options = data?.modules || [];
+    const withCurrent = !currentModule || options.some(module => module.id === `native:${currentModule.id}`)
+      ? options : [...options, { id: `native:${currentModule.id}`, title: currentModule.title }];
+    return attendanceModuleGroups(withCurrent);
+  }, [data, currentModule]);
+  const requestedModule = moduleSelection?.learnerKey === learnerKey ? moduleSelection.moduleId : null;
+  const requestedGroup = moduleOptions.find(module => module.moduleIds.includes(requestedModule || ''));
+  const currentGroup = currentModule && moduleOptions.find(module => module.moduleIds.includes(`native:${currentModule.id}`));
+  const selectedModule = requestedModule === 'all' ? 'all'
+    : requestedGroup?.id || currentGroup?.id || 'all';
+  const setModuleId = (moduleId: string) => setModuleSelection({ learnerKey, moduleId });
+  const lectures = useMemo(() => {
+    const moduleIds = moduleOptions.find(module => module.id === selectedModule)?.moduleIds || [];
+    return allLectures.filter(row => selectedModule === 'all' || moduleIds.includes(row.moduleId));
+  }, [allLectures, selectedModule, moduleOptions]);
+  const counts = useMemo(() => lectureCounts(lectures), [lectures]);
+  const tabs: PageTabItem[] = [
+    { value: 'all', label: 'All', count: counts.all },
+    { value: 'attended', label: 'Attended', count: counts.attended, tone: 'positive' },
+    { value: 'absent', label: 'Absent', count: counts.absent, tone: 'critical' },
+    { value: 'covered', label: 'Covered', count: counts.covered, tone: 'positive' },
+    { value: 'upcoming', label: 'Upcoming', count: counts.upcoming },
+  ];
+  const changeMode = async (mode: 'live' | 'lazy') => {
+    setModeBusy(true); setModeError(''); setModeNotice('');
+    try {
+      const result = await updateAttendanceMode(learner.kind, learner.id, mode);
+      setModeNotice(mode === 'live' ? 'Live Sessions is active. Absence reminders are enabled.' :
+        result.emailSent ? 'Your request has been emailed to your manager for approval.' :
+          'Your request was saved, but the approval email could not be sent. Please retry.');
+      read.refresh();
+    } catch (error) { setModeError(error instanceof Error ? error.message : 'Could not update attendance mode.'); }
+    finally { setModeBusy(false); }
+  };
+  const openActivities = (row: AttendanceLecture) => {
+    if (row.status === 'upcoming') {
+      const activityHref = row.componentHref ?? row.activities.find(activity => activity.href)?.href;
+      if (activityHref) {
+        navigate(activityHref);
+        return;
+      }
+      const moduleRef = row.moduleId.replace(/^native:/, '');
+      const search = new URLSearchParams({ subject: `current:${moduleRef}` });
+      navigate(`/learner/my-learning/${learner.kind}/${learner.id}?${search}`);
+      return;
+    }
+    const log = row.monthlyLog ?? {
+      month: row.date.slice(0, 7),
+      sourceRef: row.source === 'kbc-attendance' ? `att:${row.sessionId}` : `attendance:${row.sessionId.replace(/^teams:/, '')}`,
+    };
+    const search = new URLSearchParams({ source: log.sourceRef });
+    navigate(`/learner/monthly-logs/${learner.kind}/${learner.id}/${log.month}?${search}`);
+  };
+  const attend = async (row: AttendanceLecture) => {
+    if (attendInFlight.current || !access.canProgress) return;
+    attendInFlight.current = true;
+    setAttendBusy(true); setAttendError(''); setAttendNotice('');
+    try {
+      const result = await confirmAttendance(learner.kind, learner.id, row.id);
+      setConfirmations(current => ({ ...current, [`${learner.kind}:${learner.id}:${row.id}`]: result.creditedMinutes }));
+      setAttendNotice(`Attendance recorded for ${row.title}. ${result.creditedHours} ${result.creditedHours === 1 ? 'hour' : 'hours'} credited.`);
+      read.refresh();
+    } catch (error) { setAttendError(error instanceof Error ? error.message : 'Could not save attendance. Please try again.'); }
+    finally { attendInFlight.current = false; setAttendBusy(false); }
+  };
+  // Links a catch-up to the reported absence: an existing booking the learner picks,
+  // or (passed in) one just booked here, which is linked straight away.
+  const saveCatchup = async (booking: LearnerCalendarEvent | null = catchupBooking): Promise<boolean> => {
+    if (!catchup?.absenceReport || !booking) return false;
+    setBookingBusy(true); setAttendError('');
+    try {
+      // The attendance workspace carries its own CSRF token: learners cannot read /coach_api/csrf.
+      if (!data?.csrfToken) throw new Error('Please refresh the page before linking the catch-up.');
+      const response = await fetch(`/learner_api/session-catchup/${learner.kind}/${learner.id}/`, {
+        method: 'POST', credentials: 'include',
+        headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest', 'X-CSRFToken': data.csrfToken },
+        body: JSON.stringify({ reportId: catchup.absenceReport.id, eventKey: booking.eventKey }),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || 'Could not link catch-up.');
+      invalidateLearnerReads(); setAttendNotice(result.message); setCatchup(null); read.refresh();
+      return true;
+    } catch (reason) {
+      setAttendError(reason instanceof Error ? reason.message : 'Could not link catch-up.');
+      return false;
+    } finally { setBookingBusy(false); }
+  };
+  const selectCatchupBooking = useCallback((event: LearnerCalendarEvent | null) => {
+    setCatchupBooking(event);
+  }, []);
+
+  return <WorkspaceShell role="learner" roleLabel={learnerNav.label} navItems={learnerNav.items} workspaceLabel={learnerNav.workspaceLabel}
+    pageTitle="Attendance" pageSubtitle="Your lectures, attendance and learning activities"
+    userName={data?.summary?.learnerName || 'Learner'} userRole="Learner">
+    <PageContainer className={styles.page}>
+      <SectionHeader title="Attendance" description="Your scheduled lectures, attendance status and learning resources." icon="ri-calendar-check-line"
+        actions={data ? <div className="flex flex-wrap items-center gap-2">
+          <RowAction label="My recovery plans" icon="ri-calendar-todo-line" onClick={() => setShowRecoveryPlans(true)} />
+          <RowAction label="Report absence" icon="ri-calendar-close-line" emphasis="primary" onClick={() => setReport('choose')} />
+        </div> : undefined} />
+      {joinError && <div role="alert" className="flex items-start justify-between gap-3 rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm">
+        <span>{joinErrorMessage(joinError)}</span>
+        <button type="button" onClick={dismissJoinError} className="shrink-0 font-semibold underline">Dismiss</button>
+      </div>}
+      {read.error && data && <div role="alert" className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm">
+        Lectures could not refresh. Showing the last loaded record. <button onClick={read.refresh} className="font-semibold underline">Retry</button>
+      </div>}
+      {read.loading ? <Panel><RowsSkeleton rows={6} /></Panel> : !data ? <LearnerLoadError error={read.error || 'Could not load lectures.'} onRetry={read.refresh} /> : <>
+        <FeaturedLecture lecture={featured} now={now} timeZone={data.timeZone} busy={attendBusy} canAttend={access.canProgress}
+          error={attendError} notice={attendNotice} onAttend={attend} onReport={setReport} />
+        <div className={styles.workspace}>
+          <div className={styles.mainColumn}>
+            <Panel className={styles.overview}>
+              <label className={styles.moduleField}><span>Select Module</span>
+                <select className={styles.moduleSelect} aria-label="Module" value={selectedModule} onChange={event => { setModuleId(event.target.value); setFilter('all'); }}>
+                  <option value="all">All modules</option>
+                  {moduleOptions.map(module => <option key={module.id} value={module.id}>{module.title}</option>)}
+                </select>
+              </label>
+              <div className={styles.moduleOverview}>
+                <h2>Module Overview</h2>
+                <p className={styles.selectedModule} title={moduleOptions.find(module => module.id === selectedModule)?.title || 'All modules'}>
+                  {moduleOptions.find(module => module.id === selectedModule)?.title || 'All modules'}
+                </p>
+                <p className={styles.rateDescription} title="Includes late attendance">{counts.rate == null ? 'No completed attendance records yet' : <>{counts.rate}% attendance<span className="sr-only"> · includes late attendance</span></>}</p>
+              </div>
+              <div className={styles.metrics}>
+                <Stat label="Total Lectures" value={counts.all} total={counts.all} icon="ri-book-open-line" tone="total" />
+                <Stat label="Attended" value={counts.attended} total={counts.all} icon="ri-checkbox-circle-line" tone="attended" />
+                <Stat label="Absent" value={counts.absent} total={counts.all} icon="ri-close-line" tone="absent" />
+                <Stat label="Covered Missed" value={counts.covered} total={counts.all} icon="ri-star-fill" tone="covered" />
+              </div>
+            </Panel>
+            {schedule.error && <p role="alert" className={styles.scheduleError}>Current module could not be identified. <button type="button" onClick={schedule.refresh}>Retry schedule</button></p>}
+            <AttendanceLectureList key={selectedModule} lectures={lectures} moduleId={selectedModule} onModuleChange={setModuleId}
+              filter={filter} onFilterChange={setFilter} tabs={tabs} onOpen={openActivities} onReport={setReport}
+              onCatchup={row => { setCatchup(row); setCatchupBooking(null); }} />
+            <p className={styles.learningNote}><AppIcon className="ri-information-line" />An approved excuse remains an absence until your coach confirms the linked catch-up session is complete. Watching a recording does not change live attendance.</p>
+          </div>
+          <aside className={styles.sidebar}>
+            <AttendanceModePanel mode={data.mode} busy={modeBusy} error={modeError} notice={modeNotice} onChange={changeMode} />
+            <Panel className={styles.supportPanel}>
+              <div className={styles.sidebarHeading}>
+                <span className={styles.sectionIcon}><AppIcon className="ri-group-line" /></span>
+                <div><h2>Book Support Session</h2><p>Need extra help? Book a one-to-one support session with your tutor.</p></div>
+              </div>
+              <Link to="/learner/calendar?book=student-support" className={`primary-action ${styles.supportButton}`}><AppIcon className="ri-calendar-event-line" />Book a Support Session</Link>
+              <Link to="/learner/support" className={styles.contactLink}>Contact Support</Link>
+            </Panel>
+            <Panel className={styles.activityPanel}>
+              <div className={styles.activityHeading}><h2><AppIcon className="ri-history-line" />Recent Activity <span>(Audit Trail)</span></h2>
+                {data.recentActivity.length > 5 && <button type="button" onClick={() => setShowAllActivity(value => !value)}>{showAllActivity ? 'Show less' : 'View all'} <span aria-hidden="true">→</span></button>}
+              </div>
+              {!data.recentActivity.length ? <p className="mt-3 text-xs text-foreground-500">Your recent activity will appear here.</p> : <ul className={styles.recentActivity}>{data.recentActivity.slice(0, showAllActivity ? undefined : 5).map(item => <li key={item.id}>
+                <span className={styles.activityIcon} data-type={item.type}><AppIcon className={activityIcon(item.type)} /></span>
+                <p>{item.title}</p>
+                <time dateTime={item.at}><span>{new Date(item.at).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}</span><span>{new Date(item.at).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}</span></time>
+              </li>)}</ul>}
+            </Panel>
+          </aside>
+        </div>
+      </>}
+    </PageContainer>
+    {report && <AbsenceReportDialog onClose={() => setReport(null)}>
+      <AbsenceReportForm key={typeof report === 'string' ? report : report.id}
+        preselectMatch={typeof report === 'string' ? null : { id: report.id, dateIso: report.date, title: report.title }}
+        onSubmitted={() => read.refresh()} onCancel={() => setReport(null)} showGuidance={false} showHistory compact />
+    </AbsenceReportDialog>}
+    {showRecoveryPlans && <AbsenceReportDialog title="My recovery plans" onClose={() => setShowRecoveryPlans(false)}>
+      <RecoveryPlansDialog />
+    </AbsenceReportDialog>}
+    {catchup && <AbsenceReportDialog title="Book Catchup Session" onClose={() => { setCatchup(null); read.refresh(); }}>
+      {catchup.absenceReport ? <>
+        <p className={styles.catchupLectureTitle}>{catchup.title} · {catchup.date}</p>
+        <CatchupBooking key={catchup.id} lecture={{ ...catchup, status: 'absent', dateIso: catchup.date,
+          sessionType: 'live_session', coach: catchup.coach || '' }} selectedKey={catchupBooking?.eventKey || ''}
+          onSelect={selectCatchupBooking} onBusyChange={setBookingBusy} standalone
+          onLinked={() => {
+            // Booked and linked by the server in one request.
+            invalidateLearnerReads(); setAttendNotice('Catch-up booked and linked to this absence.'); setCatchup(null); read.refresh();
+          }}
+          reportId={catchup.absenceReport.id} />
+        {attendError && <p role="alert">{attendError}</p>}
+        <button type="button" className={styles.catchupDone} disabled={bookingBusy || !catchupBooking} onClick={() => void saveCatchup()}>Link catch-up to this absence</button>
+        <button type="button" className={styles.catchupDone} disabled={bookingBusy} onClick={() => { setCatchup(null); read.refresh(); }}>Close</button>
+      </> : <AbsenceReportForm key={catchup.id} initialRecoveryMethod="catch-up"
+        preselectMatch={{ id: catchup.id, dateIso: catchup.date, title: catchup.title }}
+        onSubmitted={() => { setCatchup(null); read.refresh(); }}
+        onCancel={() => { setCatchup(null); read.refresh(); }} showGuidance={false} showHistory={false} compact />}
+    </AbsenceReportDialog>}
+  </WorkspaceShell>;
+}
+
+function Stat({ label, value, total, icon, tone }: { label: string; value: number; total: number; icon: string; tone: 'total' | 'attended' | 'absent' | 'covered' }) {
+  return <div className={styles.metric} data-tone={tone}>
+    <span key={`${value}:${total}`} className={`${styles.metricRing} kbc-animated-conic-ring`} aria-hidden="true" style={{ '--kbc-ring-target': `${total ? value / total * 100 : 0}%` } as CSSProperties}><span><AppIcon className={icon} /></span></span>
+    <div><p className={styles.value}>{value}</p><p className={styles.metricLabel}>{label}</p></div>
+  </div>;
+}
+
+function activityIcon(type: string) {
+  if (type.includes('absence')) return 'ri-flag-line';
+  if (type.includes('support') || type.includes('booking')) return 'ri-calendar-event-line';
+  if (type.includes('mode')) return 'ri-toggle-line';
+  if (type.includes('attendance')) return 'ri-calendar-check-line';
+  return 'ri-book-open-line';
+}

@@ -1,0 +1,110 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { fetchCurriculumProgrammes, type CurriculumProgramme } from '@/lib/curriculumApi';
+import { useLiveRefresh } from '@/hooks/useRefreshOnReturn';
+
+type LoadOptions = {
+  silent?: boolean;
+  skipCache?: boolean;
+  revalidate?: boolean;
+  visibility?: 'all' | 'operational';
+};
+
+type UseCurriculumProgrammesOptions = {
+  skipCache?: boolean;
+  revalidate?: boolean;
+  visibility?: 'all' | 'operational';
+};
+
+export function useCurriculumProgrammes({ skipCache = false, revalidate = false, visibility }: UseCurriculumProgrammesOptions = {}) {
+  const [programmes, setProgrammes] = useState<CurriculumProgramme[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const requestIdRef = useRef(0);
+
+  const load = useCallback(async (signal?: AbortSignal, options: LoadOptions = {}) => {
+    const requestId = requestIdRef.current + 1;
+    requestIdRef.current = requestId;
+    if (!options.silent) setLoading(true);
+    try {
+      const programmeResult = await fetchCurriculumProgrammes(signal, { skipCache: options.skipCache ?? skipCache, revalidate: options.revalidate ?? revalidate, visibility: options.visibility ?? visibility });
+      if (signal?.aborted || requestId !== requestIdRef.current) return [];
+      setProgrammes(programmeResult);
+      setError(null);
+      return programmeResult;
+    } catch (err) {
+      if (signal?.aborted || requestId !== requestIdRef.current) return [];
+      setError(err instanceof Error ? err.message : 'Unable to load curriculum programmes');
+      return [];
+    } finally {
+      if (!options.silent && !signal?.aborted && requestId === requestIdRef.current) setLoading(false);
+    }
+  }, [skipCache, revalidate, visibility]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    // A caller may request revalidation for background refreshes, but the first
+    // paint should still use a warm client snapshot when one exists. The live
+    // refresh below CHANGE_MEly revalidates after focus/remote writes, and
+    // CHANGE_ME post-save reloads can still opt into skipCache.
+    void load(controller.signal, { revalidate: false });
+    return () => controller.abort();
+  }, [load]);
+
+  // Programmes are made in other places too -- the structure wizard, a second
+  // tab, a colleague on another machine -- and this list has no way to hear
+  // about those. `revalidate`, not `skipCache`: the server drops its payload
+  // cache on write, so the network already has the truth and there is nothing
+  // to gain from making it spend the multi-second rebuild on every tab switch.
+  useLiveRefresh(() => {
+    void load(undefined, { silent: true, revalidate: true, skipCache: false });
+  });
+
+  const removeProgramme = (id: string) => {
+    setProgrammes(prev => prev.filter(p => (p.sourceId || p.id) !== id));
+  };
+
+  // Archiving is not a delete: the row has to stay in state and flip to
+  // archived, or it leaves the active list without ever reaching the archive.
+  const markProgrammeArchived = (id: string) => {
+    setProgrammes(prev => prev.map(p => (
+      (p.sourceId || p.id) === id ? { ...p, isArchived: true, status: 'archived' } : p
+    )));
+  };
+
+  const markProgrammeRestored = (id: string) => {
+    setProgrammes(prev => prev.map(p => (
+      (p.sourceId || p.id) === id ? { ...p, isArchived: false, status: 'active' } : p
+    )));
+  };
+
+  /**
+   * Put a just-written programme on the list without waiting for the reload.
+   *
+   * The collection is rebuilt from several tables and can take seconds, so a
+   * create that only triggered a refetch left the page looking unchanged for
+   * long enough to read as "it didn't save". A new programme goes to the end,
+   * matching where the server's own ordering puts it once the reload behind
+   * this lands: the list reads newest-last, like any other list here.
+   */
+  const upsertProgramme = (programme: CurriculumProgramme) => {
+    const key = programme.sourceId || programme.id;
+    if (!key) return;
+    setProgrammes(prev => {
+      const known = prev.some(p => (p.sourceId || p.id) === key);
+      return known
+        ? prev.map(p => ((p.sourceId || p.id) === key ? { ...p, ...programme } : p))
+        : [...prev, programme];
+    });
+  };
+
+  return {
+    programmes,
+    loading,
+    error,
+    reload: (options?: LoadOptions) => load(undefined, options),
+    removeProgramme,
+    markProgrammeArchived,
+    markProgrammeRestored,
+    upsertProgramme,
+  };
+}

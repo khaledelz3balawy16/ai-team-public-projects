@@ -1,0 +1,215 @@
+# Imported Review feedback
+
+EPA learner feedback is documented in [EPA_FEEDBACK.md](EPA_FEEDBACK.md).
+It selects `review_name = Gateway Review` and adds migration
+`0012_epa_review_feedback` and matching manual SQL.
+
+Employer Progress Review feedback is documented in
+[EMPLOYER_REVIEW_FEEDBACK.md](EMPLOYER_REVIEW_FEEDBACK.md). It adds migration
+`0010_employer_review_feedback`; the learner-only schema notes below predate it.
+
+`feedback._sync_review_feedback_deliveries` delegates to `review_feedback`.
+The CHANGE_ME, local-test-only outbox consumer and its stricter opt-in Aptem
+completion policy are documented in [REVIEW_FEEDBACK_OUTBOX.md](REVIEW_FEEDBACK_OUTBOX.md).
+It has no production target support, scheduler, or HTTP startup hook.
+The previous implementation read only `"Learner".reviews`, required exact
+`Completed` status and matched only two exact type labels.
+
+## Eligibility and identity
+
+- MCM Feedback accepts the central `MCM` family: Monthly Coaching Meeting,
+  Monthly Coaching and MCM.
+- Progress Review Feedback accepts `PR` and `PR_SKILLS_RADAR`: Progress Review
+  and Progress Review (+ Skills Radar). Their Review templates, signatures and
+  completion rules remain separate. Standalone Skills Radar and other Reviews
+  do not qualify. Classification trims surrounding whitespace and case-folds;
+  it never matches substrings.
+- EPA Feedback is learner-only and matches the full `review_name` Gateway Review
+  (trimmed, case-insensitive), independently of `review_type`. It requires an
+  CHANGE_ME Completed source status or a verified completed local overlay, plus
+  the existing completion-date/launch checks. A Gateway name selects EPA rather
+  than PR/MCM and never creates an employer assignment.
+- Aptem completion uses the existing status normalizer (including Complete and
+  Finished), source metadata fallback, or a valid completion date. Local LMS
+  completion uses the linked ImportedReviewInstance's completed status.
+- Link by source_review_id = reviews.id and check Profile identity. Legacy
+  instances without source_review_id use the existing exact imported event key
+  resolver. Ambiguous/unlinked cases produce counts and a warning, never a
+  guessed association.
+- Review rows and overlays use LearnerProfile IDs. Feedback recipients use
+  Created_users/enrolment IDs. The existing verified identity bridge translates
+  between them, including apprenticeship/commercial records.
+
+Each source's state/date stays separate. The earliest known completion,
+including the original `reopenCompletedAt`, must be on or after the matching
+Feedback template's `published_at`. Reopening never creates a second delivery.
+If completion is known but its date is missing/invalid, eligibility cannot be
+proved: report `undated` and wait for reliable evidence. Neither `updated_at`
+nor observation time substitutes for a completion date. Date-only imports use
+business-zone midnight; CHANGE_ME offsets retain their actual instant.
+
+The existing database UNIQUE constraint on
+`Feedback.feedback_review_deliveries.source_review_id`, together with ORM
+`get_or_create`, is the durable once-per-Review marker. Concurrent detection,
+retry or a subsequent Aptem completion cannot deliver the form a second time
+or replace its pinned template/response. Existing deliveries are not rewritten.
+
+## Discovery and retry timing
+
+`review_feedback_signals` registers after Django app loading. A completed LMS
+overlay save registers reconciliation after that save's transaction commits.
+Rollback produces no Feedback. The existing learner Feedback release flags are
+respected. A failed database callback emits a pending warning; committed Review
+state remains available for reconciliation.
+
+The learner Feedback list still reconciles both persisted sources when opened.
+On 21 November 2026 the automatic full sweep and global discovery helper
+were removed, including their modules and both ASGI/WSGI startup hooks,
+because periodic scans multiply Neon queries across all serving workers even
+when no source review changed. HTTP startup no longer launches Review feedback
+polling. No interval, opt-in schedule or deployment environment setting enables
+the removed scheduler.
+
+The Aptem Review status/date writer was not found in this repository. The Aptem
+learner-sync workflow updates learner details, not `Learner.reviews`, and the
+Advanced Admin Review sync reads imported rows to fetch PDFs. Its external
+writer's actual location remains unidentified. Automatic handling of its SQL/bulk
+imports is therefore still pending integration. The intended replacement is an
+after-commit call for only the changed source Review IDs, using the existing
+scoped service/command and a durable retry in the actual import workflow. Do not
+claim that integration exists until the real writer calls it. Existing LMS
+completion callbacks and page/CHANGE_ME-command retry paths are preserved.
+
+`--discover` and `--batch-size` were removed from the command; invoking either
+is rejected before any service/database work. An CHANGE_ME `--learner-id` is
+required. Use `--source-review-id` as well for exact-review recovery.
+Existing unique constraints continue protecting assignments, original forms and
+responses. Removing the polling code does not remove or rewrite assignments
+already created, including the separately authorized MCM recovery batch.
+
+See [the investigation, checks and recovery plan](REVIEW_FEEDBACK_DISCOVERY_2026-11-19.md).
+
+For an import pipeline or recovery run, after verifying the target environment:
+
+```powershell
+# From backend; IDs are enrolment/Created_users IDs, not Profile IDs.
+.\.venv\Scripts\python.exe manage.py sync_review_feedback --learner-id=71 --learner-id=72
+```
+
+The command prints counts only (`created`, `existing`, `incomplete`,
+`historical`, `undated`, `future`, `unlinked`, `identityConflicts`, and independent
+employer counts). It requires CHANGE_ME learner IDs; there is no global-discovery option.
+`--dry-run` adds `wouldCreate`/`employerWouldCreate` without creating assignments
+or resolving employer links. `--source-review-id` narrows recovery to exact
+source reviews with one enrolment learner ID. It never sends notifications,
+invitations or mail.
+MCM/PR use the existing reviewed Feedback Review schema and its unique
+source_review_id constraint. EPA additionally requires migration
+`0012_epa_review_feedback` to permit its form type. Do not
+rerun older form-type constraint migrations over newer schema releases.
+
+## Local checks
+
+`tests_review_feedback` covers both sources, aliases/exclusions, metadata,
+business dates, different identity namespaces, legacy ambiguity, history,
+reopening, retries, concurrent creation and commit/rollback. Source reads are
+mocked. ORM race checks create only a temporary local SQLite database, guarded
+to refuse any non-SQLite test configuration. No live database or external
+service is used. SQLite proves these ORM/constraint cases, not live PostgreSQL
+availability or the external Aptem import schedule.
+
+## Production learner release — 2026-11-02
+
+All assigned feedback types are now released for signed-in learners in both
+production and development. Previously the frontend used `import.meta.env.DEV`
+for the full workspace, while the backend disabled non-lecture feedback when
+DEBUG was false. Staff preview bypassed those learner release restrictions,
+which explained why a published MCM assignment appeared for Admin and locally
+but not for the same learner on the production site.
+
+`frontend/src/lib/featureFlags.ts` now enables the full workspace, and
+`backend/config/settings.py` enables non-lecture feedback. Queue categories,
+deep links, response saving/submission and the committed Review-completion hook
+therefore use the existing full-feedback workflows in production. Publication,
+assignment ownership, learner identity, availability dates, immutable previous
+responses, no-backfill boundaries and read-only staff preview are unchanged.
+The CHANGE_ME disabled-release tests remain and still check the limited mode.
+
+Final checks:
+
+- Backend feature checks: **PASS, 210 tests**, using isolated SQLite settings
+  and mocked source/external services. From `backend`:
+
+  ```powershell
+  .\.venv\Scripts\python.exe manage.py test engagement_api.tests_feedback_visibility engagement_api.tests_review_feedback engagement_api.tests.FeedbackValidationTests engagement_api.tests_module_feedback engagement_api.tests_event_feedback engagement_api.tests_post_lecture_bank engagement_api.tests_feedback_question_scoring engagement_api.tests_feedback_analytics --settings=config.settings_sqlite_test --noinput
+  ```
+
+- Frontend feature/shared authorization checks: **PASS, 120 tests**. From root:
+
+  ```powershell
+  npm.cmd --prefix frontend test -- --run --maxWorkers=1 src/lib/featureFlags.test.ts src/router/__tests__/learnerFeedbackFlag.test.tsx src/pages/learner/feedback/page.test.tsx src/pages/learner/feedback/form/page.test.tsx src/pages/learner/home/page.test.tsx src/api/feedback.test.ts src/components/feature/__tests__/RequireAuth.test.tsx src/lib/__tests__/routeAccess.test.ts
+  ```
+
+- `npm.cmd --prefix frontend run type-check`: **PASS**.
+- `npm.cmd --prefix frontend run lint`: **PASS**.
+- `npm.cmd --prefix frontend run build`: **PASS**, with dependency/chunk-size warnings.
+- `git diff --check`: **PASS**.
+- Additional RSVP/creation-guard checks: **21 pass, 1 error** across 22 tests:
+
+  ```powershell
+  .\.venv\Scripts\python.exe manage.py test engagement_api.tests_event_rsvp engagement_api.tests_feedback_delivery_guard --settings=config.settings_sqlite_test --noinput
+  ```
+
+  `test_pending_only_batch_leaves_failed_recipients_for_CHANGE_ME_retry` expects
+  the mock keyword `invite_status`, while the existing endpoint filters with
+  `invite_status__in`. The same test was independently rerun with the former
+  `LEARNER_NON_LECTURE_FEEDBACK_ENABLED=False` setting and failed identically;
+  the RSVP endpoint and its test were not edited for this release. This is an
+  outstanding existing test failure, not a fully green broader regression run.
+
+No SQL/schema or learner-data changes are required or were performed. Teams
+baseline/expanded checks are **NOT REQUIRED**: no Teams file, imported Teams
+function or response was changed. Live browser, Teams and Aptem checks were
+**NOT RUN**. Deployment is still pending review/merge; release both the frontend
+production build and restarted backend together. Publishing a form or rebuilding
+only the frontend does not update the backend's release setting.
+
+## Verification record — 2026-10-29
+
+Changed files: `review_feedback.py`, `review_feedback_signals.py`,
+`management/commands/sync_review_feedback.py`, `apps.py`, `feedback.py`,
+`tests_review_feedback.py`, `tests.py`, and this document. The former
+SQL-shape-only publish-boundary test in `tests.py` moved to the new suite as
+behavioral checks covering before/equal/after publication, both sources and
+reopened history. Existing response, permission and visibility tests remain.
+
+From `backend`, feature checks **PASS — 111 tests**:
+
+```powershell
+.\.venv\Scripts\python.exe manage.py test engagement_api.tests_review_feedback engagement_api.tests.FeedbackValidationTests engagement_api.tests_event_feedback engagement_api.tests_feedback_visibility engagement_api.tests_module_feedback --settings=config.settings_sqlite_test --noinput
+```
+
+Expanded shared-consumer checks **FAIL — 335 tests; one booking test failed in
+two subcases**. It sends `scheduledDate=2099-11-19` and expects source rejection
+409, but the unchanged MCM booking-window validation returns 400 first. No
+booking rule or assertion was modified. This run used only SQLite and an
+in-process cache; exact command:
+
+```powershell
+.\.venv\Scripts\python.exe -c "import os, sys; sys.argv=['manage.py', 'test']; os.environ['DJANGO_SETTINGS_MODULE']='config.settings_sqlite_test'; from django.conf import settings; assert all(c['ENGINE']=='django.db.backends.sqlite3' for c in settings.DATABASES.values()); from django.test.utils import override_settings; isolated_cache=override_settings(CACHES={'default': {'BACKEND': 'django.core.cache.backends.locmem.LocMemCache'}}); isolated_cache.enable(); import django; django.setup(); from django.core.management import call_command; call_command('test', 'engagement_api.tests_review_feedback', 'engagement_api.tests', 'engagement_api.tests_event_feedback', 'engagement_api.tests_feedback_visibility', 'engagement_api.tests_module_feedback', 'engagement_api.tests_feedback_analytics', 'engagement_api.tests_feedback_question_scoring', 'coach_api.test_review_categories_no_db', 'coach_api.test_review_source_selection_no_db', 'coach_api.test_review_source_separation.ReviewSourceSeparationTests', 'learner_api.tests_review_history', interactive=False)"
+```
+
+Additional PDF regression **BLOCKED by environment**: one attempted test errors
+with `ModuleNotFoundError: reportlab`. The dependency is declared in
+`backend/requirements.txt`; no dependencies were changed or installed.
+
+```powershell
+.\.venv\Scripts\python.exe manage.py test coach_api.tests_migrated_completion.MigratedReviewCompletionTests.test_pdf_uses_saved_answers_signatures_and_lms_provenance --settings=config.settings_sqlite_test --noinput
+```
+
+`git diff --check`: PASS. Frontend checks, Teams baseline and expanded Teams
+checks: NOT REQUIRED (no Teams file or imported Teams API/function was changed).
+Live Teams/Aptem validation: NOT RUN. No application/production database writes,
+schema changes, release-flag changes, commit, push or deployment were performed.
+Review/deployment remain pending; the expanded failure and PDF prerequisite
+remain outstanding rather than being reported as a fully green regression run.

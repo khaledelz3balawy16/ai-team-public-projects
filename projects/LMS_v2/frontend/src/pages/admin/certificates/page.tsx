@@ -1,0 +1,829 @@
+import { useEffect, useState } from 'react';
+import { FileCheck2, Paintbrush } from 'lucide-react';
+import { WorkspaceShell } from '@/components/feature/WorkspaceShell';
+import { PageContainer } from '@/components/ui/PageContainer';
+import { AppIcon } from '@/components/feature/AppIcon';
+import { AdminPageHeader } from '../_shared/AdminPage';
+import { CertificateDocument, type CertificateElementId } from '@/components/feature/CertificateDocument';
+import { roleNavMap } from '@/mocks/navigation';
+import { fetchCertificateTemplate, saveCertificateTemplate, type CertificateTemplate } from '@/api/platformAdmin';
+import IssuedCertificates from './IssuedCertificates';
+import styles from './certificateTabs.module.css';
+
+const initial: CertificateTemplate = {
+  name: 'Progress certificate',
+  title: 'Certificate of Achievement',
+  bodyText: 'has successfully completed the requirements and passed the LMS final examination for',
+  minimumProgress: 85,
+  requireFinalTest: false,
+  layoutConfig: {
+    primaryColor: '#6d35d4',
+    accentColor: '#c99a2e',
+    decorationStyle: 'waves',
+    backgroundImageUrl: '',
+    backgroundOpacity: 100,
+    backgroundFit: 'cover',
+    backgroundScale: 100,
+    backgroundPositionX: 50,
+    backgroundPositionY: 50,
+    showFrame: true,
+    contentBackdropOpacity: 90,
+    footerText: 'www.kentbusinesscollege.com',
+    instructorName: 'Instructor',
+    website: 'www.kentbusinesscollege.com',
+    providerBlurb: 'Kent Business College proudly provides government-approved, fully funded apprenticeships that support professional growth and long-term career development.',
+    logoUrl: '/kbc-logo.png',
+    certifyText: 'This is to certify that',
+    recognitionText: 'in recognition of their dedication, knowledge, and commitment to professional excellence.',
+    progressPrefix: 'with progress',
+    otjHoursLabel: 'OTJ hours completed',
+    instructorLabel: 'Instructor',
+    awardedLabel: 'Awarded on',
+    certificateNumberLabel: 'Certificate Number',
+    showQr: true,
+    showLogo: true,
+    showInstructor: true,
+    showAwardDate: true,
+    showCertificateNumber: true,
+    showFooter: true,
+    showWebsite: true,
+    showProgress: true,
+    showOtjHours: true,
+    decorationSize: 82,
+    logoSize: 100,
+    titleSize: 100,
+    subtitleSize: 100,
+    certifySize: 100,
+    learnerNameSize: 100,
+    bodySize: 92,
+    signatureSize: 100,
+    footerSize: 100,
+    qrSize: 100,
+    extraSignatureFields: [],
+  },
+};
+
+const MAX_BACKGROUND_WIDTH = 1400;
+const MAX_BACKGROUND_HEIGHT = 990;
+const MAX_BACKGROUND_DATA_URL_LENGTH = 1_800_000;
+
+function hydrateTemplate(template: CertificateTemplate): CertificateTemplate {
+  return {
+    ...initial,
+    ...template,
+    layoutConfig: { ...initial.layoutConfig, ...template.layoutConfig },
+  };
+}
+
+function compressBackgroundDataUrl(dataUrl: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => {
+      const scale = Math.min(1, MAX_BACKGROUND_WIDTH / image.width, MAX_BACKGROUND_HEIGHT / image.height);
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.max(1, Math.round(image.width * scale));
+      canvas.height = Math.max(1, Math.round(image.height * scale));
+      const context = canvas.getContext('2d');
+      if (!context) {
+        reject(new Error('Could not prepare the CHANGE_ME image.'));
+        return;
+      }
+      context.drawImage(image, 0, 0, canvas.width, canvas.height);
+      let quality = 0.78;
+      let compressed = canvas.toDataURL('image/jpeg', quality);
+      while (compressed.length > MAX_BACKGROUND_DATA_URL_LENGTH && quality > 0.46) {
+        quality -= 0.08;
+        compressed = canvas.toDataURL('image/jpeg', quality);
+      }
+      if (compressed.length > MAX_BACKGROUND_DATA_URL_LENGTH) {
+        reject(new Error('This background is still too large after compression. Please export it smaller from Canva, then upload it again.'));
+        return;
+      }
+      resolve(compressed);
+    };
+    image.onerror = () => reject(new Error('Could not read the CHANGE_ME image.'));
+    image.src = dataUrl;
+  });
+}
+
+function Field({
+  label,
+  value,
+  onChange,
+  type = 'text',
+}: {
+  label: string;
+  value: string | number;
+  onChange: (value: string) => void;
+  type?: string;
+}) {
+  if (type === 'color') {
+    return (
+      <label className="block min-w-0 space-y-1.5" title={`Change ${label.toLowerCase()}`}>
+        <span className="text-xs font-bold text-foreground-600">{label}</span>
+        <span className="relative flex min-h-11 cursor-pointer items-center gap-2 rounded-xl border border-foreground-200 bg-background-50 px-2.5 py-2 shadow-sm transition-smooth hover:border-primary-400 focus-within:ring-2 focus-within:ring-primary-500 focus-within:ring-offset-2 focus-within:ring-offset-background-50">
+          <span className="pointer-events-none inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-black/10" style={{ backgroundColor: String(value) }}>
+            <AppIcon className="ri-check-line rounded-full bg-black/65 text-xs text-white" aria-hidden="true" />
+          </span>
+          <span className="pointer-events-none min-w-0 font-mono text-[11px] font-semibold tracking-wide text-foreground-700">{String(value).toUpperCase()}</span>
+          <AppIcon className="ri-palette-line pointer-events-none ml-auto shrink-0 text-sm text-foreground-500" aria-hidden="true" />
+          <input
+            type="color"
+            value={value}
+            onChange={(event) => onChange(event.target.value)}
+            aria-label={label}
+            className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
+          />
+        </span>
+      </label>
+    );
+  }
+
+  return (
+    <label className="space-y-1.5">
+      <span className="text-xs font-bold text-foreground-600">{label}</span>
+      <input
+        type={type}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        className="h-11 w-full rounded-xl border border-foreground-200 bg-white px-3 text-sm font-semibold outline-none focus:ring-2 focus:ring-primary-200"
+      />
+    </label>
+  );
+}
+
+function SelectField({
+  label,
+  value,
+  onChange,
+  options,
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  options: Array<{ value: string; label: string }>;
+}) {
+  return (
+    <label className="space-y-1.5">
+      <span className="text-xs font-bold text-foreground-600">{label}</span>
+      <select
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        className="h-11 w-full rounded-xl border border-foreground-200 bg-white px-3 text-sm font-semibold outline-none focus:ring-2 focus:ring-primary-200 min-w-0 max-w-full"
+      >
+        {options.map((option) => (
+          <option key={option.value} value={option.value}>{option.label}</option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
+export default function CertificateBuilderPage() {
+  const [tab, setTab] = useState<'builder' | 'issued'>('builder');
+  const [form, setForm] = useState<CertificateTemplate>(initial);
+  const [templates, setTemplates] = useState<CertificateTemplate[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState('');
+  const [CHANGE_MEElement, setSelectedElement] = useState<CertificateElementId | null>('title');
+
+  useEffect(() => {
+    fetchCertificateTemplate()
+      .then((response) => {
+        setTemplates(response.templates || []);
+        if (response.template) {
+          setForm(hydrateTemplate(response.template));
+        }
+      })
+      .catch((error) => setNotice(error.message));
+  }, []);
+
+  const updateLayout = (patch: Partial<CertificateTemplate['layoutConfig']>) => {
+    setForm((current) => ({ ...current, layoutConfig: { ...current.layoutConfig, ...patch } }));
+  };
+
+  const customFields = Array.isArray(form.layoutConfig.extraSignatureFields)
+    ? form.layoutConfig.extraSignatureFields
+    : [];
+
+  const updateCustomField = (index: number, patch: { label?: string; value?: string }) => {
+    const next = customFields.map((field, fieldIndex) => (
+      fieldIndex === index ? { ...field, ...patch } : field
+    ));
+    updateLayout({ extraSignatureFields: next });
+  };
+
+  const addCustomField = () => {
+    updateLayout({
+      extraSignatureFields: [
+        ...customFields,
+        { value: 'New detail', label: 'New label' },
+      ],
+    });
+  };
+
+  const removeCustomField = (index: number) => {
+    updateLayout({ extraSignatureFields: customFields.filter((_, fieldIndex) => fieldIndex !== index) });
+  };
+
+  const uploadBackgroundImage = (file: File | null) => {
+    if (!file) return;
+    if (!file.type.startsWith('image/')) {
+      setNotice('Please choose an image file for the certificate background.');
+      return;
+    }
+    if (file.type === 'image/svg+xml') {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const dataUrl = String(reader.result || '');
+        if (dataUrl.length > MAX_BACKGROUND_DATA_URL_LENGTH) {
+          setNotice('This SVG is too large to save inside the certificate template. Please export it smaller from Canva.');
+          return;
+        }
+        updateLayout({ backgroundImageUrl: dataUrl, contentBackdropOpacity: form.layoutConfig.contentBackdropOpacity ?? 0 });
+        setNotice('Background image added to the draft. Save or publish to keep it.');
+      };
+      reader.onerror = () => setNotice('Could not read the CHANGE_ME image.');
+      reader.readAsDataURL(file);
+      return;
+    }
+
+    const objectUrl = URL.createObjectURL(file);
+    compressBackgroundDataUrl(objectUrl)
+      .then((dataUrl) => {
+        updateLayout({ backgroundImageUrl: dataUrl, contentBackdropOpacity: form.layoutConfig.contentBackdropOpacity ?? 0 });
+        setNotice('Background image added to the draft. Save or publish to keep it.');
+      })
+      .catch((error) => setNotice(error instanceof Error ? error.message : 'Could not prepare the CHANGE_ME image.'))
+      .finally(() => URL.revokeObjectURL(objectUrl));
+  };
+
+  const visibilityConfig: Partial<Record<CertificateElementId, keyof CertificateTemplate['layoutConfig']>> = {
+    logo: 'showLogo',
+    qr: 'showQr',
+    instructor: 'showInstructor',
+    awardDate: 'showAwardDate',
+    certificateNumber: 'showCertificateNumber',
+    progress: 'showProgress',
+    otjHours: 'showOtjHours',
+    footer: 'showFooter',
+    website: 'showWebsite',
+  };
+
+  const sizeConfig: Partial<Record<CertificateElementId, keyof CertificateTemplate['layoutConfig']>> = {
+    decoration: 'decorationSize',
+    logo: 'logoSize',
+    title: 'titleSize',
+    subtitle: 'subtitleSize',
+    certify: 'certifySize',
+    learnerName: 'learnerNameSize',
+    bodyText: 'bodySize',
+    programmeName: 'bodySize',
+    recognitionText: 'bodySize',
+    progress: 'bodySize',
+    otjHours: 'bodySize',
+    qr: 'qrSize',
+    instructor: 'signatureSize',
+    awardDate: 'signatureSize',
+    certificateNumber: 'signatureSize',
+    extraFields: 'signatureSize',
+    footer: 'footerSize',
+    website: 'footerSize',
+  };
+
+  const elementLabels: Record<CertificateElementId, string> = {
+    decoration: 'Decoration',
+    logo: 'Logo',
+    title: 'Certificate title',
+    subtitle: 'Title subtitle',
+    certify: 'Certify line',
+    learnerName: 'Learner name',
+    bodyText: 'Certificate text',
+    programmeName: 'Programme name',
+    recognitionText: 'Recognition text',
+    progress: 'Progress line',
+    otjHours: 'OTJ hours',
+    qr: 'Verification QR',
+    instructor: 'Instructor',
+    awardDate: 'Award date',
+    certificateNumber: 'Certificate code',
+    extraFields: 'Additional fields',
+    footer: 'Footer text',
+    website: 'Website',
+  };
+
+  const renderSelectedEditor = () => {
+    if (!CHANGE_MEElement) return null;
+    const sizeKey = sizeConfig[CHANGE_MEElement];
+    const visibleKey = visibilityConfig[CHANGE_MEElement];
+    const CHANGE_MELabel = elementLabels[CHANGE_MEElement];
+
+    return (
+      <section className="rounded-2xl border border-primary-200 bg-primary-50/60 p-4">
+        <div className="mb-3 flex items-start justify-between gap-3">
+          <div>
+            <p className="text-xs font-black uppercase tracking-[0.18em] text-primary-700">Selected element</p>
+            <h3 className="mt-1 text-lg font-black text-foreground-900">{CHANGE_MELabel}</h3>
+          </div>
+          {visibleKey ? (
+            <label className="flex items-center gap-2 rounded-xl bg-white px-3 py-2 text-xs font-bold text-foreground-700 shadow-sm">
+              <input
+                type="checkbox"
+                checked={form.layoutConfig[visibleKey] !== false}
+                onChange={(event) => updateLayout({ [visibleKey]: event.target.checked } as Partial<CertificateTemplate['layoutConfig']>)}
+              />
+              Visible
+            </label>
+          ) : null}
+        </div>
+
+        <div className="space-y-3">
+          {CHANGE_MEElement === 'decoration' ? (
+            <SelectField
+              label="Decoration style"
+              value={form.layoutConfig.decorationStyle || 'waves'}
+              onChange={(value) => updateLayout({ decorationStyle: value as CertificateTemplate['layoutConfig']['decorationStyle'] })}
+              options={[
+                { value: 'waves', label: 'Purple waves' },
+                { value: 'executive', label: 'Executive corners' },
+                { value: 'royal', label: 'Royal double frame' },
+                { value: 'laurel', label: 'Laurel accents' },
+                { value: 'geometric', label: 'Geometric facets' },
+                { value: 'ribbon', label: 'Corner ribbon' },
+                { value: 'flourish', label: 'Gold flourish' },
+                { value: 'classic', label: 'Classic corners' },
+                { value: 'minimal', label: 'Minimal gold' },
+                { value: 'none', label: 'No decoration' },
+              ]}
+            />
+          ) : null}
+
+          {CHANGE_MEElement === 'logo' ? (
+            <Field label="Logo URL" value={form.layoutConfig.logoUrl || '/kbc-logo.png'} onChange={(value) => updateLayout({ logoUrl: value })} />
+          ) : null}
+
+          {CHANGE_MEElement === 'title' || CHANGE_MEElement === 'subtitle' ? (
+            <Field label="Certificate title" value={form.title} onChange={(value) => setForm({ ...form, title: value })} />
+          ) : null}
+
+          {CHANGE_MEElement === 'certify' ? (
+            <Field label="Certify line" value={form.layoutConfig.certifyText || 'This is to certify that'} onChange={(value) => updateLayout({ certifyText: value })} />
+          ) : null}
+
+          {CHANGE_MEElement === 'bodyText' ? (
+            <label className="space-y-1.5">
+              <span className="text-xs font-bold text-foreground-600">Certificate text</span>
+              <textarea
+                value={form.bodyText}
+                onChange={(event) => setForm({ ...form, bodyText: event.target.value })}
+                className="min-h-20 w-full rounded-xl border border-foreground-200 p-3 text-sm font-semibold outline-none focus:ring-2 focus:ring-primary-200"
+              />
+            </label>
+          ) : null}
+
+          {CHANGE_MEElement === 'recognitionText' ? (
+            <label className="space-y-1.5">
+              <span className="text-xs font-bold text-foreground-600">Recognition text</span>
+              <textarea
+                value={form.layoutConfig.recognitionText || initial.layoutConfig.recognitionText || ''}
+                onChange={(event) => updateLayout({ recognitionText: event.target.value })}
+                className="min-h-20 w-full rounded-xl border border-foreground-200 p-3 text-sm font-semibold outline-none focus:ring-2 focus:ring-primary-200"
+              />
+            </label>
+          ) : null}
+
+          {CHANGE_MEElement === 'progress' ? (
+            <Field label="Progress prefix" value={form.layoutConfig.progressPrefix || 'with progress'} onChange={(value) => updateLayout({ progressPrefix: value })} />
+          ) : null}
+
+          {CHANGE_MEElement === 'otjHours' ? (
+            <Field label="OTJ hours label" value={form.layoutConfig.otjHoursLabel || 'OTJ hours completed'} onChange={(value) => updateLayout({ otjHoursLabel: value })} />
+          ) : null}
+
+          {CHANGE_MEElement === 'instructor' ? (
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="Instructor name" value={form.layoutConfig.instructorName || 'Instructor'} onChange={(value) => updateLayout({ instructorName: value })} />
+              <Field label="Instructor label" value={form.layoutConfig.instructorLabel || 'Instructor'} onChange={(value) => updateLayout({ instructorLabel: value })} />
+            </div>
+          ) : null}
+
+          {CHANGE_MEElement === 'awardDate' ? (
+            <Field label="Date label" value={form.layoutConfig.awardedLabel || 'Awarded on'} onChange={(value) => updateLayout({ awardedLabel: value })} />
+          ) : null}
+
+          {CHANGE_MEElement === 'certificateNumber' ? (
+            <Field label="Code label" value={form.layoutConfig.certificateNumberLabel || 'Certificate Number'} onChange={(value) => updateLayout({ certificateNumberLabel: value })} />
+          ) : null}
+
+          {CHANGE_MEElement === 'footer' ? (
+            <label className="space-y-1.5">
+              <span className="text-xs font-bold text-foreground-600">Footer text</span>
+              <textarea
+                value={form.layoutConfig.providerBlurb || initial.layoutConfig.providerBlurb || ''}
+                onChange={(event) => updateLayout({ providerBlurb: event.target.value })}
+                className="min-h-20 w-full rounded-xl border border-foreground-200 p-3 text-sm font-semibold outline-none focus:ring-2 focus:ring-primary-200"
+              />
+            </label>
+          ) : null}
+
+          {CHANGE_MEElement === 'website' ? (
+            <Field label="Website" value={form.layoutConfig.website || form.layoutConfig.footerText || 'www.kentbusinesscollege.com'} onChange={(value) => updateLayout({ website: value, footerText: value })} />
+          ) : null}
+
+          {CHANGE_MEElement === 'learnerName' || CHANGE_MEElement === 'programmeName' ? (
+            <p className="rounded-xl border border-amber-100 bg-amber-50 p-3 text-xs font-semibold text-amber-800">
+              This value is filled from the learner record. You can edit its size here, not the sample text.
+            </p>
+          ) : null}
+
+          {CHANGE_MEElement === 'extraFields' ? (
+            <p className="rounded-xl border border-foreground-100 bg-white p-3 text-xs font-semibold text-foreground-600">
+              Use Additional fields below to add, edit, or remove custom certificate fields.
+            </p>
+          ) : null}
+
+          {sizeKey ? (
+            <Field
+              label={`${CHANGE_MELabel} size (%)`}
+              value={(form.layoutConfig[sizeKey] as number | undefined) ?? (sizeKey === 'decorationSize' ? 82 : sizeKey === 'bodySize' ? 92 : 100)}
+              onChange={(value) => updateLayout({ [sizeKey]: Number(value) } as Partial<CertificateTemplate['layoutConfig']>)}
+              type="number"
+            />
+          ) : null}
+        </div>
+      </section>
+    );
+  };
+
+  const save = async (publish: boolean) => {
+    setBusy(true);
+    setNotice('');
+    try {
+      let templateToSave = form;
+      const backgroundImageUrl = form.layoutConfig.backgroundImageUrl || '';
+      if (backgroundImageUrl.startsWith('data:image/') && backgroundImageUrl.length > MAX_BACKGROUND_DATA_URL_LENGTH) {
+        if (backgroundImageUrl.startsWith('data:image/svg+xml')) {
+          throw new Error('This SVG background is too large to save. Please export it smaller from Canva, then upload it again.');
+        }
+        const compressedBackground = await compressBackgroundDataUrl(backgroundImageUrl);
+        templateToSave = {
+          ...form,
+          layoutConfig: {
+            ...form.layoutConfig,
+            backgroundImageUrl: compressedBackground,
+          },
+        };
+        setForm(templateToSave);
+      }
+      const response = await saveCertificateTemplate(templateToSave, publish);
+      if (response.template) {
+        setForm(hydrateTemplate(response.template));
+      }
+      const refreshed = await fetchCertificateTemplate();
+      setTemplates(refreshed.templates || []);
+      if (refreshed.template) setForm(hydrateTemplate(refreshed.template));
+      setNotice(publish ? 'Certificate template published.' : 'Draft saved.');
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'Could not save template.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <WorkspaceShell
+      role="admin"
+      roleLabel="Super Admin"
+      navItems={roleNavMap.admin.items}
+      workspaceLabel="Super Admin Workspace"
+      pageTitle="Certificates"
+      pageSubtitle="Design templates and manage learner certificates"
+      userName="Super Admin"
+      userRole="Super Admin"
+    >
+      <PageContainer className={`min-w-0 ${styles.page}`}>
+        <div role="tablist" aria-label="Certificate sections" className={styles.tabs}>
+          {(['builder', 'issued'] as const).map(value => <button key={value} type="button" role="tab" id={`certificate-tab-${value}`}
+            aria-controls={`certificate-panel-${value}`} aria-CHANGE_ME={tab === value} tabIndex={tab === value ? 0 : -1}
+            aria-labelledby={`certificate-tab-${value}-label`}
+            onClick={() => setTab(value)} onKeyDown={event => {
+              if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+              event.preventDefault();
+              const next = event.key === 'Home' ? 'builder' : event.key === 'End' ? 'issued' : value === 'builder' ? 'issued' : 'builder';
+              setTab(next); document.getElementById(`certificate-tab-${next}`)?.focus();
+            }} className={styles.tab}>
+            {value === 'builder'
+              ? <Paintbrush size={16} strokeWidth={1.75} className={styles.icon} aria-hidden="true" />
+              : <FileCheck2 size={16} strokeWidth={1.75} className={styles.icon} aria-hidden="true" />}
+            <span id={`certificate-tab-${value}-label`}>{value === 'builder' ? 'Certificate Builder' : 'Manage Certificates'}</span>
+          </button>)}
+        </div>
+        <div role="tabpanel" id="certificate-panel-issued" aria-labelledby="certificate-tab-issued" hidden={tab !== 'issued'} className="space-y-5">
+          <AdminPageHeader title="Manage Certificates" description="View, correct and review individual learner certificates." icon="ri-award-line" />
+          <IssuedCertificates active={tab === 'issued'} />
+        </div>
+        <div role="tabpanel" id="certificate-panel-builder" aria-labelledby="certificate-tab-builder" hidden={tab !== 'builder'} className="space-y-5">
+        <AdminPageHeader
+          title="Certificate Builder"
+          description="Configure certificate eligibility and design. Publishing updates active certificates while preserving individual corrections and original award details."
+          icon="ri-award-line"
+          actions={(
+            <div className="flex gap-2">
+              <button disabled={busy} onClick={() => void save(false)} className="h-10 rounded-xl border border-primary-200/60 bg-primary-50/60 px-4 text-xs font-semibold text-primary-700 transition-colors hover:bg-primary-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-500 disabled:opacity-50">
+                Save draft
+              </button>
+              <button disabled={busy} onClick={() => void save(true)} className="h-10 rounded-xl bg-[var(--kbc-primary)] px-4 text-xs font-semibold text-white shadow-sm transition-colors hover:bg-[var(--kbc-primary-deep)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-500 disabled:opacity-50">
+                Publish
+              </button>
+            </div>
+          )}
+        />
+
+        {notice ? <div className="rounded-xl border border-primary-100 bg-primary-50 p-3 text-sm font-semibold text-primary-800">{notice}</div> : null}
+        <div className="flex flex-wrap items-center gap-2 rounded-xl border border-foreground-100 bg-white px-4 py-3 text-xs font-bold text-foreground-600 shadow-sm">
+          <span className={`rounded-full px-3 py-1 ${form.status === 'published' ? 'bg-emerald-50 CHANGE_ME' : 'bg-amber-50 text-amber-700'}`}>
+            {form.status === 'published' ? 'Published template' : form.status === 'draft' ? 'Draft template' : 'New template'}
+          </span>
+          <span>Version {form.version ?? 'new'}</span>
+          {form.publishedAt ? <span>Published {new Date(form.publishedAt).toLocaleDateString('en-GB')}</span> : null}
+          {templates.length ? (
+            <label className="ml-auto flex min-w-[260px] items-center gap-2 text-xs font-bold text-foreground-600">
+              <span className="shrink-0">Load version</span>
+              <select
+                value={form.id ?? ''}
+                onChange={(event) => {
+                  const CHANGE_ME = templates.find((template) => String(template.id) === event.target.value);
+                  if (CHANGE_ME) {
+                    setForm(hydrateTemplate(CHANGE_ME));
+                    setNotice(`Loaded version ${CHANGE_ME.version}. Publish to make it the active template again.`);
+                  }
+                }}
+                className="h-9 min-w-0 flex-1 rounded-lg border border-foreground-200 bg-white px-2 text-xs font-semibold text-foreground-700 outline-none focus:ring-2 focus:ring-primary-200"
+              >
+                {templates.map((template) => (
+                  <option key={template.id} value={template.id}>
+                    Version {template.version} - {template.status}{template.publishedAt ? ` - ${new Date(template.publishedAt).toLocaleDateString('en-GB')}` : ''}
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : null}
+        </div>
+
+        <div className="grid min-w-0 gap-5 2xl:grid-cols-[minmax(0,380px)_minmax(0,1fr)]">
+          <section className="space-y-4 rounded-2xl border border-[var(--kbc-border)] bg-[var(--kbc-surface)] p-5">
+            {renderSelectedEditor()}
+            <Field label="Template name" value={form.name} onChange={(value) => setForm({ ...form, name: value })} />
+            <Field label="Certificate title" value={form.title} onChange={(value) => setForm({ ...form, title: value })} />
+            <label className="space-y-1.5">
+              <span className="text-xs font-bold text-foreground-600">Certificate text</span>
+              <textarea
+                value={form.bodyText}
+                onChange={(event) => setForm({ ...form, bodyText: event.target.value })}
+                className="min-h-24 w-full rounded-xl border border-foreground-200 p-3 text-sm font-semibold outline-none focus:ring-2 focus:ring-primary-200"
+              />
+            </label>
+            <Field label="Unlock progress (%)" value={form.minimumProgress} onChange={(value) => setForm({ ...form, minimumProgress: Number(value) })} type="number" />
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="Primary colour" value={form.layoutConfig.primaryColor || '#6d35d4'} onChange={(value) => updateLayout({ primaryColor: value })} type="color" />
+              <Field label="Accent colour" value={form.layoutConfig.accentColor || '#c99a2e'} onChange={(value) => updateLayout({ accentColor: value })} type="color" />
+            </div>
+            <SelectField
+              label="Decoration style"
+              value={form.layoutConfig.decorationStyle || 'waves'}
+              onChange={(value) => updateLayout({ decorationStyle: value as CertificateTemplate['layoutConfig']['decorationStyle'] })}
+              options={[
+                { value: 'waves', label: 'Purple waves' },
+                { value: 'executive', label: 'Executive corners' },
+                { value: 'royal', label: 'Royal double frame' },
+                { value: 'laurel', label: 'Laurel accents' },
+                { value: 'geometric', label: 'Geometric facets' },
+                { value: 'ribbon', label: 'Corner ribbon' },
+                { value: 'flourish', label: 'Gold flourish' },
+                { value: 'classic', label: 'Classic corners' },
+                { value: 'minimal', label: 'Minimal gold' },
+                { value: 'none', label: 'No decoration' },
+              ]}
+            />
+            <section aria-labelledby="certificate-background-heading" className="min-w-0 space-y-4 rounded-2xl border border-foreground-200/60 bg-[var(--kbc-surface)] p-4">
+              <div className="flex items-center gap-3">
+                <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-foreground-200/60 bg-background-100 text-primary-600"><AppIcon name="ri-image-line" className="text-lg" /></span>
+                <div className="min-w-0">
+                  <h3 id="certificate-background-heading" className="text-sm font-bold text-foreground-900">Background image</h3>
+                  <p className="mt-0.5 text-[11px] leading-4 text-foreground-500">Add your own certificate artwork.</p>
+                </div>
+              </div>
+              <label className="group flex min-h-24 cursor-pointer items-center gap-3 rounded-xl border border-dashed border-foreground-300 bg-background-50 p-3 transition-smooth hover:border-primary-400 hover:bg-background-100 focus-within:ring-2 focus-within:ring-primary-500 focus-within:ring-offset-2 focus-within:ring-offset-background-50">
+                {form.layoutConfig.backgroundImageUrl ? (
+                  <img src={form.layoutConfig.backgroundImageUrl} alt="Selected certificate background" className="h-14 w-20 shrink-0 rounded-lg border border-foreground-200/60 bg-background-100 object-contain" />
+                ) : (
+                  <span className="inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-foreground-200/60 bg-background-100 text-primary-600"><AppIcon name="ri-upload-cloud-line" className="text-xl" /></span>
+                )}
+                <span className="min-w-0 flex-1">
+                  <span className="block text-xs font-bold text-foreground-800">{form.layoutConfig.backgroundImageUrl ? 'Replace background image' : 'Choose background image'}</span>
+                  <span className="mt-1 block text-[11px] leading-4 text-foreground-500">Choose an image from your device</span>
+                </span>
+                <AppIcon name="ri-arrow-right-line" className="shrink-0 text-base text-foreground-400 transition-smooth group-hover:text-primary-600" />
+                <input
+                  type="file"
+                  accept="image/*"
+                  aria-label="Upload certificate background"
+                  onChange={(event) => uploadBackgroundImage(event.target.files?.[0] || null)}
+                  className="sr-only"
+                />
+              </label>
+              {form.layoutConfig.backgroundImageUrl ? (
+                <button
+                  type="button"
+                  onClick={() => updateLayout({ backgroundImageUrl: '' })}
+                  className="inline-flex min-h-9 items-center gap-2 rounded-lg px-2 py-1.5 text-[11px] font-semibold text-red-600 transition-smooth hover:bg-red-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-400"
+                >
+                  <AppIcon name="ri-delete-bin-line" className="text-sm" />
+                  Remove background
+                </button>
+              ) : null}
+              <div className="grid grid-cols-2 gap-x-3 gap-y-4 border-t border-foreground-200/60 pt-4">
+                <Field label="Opacity (%)" value={form.layoutConfig.backgroundOpacity ?? 100} onChange={(value) => updateLayout({ backgroundOpacity: Number(value) })} type="number" />
+                <SelectField
+                  label="Fit"
+                  value={form.layoutConfig.backgroundFit || 'cover'}
+                  onChange={(value) => updateLayout({ backgroundFit: value as CertificateTemplate['layoutConfig']['backgroundFit'] })}
+                  options={[
+                    { value: 'cover', label: 'Cover' },
+                    { value: 'contain', label: 'Contain' },
+                  ]}
+                />
+                <Field label="Scale (%)" value={form.layoutConfig.backgroundScale ?? 100} onChange={(value) => updateLayout({ backgroundScale: Number(value) })} type="number" />
+                <Field label="Text backing (%)" value={form.layoutConfig.contentBackdropOpacity ?? (form.layoutConfig.backgroundImageUrl ? 0 : 90)} onChange={(value) => updateLayout({ contentBackdropOpacity: Number(value) })} type="number" />
+                <Field label="Position X (%)" value={form.layoutConfig.backgroundPositionX ?? 50} onChange={(value) => updateLayout({ backgroundPositionX: Number(value) })} type="number" />
+                <Field label="Position Y (%)" value={form.layoutConfig.backgroundPositionY ?? 50} onChange={(value) => updateLayout({ backgroundPositionY: Number(value) })} type="number" />
+              </div>
+              <label className="flex cursor-pointer items-center gap-3 rounded-xl border border-foreground-200/60 bg-background-50 p-3">
+                <input type="checkbox" aria-label="Show default frame" checked={form.layoutConfig.showFrame !== false} onChange={(event) => updateLayout({ showFrame: event.target.checked })} className="peer sr-only" />
+                <span className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-md border border-foreground-300 bg-background-50 text-transparent transition-smooth peer-checked:border-[var(--kbc-primary)] peer-checked:bg-[var(--kbc-primary)] peer-checked:text-white peer-focus-visible:ring-2 peer-focus-visible:ring-primary-500 peer-focus-visible:ring-offset-2 peer-focus-visible:ring-offset-background-50"><AppIcon name="ri-check-line" className="text-sm" /></span>
+                <span className="min-w-0"><span className="block text-xs font-bold text-foreground-800">Show default frame</span><span className="mt-0.5 block text-[11px] leading-4 text-foreground-500">Keep the built-in certificate border.</span></span>
+              </label>
+              <div className="flex items-start gap-2 rounded-xl bg-background-100 p-3 text-foreground-500">
+                <AppIcon name="ri-information-line" className="mt-0.5 shrink-0 text-sm" />
+                <p className="text-[11px] leading-5">Artwork already has a border? Choose <span className="font-semibold text-foreground-700">No decoration</span> above and turn off <span className="font-semibold text-foreground-700">Show default frame</span>.</p>
+              </div>
+            </section>
+            <div className="rounded-2xl border border-foreground-100 bg-[var(--kbc-surface)] p-3">
+              <p className="mb-3 text-xs font-black uppercase tracking-[0.18em] text-foreground-500">Element sizes (%)</p>
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="Decoration" value={form.layoutConfig.decorationSize ?? 82} onChange={(value) => updateLayout({ decorationSize: Number(value) })} type="number" />
+                <Field label="Logo" value={form.layoutConfig.logoSize ?? 100} onChange={(value) => updateLayout({ logoSize: Number(value) })} type="number" />
+                <Field label="Title" value={form.layoutConfig.titleSize ?? 100} onChange={(value) => updateLayout({ titleSize: Number(value) })} type="number" />
+                <Field label="Subtitle" value={form.layoutConfig.subtitleSize ?? 100} onChange={(value) => updateLayout({ subtitleSize: Number(value) })} type="number" />
+                <Field label="Certify line" value={form.layoutConfig.certifySize ?? 100} onChange={(value) => updateLayout({ certifySize: Number(value) })} type="number" />
+                <Field label="Learner name" value={form.layoutConfig.learnerNameSize ?? 100} onChange={(value) => updateLayout({ learnerNameSize: Number(value) })} type="number" />
+                <Field label="Body text" value={form.layoutConfig.bodySize ?? 92} onChange={(value) => updateLayout({ bodySize: Number(value) })} type="number" />
+                <Field label="Signatures" value={form.layoutConfig.signatureSize ?? 100} onChange={(value) => updateLayout({ signatureSize: Number(value) })} type="number" />
+                <Field label="Footer" value={form.layoutConfig.footerSize ?? 100} onChange={(value) => updateLayout({ footerSize: Number(value) })} type="number" />
+                <Field label="QR" value={form.layoutConfig.qrSize ?? 100} onChange={(value) => updateLayout({ qrSize: Number(value) })} type="number" />
+              </div>
+              <p className="mt-2 text-[11px] font-semibold text-foreground-500">Allowed range is safely clamped between 60% and 160%.</p>
+            </div>
+            <Field label="Logo URL" value={form.layoutConfig.logoUrl || '/kbc-logo.png'} onChange={(value) => updateLayout({ logoUrl: value })} />
+            <Field label="Certify line" value={form.layoutConfig.certifyText || 'This is to certify that'} onChange={(value) => updateLayout({ certifyText: value })} />
+            <Field label="Instructor name" value={form.layoutConfig.instructorName || 'Instructor'} onChange={(value) => updateLayout({ instructorName: value })} />
+            <div className="grid grid-cols-3 gap-3">
+              <Field label="Instructor label" value={form.layoutConfig.instructorLabel || 'Instructor'} onChange={(value) => updateLayout({ instructorLabel: value })} />
+              <Field label="Date label" value={form.layoutConfig.awardedLabel || 'Awarded on'} onChange={(value) => updateLayout({ awardedLabel: value })} />
+              <Field label="Code label" value={form.layoutConfig.certificateNumberLabel || 'Certificate Number'} onChange={(value) => updateLayout({ certificateNumberLabel: value })} />
+            </div>
+            <Field label="Website" value={form.layoutConfig.website || form.layoutConfig.footerText || 'www.kentbusinesscollege.com'} onChange={(value) => updateLayout({ website: value, footerText: value })} />
+            <Field label="Progress prefix" value={form.layoutConfig.progressPrefix || 'with progress'} onChange={(value) => updateLayout({ progressPrefix: value })} />
+            <Field label="OTJ hours label" value={form.layoutConfig.otjHoursLabel || 'OTJ hours completed'} onChange={(value) => updateLayout({ otjHoursLabel: value })} />
+            <p className="text-xs text-foreground-500">Recorded OTJ time for this course, hidden when unavailable. The preview uses example hours.</p>
+            <label className="space-y-1.5">
+              <span className="text-xs font-bold text-foreground-600">Recognition text</span>
+              <textarea
+                value={form.layoutConfig.recognitionText || initial.layoutConfig.recognitionText || ''}
+                onChange={(event) => updateLayout({ recognitionText: event.target.value })}
+                className="min-h-20 w-full rounded-xl border border-foreground-200 p-3 text-sm font-semibold outline-none focus:ring-2 focus:ring-primary-200"
+              />
+            </label>
+            <label className="space-y-1.5">
+              <span className="text-xs font-bold text-foreground-600">Footer text</span>
+              <textarea
+                value={form.layoutConfig.providerBlurb || initial.layoutConfig.providerBlurb || ''}
+                onChange={(event) => updateLayout({ providerBlurb: event.target.value })}
+                className="min-h-20 w-full rounded-xl border border-foreground-200 p-3 text-sm font-semibold outline-none focus:ring-2 focus:ring-primary-200"
+              />
+            </label>
+            <p className="text-sm text-foreground-600">Certificates unlock when completed activities ÷ total course activities reaches the percentage above. OTJ hours do not affect eligibility, and no separate final exam is required.</p>
+            <div className="rounded-2xl border border-foreground-100 bg-[var(--kbc-surface)] p-3">
+              <div className="mb-3 flex items-center justify-between gap-2">
+                <div>
+                  <p className="text-xs font-black uppercase tracking-[0.18em] text-foreground-500">Additional fields</p>
+                  <p className="mt-1 text-xs text-foreground-500">Add extra details to the bottom official row.</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={addCustomField}
+                  className="rounded-lg border border-primary-200 bg-white px-3 py-2 text-xs font-bold text-primary-700"
+                >
+                  + Add
+                </button>
+              </div>
+              {customFields.length ? (
+                <div className="space-y-3">
+                  {customFields.map((field, index) => (
+                    <div key={`${index}-${field.label || field.value || 'field'}`} className="rounded-2xl border border-foreground-100 bg-[var(--kbc-surface)] p-3">
+                      <div className="grid grid-cols-[1fr_1fr_auto] gap-2">
+                        <Field label="Value" value={field.value || ''} onChange={(value) => updateCustomField(index, { value })} />
+                        <Field label="Label" value={field.label || ''} onChange={(value) => updateCustomField(index, { label: value })} />
+                        <button
+                          type="button"
+                          onClick={() => removeCustomField(index)}
+                          className="mt-6 h-11 rounded-xl border border-red-100 bg-red-50 px-3 text-xs font-bold text-red-600"
+                        >
+                          Remove
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="rounded-xl border border-dashed border-foreground-200 bg-white p-3 text-xs font-semibold text-foreground-500">
+                  No additional fields yet.
+                </p>
+              )}
+            </div>
+            <div className="rounded-2xl border border-foreground-100 bg-[var(--kbc-surface)] p-3">
+              <p className="mb-3 text-xs font-black uppercase tracking-[0.18em] text-foreground-500">Visible sections</p>
+              <div className="grid grid-cols-2 gap-2 text-sm font-semibold">
+                <label className="flex items-center gap-2">
+                  <input type="checkbox" checked={form.layoutConfig.showLogo !== false} onChange={(event) => updateLayout({ showLogo: event.target.checked })} />
+                  Logo
+                </label>
+                <label className="flex items-center gap-2">
+                  <input type="checkbox" checked={form.layoutConfig.showFrame !== false} onChange={(event) => updateLayout({ showFrame: event.target.checked })} />
+                  Default frame
+                </label>
+                <label className="flex items-center gap-2">
+                  <input type="checkbox" checked={form.layoutConfig.showQr !== false} onChange={(event) => updateLayout({ showQr: event.target.checked })} />
+                  Verification QR
+                </label>
+                <label className="flex items-center gap-2">
+                  <input type="checkbox" checked={form.layoutConfig.showInstructor !== false} onChange={(event) => updateLayout({ showInstructor: event.target.checked })} />
+                  Instructor
+                </label>
+                <label className="flex items-center gap-2">
+                  <input type="checkbox" checked={form.layoutConfig.showAwardDate !== false} onChange={(event) => updateLayout({ showAwardDate: event.target.checked })} />
+                  Award date
+                </label>
+                <label className="flex items-center gap-2">
+                  <input type="checkbox" checked={form.layoutConfig.showCertificateNumber !== false} onChange={(event) => updateLayout({ showCertificateNumber: event.target.checked })} />
+                  Certificate code
+                </label>
+                <label className="flex items-center gap-2">
+                  <input type="checkbox" checked={form.layoutConfig.showProgress !== false} onChange={(event) => updateLayout({ showProgress: event.target.checked })} />
+                  Progress
+                </label>
+                <label className="flex items-center gap-2">
+                  <input type="checkbox" checked={form.layoutConfig.showOtjHours !== false} onChange={(event) => updateLayout({ showOtjHours: event.target.checked })} />
+                  OTJ hours
+                </label>
+                <label className="flex items-center gap-2">
+                  <input type="checkbox" checked={form.layoutConfig.showFooter !== false} onChange={(event) => updateLayout({ showFooter: event.target.checked })} />
+                  Footer text
+                </label>
+                <label className="flex items-center gap-2">
+                  <input type="checkbox" checked={form.layoutConfig.showWebsite !== false} onChange={(event) => updateLayout({ showWebsite: event.target.checked })} />
+                  Website
+                </label>
+              </div>
+            </div>
+          </section>
+
+          <section
+            className="min-w-0 overflow-x-auto rounded-2xl border border-primary-200/60 bg-primary-50/60 p-4 md:p-6"
+            onClick={() => setSelectedElement(null)}
+          >
+            <CertificateDocument
+              title={form.title}
+              bodyText={form.bodyText}
+              learnerName="Student name"
+              programmeName="Course name"
+              progressLabel="Progress"
+              otjHours={12.5}
+              certificateNumber="Certificate code"
+              awardedOn="End Date"
+              verificationUrl="https://kentbusinesscollege.com/verify/demo"
+              layoutConfig={form.layoutConfig}
+              editable
+              CHANGE_MEElement={CHANGE_MEElement}
+              onSelectElement={setSelectedElement}
+            />
+            <p className="mt-3 text-center text-xs font-semibold text-foreground-500">
+              Click any element on the certificate to edit it from the CHANGE_ME-element panel.
+            </p>
+          </section>
+        </div>
+        </div>
+      </PageContainer>
+    </WorkspaceShell>
+  );
+}

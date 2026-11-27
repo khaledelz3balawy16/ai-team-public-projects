@@ -1,0 +1,222 @@
+from django.db import models
+from django.contrib.auth.hashers import check_password, make_password
+
+
+class LMSLoginAttempt(models.Model):
+    state = models.CharField(max_length=64, primary_key=True)
+    expires_at = models.DateTimeField(db_index=True)
+
+
+class AdminAccount(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    email = models.EmailField(unique=True)
+    full_name = models.TextField(blank=True, null=True)
+    password_hash = models.TextField()
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "admin_accounts"
+        ordering = ["email"]
+
+    def set_password(self, raw_password):
+        self.password_hash = make_password(raw_password)
+
+    def check_password(self, raw_password):
+        return check_password(raw_password, self.password_hash)
+
+    def __str__(self):
+        return self.email
+
+
+class SafeguardingQuestion(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    category_no = models.SmallIntegerField()
+    category_name = models.TextField()
+    question_order = models.IntegerField()
+    construct_type = models.TextField()
+    question_text = models.TextField()
+    scale_prompt = models.TextField(blank=True, null=True)
+    min_score = models.SmallIntegerField()
+    max_score = models.SmallIntegerField()
+    is_trigger = models.BooleanField()
+    trigger_rule = models.TextField(blank=True, null=True)
+    is_reverse_scored = models.BooleanField()
+    is_active = models.BooleanField()
+    created_at = models.DateTimeField()
+    updated_at = models.DateTimeField()
+    score_group = models.TextField(blank=True, null=True)
+    question_code = models.TextField(blank=True, null=True)
+    is_core = models.BooleanField(default=True)
+    rotation_cycle = models.IntegerField(blank=True, null=True)
+    trigger_key = models.TextField(blank=True, null=True)
+    trigger_priority = models.TextField(blank=True, null=True)
+    trigger_note = models.TextField(blank=True, null=True)
+
+    class Meta:
+        managed = False
+        db_table = "safeguarding_questions"
+        unique_together = (("category_no", "question_order"),)
+
+    def __str__(self):
+        return f"{self.category_no}.{self.question_order} - {self.question_text[:60]}"
+
+
+class MonitoringRecord(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    learner_name = models.TextField(blank=True, null=True)
+    learner_email = models.TextField(blank=True, null=True)
+    learner_phone = models.TextField(blank=True, null=True)
+    learner_address = models.TextField(blank=True, null=True)
+    programme = models.TextField(blank=True, null=True)
+    manager_name = models.TextField(blank=True, null=True)
+    manager_email = models.TextField(blank=True, null=True)
+    coach_name = models.TextField(blank=True, null=True)
+    coach_email = models.TextField(blank=True, null=True)
+    coach_phone = models.TextField(blank=True, null=True, db_column="Coach_Phone")
+    organization_name = models.TextField(blank=True, null=True, db_column="OrganizationName")
+
+    submission_json = models.JSONField(blank=True, null=True)
+    total_score = models.FloatField(blank=True, null=True)
+    category_1_score = models.FloatField(blank=True, null=True, db_column="personal_wellbeing_protective_factors_score")
+    category_2_score = models.FloatField(blank=True, null=True, db_column="emotional_stress_resilience_score")
+    category_3_score = models.FloatField(blank=True, null=True, db_column="provider_culture_support_score")
+    category_4_score = models.FloatField(blank=True, null=True, db_column="safeguarding_vulnerability_score")
+    trigger_count = models.IntegerField(blank=True, null=True, default=0)
+    triggered_questions = models.JSONField(blank=True, null=True)
+    risk_level = models.TextField(blank=True, null=True)
+    submitted_at = models.DateTimeField(blank=True, null=True)
+    completed = models.BooleanField(blank=True, null=True, default=False)
+    history_json = models.JSONField(blank=True, null=True)
+    employer_notified_at = models.DateTimeField(blank=True, null=True)
+
+    class Meta:
+        managed = False
+        db_table = "wellbeing_safeguarding_monitoring_system"
+
+    def __str__(self):
+        return self.learner_email or f"Record {self.id}"
+
+
+class SafeguardingWellbeingAutomation(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    wellbeing_record_id = models.BigIntegerField()
+    created_at = models.DateTimeField(blank=True, null=True)
+    updated_at = models.DateTimeField(blank=True, null=True)
+
+    apprentice_dashboard = models.TextField(blank=True, null=True)
+
+    follow_up_by_coach = models.TextField(
+        blank=True,
+        null=True,
+        db_column="Follow-up_by_Coach",
+    )
+
+    suggested_coach_actions = models.TextField(
+        blank=True,
+        null=True,
+        db_column="Suggested_Coach_Actions",
+    )
+
+    class Meta:
+        managed = False
+        db_table = "safeguarding_wellbeing_automation"
+
+    def __str__(self):
+        return f"Automation {self.id} / wellbeing_record_id={self.wellbeing_record_id}"
+
+class LearnerInclusivenessQuestion(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    system_id = models.TextField(default="initial_inclusiveness_screening")
+    section_id = models.TextField()
+    section_title = models.TextField()
+    section_order = models.IntegerField()
+    question_id = models.TextField()
+    question_order = models.IntegerField()
+    sub_section = models.TextField(blank=True, null=True)
+    question_text = models.TextField()
+    answer_type = models.TextField(default="scale_1_to_10")
+    required = models.BooleanField(default=True)
+    options = models.JSONField(default=list)
+    score_min = models.IntegerField(default=1)
+    score_max = models.IntegerField(default=10)
+    reference_code = models.TextField(blank=True, null=True)
+    reference_type = models.TextField(blank=True, null=True)
+    academic_reference = models.TextField(blank=True, null=True)
+    professional_reference = models.TextField(blank=True, null=True)
+    reference_details = models.JSONField(blank=True, null=True)
+    is_active = models.BooleanField(default=True)
+    is_diagnostic = models.BooleanField(default=False)
+    created_at = models.DateTimeField(blank=True, null=True)
+    updated_at = models.DateTimeField(blank=True, null=True)
+
+    class Meta:
+        managed = False
+        db_table = "learner_inclusiveness_questions"
+        ordering = ["section_order", "question_order"]
+
+    def __str__(self):
+        return f"{self.section_id} / {self.question_id}"
+
+
+class LearnerInclusivenessQuizResponse(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    learner_id = models.BigIntegerField(unique=True)
+    learner_name = models.TextField(blank=True, null=True)
+    learner_email = models.TextField(blank=True, null=True)
+    sections = models.JSONField(default=dict)
+    report_emailed_at = models.DateTimeField(blank=True, null=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        managed = False
+        db_table = "learner_inclusiveness_quiz_responses"
+
+    def __str__(self):
+        return f"learner={self.learner_id} / sections={list(self.sections.keys())}"
+
+
+class LearnerInclusivenessReport(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    learner_id = models.BigIntegerField(unique=True)
+    learner_name = models.TextField(blank=True, null=True)
+    learner_email = models.TextField(blank=True, null=True)
+    technology_report = models.TextField(blank=True, null=True)
+    visual_hearing_report = models.TextField(blank=True, null=True)
+    dyslexia_report = models.TextField(blank=True, null=True)
+    adhd_report = models.TextField(blank=True, null=True)
+    social_anxiety_report = models.TextField(blank=True, null=True)
+    mood_report = models.TextField(blank=True, null=True, db_column="mood_learning_capacity_report")
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        managed = False
+        db_table = "learner_inclusiveness_reports"
+
+    def __str__(self):
+        return f"report learner={self.learner_id}"
+
+
+# tickets
+class SupportTicket(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    wellbeing_record_id = models.BigIntegerField(blank=True, null=True)
+    ticket_type = models.TextField()
+    created_by = models.TextField(default="learner")
+    full_name = models.TextField()
+    email = models.TextField()
+    subject = models.TextField()
+    details = models.TextField()
+    urgency = models.TextField(blank=True, null=True)
+    preferred_contact = models.TextField(blank=True, null=True)
+    status = models.TextField(default="open")
+    evidence = models.JSONField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "support_tickets"
+
+    def __str__(self):
+        return f"{self.ticket_type} - {self.full_name} - {self.subject[:40]}"

@@ -1,0 +1,306 @@
+import { useState, useEffect } from 'react';
+import { useLocation, useNavigate } from 'react-router-dom';
+import { useAuth } from '@/hooks/useAuth';
+import { AuthError, apiAuthHealth, apiMicrosoftStart } from '@/api/auth';
+import { AppIcon } from '@/components/feature/AppIcon';
+// Shared with RequireAuth, so the page you are sent to after signing in and
+// the page you are sent back to when refused are decided by one definition.
+import { postLoginRouteFor } from '@/lib/routeAccess';
+import styles from './page.module.css';
+
+const CAMPUS_IMAGE_URL = '/kent-business-college-campus.png';
+
+export default function LoginPage() {
+  const { login, auth, isInitialized } = useAuth();
+  const navigate = useNavigate();
+  const location = useLocation();
+  const [error, setError] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [rememberMe, setRememberMe] = useState(false);
+  const [showPassword, setShowPassword] = useState(false);
+  const [ssoLoading, setSsoLoading] = useState(false);
+  // Undefined until the health check answers, so the button is not flashed in
+  // and then taken away on a deployment that has no provider configured.
+  const [ssoAvailable, setSsoAvailable] = useState<boolean | undefined>(undefined);
+
+  // A refused Microsoft sign-in comes back with ?sso_error=... . Lift it into
+  // the form's error box, then strip it so a refresh cannot resurrect it.
+  useEffect(() => {
+    const params = new URLSearchParams(location.search);
+    const ssoError = params.get('sso_error');
+    if (!ssoError) return;
+    setError(ssoError);
+    params.delete('sso_error');
+    const rest = params.toString();
+    navigate({ pathname: location.pathname, search: rest ? `?${rest}` : '' }, { replace: true });
+  }, [location.search, location.pathname, navigate]);
+
+  // Only show Microsoft sign-in when the backend confirms it is configured.
+  useEffect(() => {
+    let cancelled = false;
+    apiAuthHealth()
+      .then((health) => { if (!cancelled) setSsoAvailable(!!health.microsoftSso?.configured); })
+      .catch(() => { if (!cancelled) setSsoAvailable(false); });
+    return () => { cancelled = true; };
+  }, []);
+
+  // Bounce an already-signed-in visitor to their console after the server
+  // session has been resolved.
+  //
+  // Gated on `account` — the server's record — rather than `isAuthenticated`, to
+  // match RequireAuth. The two must agree on what "signed in" means: a local
+  // preview identity satisfies `isAuthenticated` with no session behind it, so
+  // sending it to a protected route would have it bounced straight back here,
+  // and round again.
+  useEffect(() => {
+    if (!isInitialized || !auth.account) return;
+    navigate(postLoginRouteFor(auth.account), { replace: true });
+  }, [isInitialized, auth.account, navigate]);
+
+  const handleLogin = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    // Read the displayed values at submission: password managers can fill the
+    // inputs without dispatching change events to React.
+    const fields = new FormData(e.currentTarget);
+    const email = String(fields.get('email') || '').trim();
+    const password = String(fields.get('password') || '');
+    setError('');
+
+    if (!email) {
+      setError('Please enter your email address');
+      return;
+    }
+    if (!password) {
+      setError('Please enter your password');
+      return;
+    }
+
+    setIsLoading(true);
+    try {
+      const account = await login(email, password, rememberMe);
+      navigate(postLoginRouteFor(account), { replace: true });
+    } catch (err) {
+      setError(
+        err instanceof AuthError
+          ? err.message
+          : 'Something went wrong signing in. Please try again.',
+      );
+      setIsLoading(false);
+    }
+  };
+
+  const handleMicrosoftLogin = async () => {
+    setError('');
+    setSsoLoading(true);
+    try {
+      // This is a full navigation so Microsoft can return to the callback that
+      // creates the server session cookie.
+      window.location.href = await apiMicrosoftStart();
+    } catch (err) {
+      setError(
+        err instanceof AuthError
+          ? err.message
+          : 'Could not start sign-in with Microsoft. Please try again.',
+      );
+      setSsoLoading(false);
+    }
+  };
+
+  return (
+    <main className={styles.page}>
+      <section className={styles.card} aria-labelledby="login-heading">
+        <span className={styles.curveBand} aria-hidden="true" />
+        <div className={styles.formPanel}>
+          <div className={styles.formContent}>
+            <img
+              src="/assets/kbc-logo.png"
+              alt="Kent Business College"
+              className={styles.logo}
+            />
+
+            <header className={styles.intro}>
+              <h1 id="login-heading">Welcome back</h1>
+              <p>Sign in to your workspace</p>
+            </header>
+
+            <form onSubmit={handleLogin} className={styles.form} noValidate={false}>
+              <div className={styles.fieldGroup}>
+                <label htmlFor="email">Email address</label>
+                <div className={styles.inputShell}>
+                  <AppIcon className={`ri-mail-line ${styles.inputIcon}`} aria-hidden="true" />
+                  <input
+                    id="email"
+                    name="email"
+                    type="email"
+                    onChange={() => setError('')}
+                    placeholder="your.email@kbc.test"
+                    autoComplete="email"
+                    aria-invalid={!!error}
+                    aria-describedby={error ? 'login-error' : undefined}
+                    required
+                  />
+                </div>
+              </div>
+
+              <div className={styles.fieldGroup}>
+                <div className={styles.labelRow}>
+                  <label htmlFor="password">Password</label>
+                  <button type="button" onClick={() => navigate('/forgot-password')} className={styles.forgotButton}>
+                    Forgot password?
+                  </button>
+                </div>
+                <div className={styles.inputShell}>
+                  <AppIcon className={`ri-lock-line ${styles.inputIcon}`} aria-hidden="true" />
+                  <input
+                    id="password"
+                    name="password"
+                    type={showPassword ? 'text' : 'password'}
+                    onChange={() => setError('')}
+                    placeholder="Enter your password"
+                    autoComplete="current-password"
+                    aria-invalid={!!error}
+                    aria-describedby={error ? 'login-error' : undefined}
+                    required
+                  />
+                  <button
+                    type="button"
+                    className={styles.passwordToggle}
+                    onClick={() => setShowPassword((visible) => !visible)}
+                    aria-label={showPassword ? 'Hide password' : 'CHANGE_ME'}
+                    aria-pressed={showPassword}
+                  >
+                    <AppIcon className={showPassword ? 'ri-eye-off-line' : 'ri-eye-line'} aria-hidden="true" />
+                  </button>
+                </div>
+              </div>
+
+              <div className={styles.rememberGroup}>
+                <button
+                  type="button"
+                  className={styles.rememberRow}
+                  aria-pressed={rememberMe}
+                  aria-describedby="remember-hint"
+                  onClick={() => setRememberMe((remembered) => !remembered)}
+                >
+                  <span className={styles.checkboxVisual} aria-hidden="true">
+                    <AppIcon className="ri-check-line" />
+                  </span>
+                  <span>Remember me</span>
+                </button>
+                {/* Spelled out because it stopped being guessable. The box used
+                    to choose between a shorter and a longer sign-in, both of
+                    which survived closing the browser; now leaving it off ends
+                    the session with the browser. Unexplained, that reads as a
+                    bug rather than the thing the box was asking about. */}
+                <p id="remember-hint" className={styles.rememberHint}>
+                  Stay signed in on this device. Leave it off and closing your
+                  browser signs you out.
+                </p>
+              </div>
+
+              {error && (
+                <div id="login-error" className={styles.error} role="alert" aria-live="polite">
+                  <AppIcon className="ri-error-warning-line" aria-hidden="true" />
+                  <span>{error}</span>
+                </div>
+              )}
+
+              <button
+                type="submit"
+                disabled={isLoading}
+                className={styles.primaryButton}
+              >
+                {isLoading ? (
+                  <span className={styles.loadingLabel}>
+                    <AppIcon className="ri-loader-4-line animate-spin" aria-hidden="true" />
+                    Signing in...
+                  </span>
+                ) : (
+                  'Sign in to Workspace'
+                )}
+              </button>
+            </form>
+
+            {ssoAvailable && (
+              <div className={styles.ssoBlock}>
+                <div className={styles.divider} aria-hidden="true">
+                  <span />
+                  <strong>OR</strong>
+                  <span />
+                </div>
+
+                <button
+                  type="button"
+                  onClick={handleMicrosoftLogin}
+                  disabled={ssoLoading || isLoading}
+                  className={styles.microsoftButton}
+                >
+                  {ssoLoading ? (
+                    <>
+                      <AppIcon className="ri-loader-4-line animate-spin" aria-hidden="true" />
+                      Redirecting to Microsoft...
+                    </>
+                  ) : (
+                    <>
+                      <svg className={styles.microsoftMark} viewBox="0 0 21 21" aria-hidden="true">
+                        <rect x="1" y="1" width="9" height="9" fill="#F25022" />
+                        <rect x="11" y="1" width="9" height="9" fill="#7FBA00" />
+                        <rect x="1" y="11" width="9" height="9" fill="#00A4EF" />
+                        <rect x="11" y="11" width="9" height="9" fill="#FFB900" />
+                      </svg>
+                      Sign in with Microsoft
+                    </>
+                  )}
+                </button>
+
+                <p className={styles.ssoHint}>
+                  Use your work account. You must already have access to this platform.
+                </p>
+              </div>
+            )}
+
+            <footer className={styles.secureFooter}>
+              <span>
+                <AppIcon className="ri-shield-check-line" aria-hidden="true" />
+                Secure sign-in
+              </span>
+            </footer>
+          </div>
+        </div>
+
+        <aside className={styles.visualPanel} aria-label="Kent Business College campus">
+          <img
+            className={styles.campusImage}
+            src={CAMPUS_IMAGE_URL}
+            alt="Kent Business College campus building at dusk"
+          />
+          <div className={styles.visualShade} aria-hidden="true" />
+
+          <div className={styles.visualTopCard}>
+            <span className={styles.visualIcon} aria-hidden="true">
+              <AppIcon className="ri-shield-check-line" />
+            </span>
+            <p>
+              <span>Empowering learners.</span>
+              <span>Building futures.</span>
+            </p>
+          </div>
+
+          <div className={styles.visualFooterCard}>
+            <span className={styles.footerBrand}>
+              <AppIcon className="ri-shield-check-line" aria-hidden="true" />
+              <span>
+                <strong>Kent Business College</strong>
+                <small>{'\u00a9'} 2026 All rights reserved.</small>
+              </span>
+            </span>
+            <span className={styles.supportLine}>
+              <span>Need help?</span>
+              <b>Contact support</b>
+            </span>
+          </div>
+        </aside>
+      </section>
+    </main>
+  );
+}

@@ -1,0 +1,186 @@
+import { useEffect, useRef, useState } from 'react';
+
+/* ═══════════════════════════════════════════════════════
+   VIDEO PLAYER — renders the right player for a URL and
+   reports real playback progress (duration, currentTime,
+   ended) upward. Supports:
+     - YouTube  (via the IFrame Player API — real duration/time/end)
+     - Vimeo    (plain iframe; no progress events -> onUnsupported)
+     - direct file .mp4/.webm/... (HTML5 <video> — native events)
+   ═══════════════════════════════════════════════════════ */
+
+export type PlaybackKind = 'youtube' | 'vimeo' | 'file';
+
+export interface ParsedVideo {
+  kind: PlaybackKind;
+  youTubeId?: string;
+  src: string;                 // embed src (vimeo) or file url
+  fallbackSrc?: string;        // provider preview when viewing is allowed but downloading is not
+}
+
+/** Classify a provider URL and extract the id/src needed to play it. */
+// Kept here because the parser and player share the provider contract.
+// eslint-disable-next-line react-refresh/only-export-components
+export function parseVideoUrl(url: string): ParsedVideo {
+  const clean = url.trim();
+  const yt =
+    clean.match(/(?:youtu\.be\/)([\w-]{6,})/) ||
+    clean.match(/[?&]v=([\w-]{6,})/) ||
+    clean.match(/youtube\.com\/embed\/([\w-]{6,})/);
+  if (yt) return { kind: 'youtube', youTubeId: yt[1], src: `https://www.youtube.com/embed/${yt[1]}` };
+  const vm = clean.match(/vimeo\.com\/(?:video\/)?(\d+)/);
+  if (vm) return { kind: 'vimeo', src: `https://player.vimeo.com/video/${vm[1]}` };
+  if (/\.(mp4|webm|ogg|mov|m4v)(\?.*)?$/i.test(clean)) return { kind: 'file', src: clean };
+  // Google Drive. Use our same-origin media proxy rather than Drive's /preview
+  // iframe: Drive can show "Unable to load video" for playable files, while the
+  // proxy returns the actual MP4 and preserves Range requests for seeking.
+  const drive =
+    clean.match(/drive\.google\.com\/file\/d\/([\w-]{10,})/) ||
+    clean.match(/drive\.google\.com\/open\?id=([\w-]{10,})/) ||
+    clean.match(/drive\.google\.com\/uc\?[^#]*id=([\w-]{10,})/);
+  if (drive) {
+    const preview = new URL(`https://drive.google.com/file/d/${drive[1]}/preview`);
+    const resourceKey = new URL(clean, 'https://drive.google.com').searchParams.get('resourcekey');
+    if (resourceKey) preview.searchParams.set('resourcekey', resourceKey);
+    return { kind: 'file', src: `/learner_api/media/google-drive/${drive[1]}/`, fallbackSrc: preview.href };
+  }
+  // Unknown — best-effort iframe, treated like vimeo (no progress events).
+  return { kind: 'vimeo', src: clean };
+}
+
+interface YTNamespace {
+  Player: new (el: HTMLElement | string, opts: unknown) => {
+    getDuration: () => number;
+    getCurrentTime: () => number;
+    destroy: () => void;
+  };
+  PlayerState: { ENDED: number; PLAYING: number; PAUSED: number };
+}
+declare global {
+  interface Window {
+    YT?: YTNamespace;
+    onYouTubeIframeAPIReady?: () => void;
+  }
+}
+
+/** Load the YouTube IFrame API once; resolve when window.YT is ready. */
+let ytApiPromise: Promise<YTNamespace> | null = null;
+function loadYouTubeApi(): Promise<YTNamespace> {
+  if (window.YT && window.YT.Player) return Promise.resolve(window.YT);
+  if (ytApiPromise) return ytApiPromise;
+  ytApiPromise = new Promise<YTNamespace>((resolve) => {
+    const prev = window.onYouTubeIframeAPIReady;
+    window.onYouTubeIframeAPIReady = () => {
+      prev?.();
+      if (window.YT) resolve(window.YT);
+    };
+    const tag = document.createElement('script');
+    tag.src = 'https://www.youtube.com/iframe_api';
+    document.head.appendChild(tag);
+  });
+  return ytApiPromise;
+}
+
+export function VideoPlayer({
+  parsed, title, onDuration, onProgress, onPlayingChange, onEnded, onUnsupported,
+}: {
+  parsed: ParsedVideo;
+  title: string;
+  onDuration?: (seconds: number) => void;   // real total length, once known
+  onProgress?: (currentSeconds: number) => void; // real elapsed within the video
+  onPlayingChange?: (playing: boolean) => void; // actual playback state; seeking does not count as time
+  onEnded?: () => void;                      // playback reached the end
+  onUnsupported?: () => void;                // no progress events available (Vimeo/unknown)
+}) {
+  const mountRef = useRef<HTMLDivElement | null>(null);
+  const [failedSource, setFailedSource] = useState<string | null>(null);
+  const useProviderPreview = parsed.kind === 'file' && failedSource === parsed.src && !!parsed.fallbackSrc;
+  const cbRef = useRef({ onDuration, onProgress, onPlayingChange, onEnded, onUnsupported });
+  cbRef.current = { onDuration, onProgress, onPlayingChange, onEnded, onUnsupported };
+
+  // ── YouTube: IFrame Player API ──
+  useEffect(() => {
+    if (parsed.kind !== 'youtube' || !parsed.youTubeId || !mountRef.current) return;
+    let player: { getDuration: () => number; getCurrentTime: () => number; destroy: () => void } | null = null;
+    let poll: ReturnType<typeof setInterval> | null = null;
+    let cancelled = false;
+
+    loadYouTubeApi().then((YT) => {
+      if (cancelled || !mountRef.current) return;
+      const host = document.createElement('div');
+      mountRef.current.appendChild(host);
+      player = new YT.Player(host, {
+        videoId: parsed.youTubeId,
+        width: '100%',
+        height: '100%',
+        playerVars: { rel: 0, modestbranding: 1, playsinline: 1 },
+        events: {
+          onReady: () => {
+            const d = player?.getDuration() ?? 0;
+            if (d > 0) cbRef.current.onDuration?.(Math.round(d));
+          },
+          onStateChange: (e: { data: number }) => {
+            // Duration is reliable only once playback starts.
+            if (e.data === YT.PlayerState.PLAYING) {
+              const d = player?.getDuration() ?? 0;
+              if (d > 0) cbRef.current.onDuration?.(Math.round(d));
+            }
+            cbRef.current.onPlayingChange?.(e.data === YT.PlayerState.PLAYING);
+            if (e.data === YT.PlayerState.ENDED) cbRef.current.onEnded?.();
+          },
+        },
+      });
+      // Poll current time for a smooth countdown (state events alone are too coarse).
+      poll = setInterval(() => {
+        const t = player?.getCurrentTime?.();
+        if (typeof t === 'number') cbRef.current.onProgress?.(t);
+      }, 500);
+    });
+
+    return () => {
+      cancelled = true;
+      cbRef.current.onPlayingChange?.(false);
+      if (poll) clearInterval(poll);
+      try { player?.destroy(); } catch { /* player may not be constructed yet */ }
+    };
+  }, [parsed.kind, parsed.youTubeId]);
+
+  // ── Vimeo / unknown: plain iframe, no progress events ──
+  useEffect(() => {
+    if (parsed.kind === 'vimeo' || useProviderPreview) cbRef.current.onUnsupported?.();
+  }, [parsed.kind, useProviderPreview]);
+
+  if (parsed.kind === 'youtube') {
+    return <div ref={mountRef} className="absolute inset-0 w-full h-full [&>div]:w-full [&>div]:h-full" />;
+  }
+
+  if (parsed.kind === 'file' && !useProviderPreview) {
+    return (
+      <video
+        src={parsed.src}
+        controls
+        preload="metadata"
+        className="absolute inset-0 w-full h-full bg-black"
+        onLoadedMetadata={(e) => onDuration?.(Math.round((e.target as HTMLVideoElement).duration))}
+        onTimeUpdate={(e) => onProgress?.((e.target as HTMLVideoElement).currentTime)}
+        onPlay={() => onPlayingChange?.(true)}
+        onPause={() => onPlayingChange?.(false)}
+        onEnded={() => { onPlayingChange?.(false); onEnded?.(); }}
+        onError={() => { onPlayingChange?.(false); setFailedSource(parsed.src); }}
+      >
+        Your browser does not support the video tag.
+      </video>
+    );
+  }
+
+  // Vimeo / unknown — plain embed (progress tracked via onUnsupported fallback).
+  return (
+    <iframe
+      src={useProviderPreview ? parsed.fallbackSrc : parsed.src}
+      title={title}
+      className="absolute inset-0 w-full h-full"
+      allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+      allowFullScreen
+    />
+  );
+}

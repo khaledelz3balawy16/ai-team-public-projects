@@ -1,0 +1,228 @@
+from django.db import models
+import uuid
+
+# Create your models here.
+# import uuid
+
+class CoachData(models.Model):
+    # id
+    case_owner_id = models.IntegerField(primary_key=True)
+    # json
+    tasks = models.JSONField(null=True, blank=True, default=list)
+
+    class Meta:
+        db_table = "coaches_data"
+        managed = False
+
+    def __str__(self):
+        return str(self.case_owner_id)
+
+# for wellbeing
+
+#for analyzied data from safeguarding_wellbeing_automation table
+class SafeguardingWellbeingAutomation(models.Model):
+    wellbeing_record_id = models.BigIntegerField(primary_key=True)
+    created_at = models.DateTimeField(null=True, blank=True)
+    updated_at = models.DateTimeField(null=True, blank=True)
+
+    apprentice_dashboard = models.TextField(null=True, blank=True, db_column="apprentice_dashboard")
+    follow_up_by_coach = models.TextField(null=True, blank=True, db_column="Follow-up_by_Coach")
+    suggested_coach_actions = models.TextField(null=True, blank=True, db_column="Suggested_Coach_Actions")
+    line_manager_actions = models.TextField(null=True, blank=True, db_column="Line_Manager_Actions")
+
+    class Meta:
+        managed = False
+        db_table = "safeguarding_wellbeing_automation"
+
+#to bring coach & learner data
+class WellbeingSafeguardingMonitoringSystem(models.Model):
+    id = models.BigIntegerField(primary_key=True)
+    learner_name = models.TextField(null=True, blank=True)
+    learner_email = models.TextField(null=True, blank=True)
+    learner_phone = models.TextField(null=True, blank=True)
+    learner_address = models.TextField(null=True, blank=True)
+    programme = models.TextField(null=True, blank=True)
+    manager_name = models.TextField(null=True, blank=True)
+    manager_email = models.TextField(null=True, blank=True)
+    coach_name = models.TextField(null=True, blank=True)
+    coach_email = models.TextField(null=True, blank=True)
+
+    total_score = models.FloatField(null=True, blank=True)
+    personal_wellbeing_protective_factors_score = models.FloatField(null=True, blank=True)
+    emotional_stress_resilience_score = models.FloatField(null=True, blank=True)
+    provider_culture_support_score = models.FloatField(null=True, blank=True)
+    safeguarding_vulnerability_score = models.FloatField(null=True, blank=True)
+    trigger_count = models.IntegerField(null=True, blank=True)
+    triggered_questions = models.JSONField(null=True, blank=True)
+    submission_json = models.JSONField(null=True, blank=True)
+    risk_level = models.TextField(null=True, blank=True)
+    history_json = models.JSONField(null=True, blank=True)
+    program_status = models.TextField(null=True, blank=True, db_column="Program_status")
+
+    class Meta:
+        managed = False
+        db_table = "wellbeing_safeguarding_monitoring_system"
+
+
+class SafeguardingQuestion(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    category_no = models.IntegerField(null=True, blank=True)
+    question_order = models.IntegerField(null=True, blank=True)
+    question_text = models.TextField(null=True, blank=True)
+    question_code = models.TextField(null=True, blank=True)
+    min_score = models.IntegerField(null=True, blank=True)
+    max_score = models.IntegerField(null=True, blank=True)
+    is_trigger = models.BooleanField(null=True, blank=True)
+    trigger_rule = models.TextField(null=True, blank=True)
+    is_reverse_scored = models.BooleanField(null=True, blank=True)
+    is_active = models.BooleanField(null=True, blank=True)
+
+    class Meta:
+        managed = False
+        db_table = "safeguarding_questions"
+
+# safeguarding
+class SupportTicket(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    wellbeing_record_id = models.BigIntegerField(null=True, blank=True)
+    ticket_type = models.TextField(null=True, blank=True)
+    full_name = models.TextField(null=True, blank=True)
+    email = models.TextField(null=True, blank=True)
+    subject = models.TextField(null=True, blank=True)
+    details = models.TextField(null=True, blank=True)
+    urgency = models.TextField(null=True, blank=True)
+    preferred_contact = models.TextField(null=True, blank=True)
+    status = models.TextField(null=True, blank=True)
+    notes = models.JSONField(null=True, blank=True, default=list)
+    evidence = models.JSONField(null=True, blank=True, default=list)
+    created_at = models.DateTimeField(null=True, blank=True)
+    updated_at = models.DateTimeField(null=True, blank=True)
+    created_by = models.TextField(null=True, blank=True)
+    days_to_close = models.IntegerField(null=True, blank=True)
+    submitted_by = models.TextField(null=True, blank=True)
+    is_archived = models.BooleanField(null=True, blank=True, default=False)
+    assigned_owner = models.TextField(null=True, blank=True)
+    coach_name = models.TextField(null=True, blank=True)
+    coach_email = models.TextField(null=True, blank=True)
+
+    class Meta:
+        managed = False
+        db_table = "support_tickets"
+
+
+class LearnerInclusivenessReport(models.Model):
+    id = models.TextField(primary_key=True)
+    learner_id = models.BigIntegerField(null=True, blank=True)
+    learner_email = models.TextField(null=True, blank=True)
+    learner_name = models.TextField(null=True, blank=True)
+    academic_email = models.TextField(null=True, blank=True)
+    previous_emails = models.TextField(null=True, blank=True)
+    programme = models.TextField(null=True, blank=True)
+    organization_name = models.TextField(null=True, blank=True)
+    coach_name = models.TextField(null=True, blank=True)
+    coach_email = models.TextField(null=True, blank=True)
+    manager_name = models.TextField(null=True, blank=True)
+    manager_email = models.TextField(null=True, blank=True)
+    technology_report = models.TextField(null=True, blank=True)
+    visual_hearing_report = models.TextField(null=True, blank=True)
+    dyslexia_report = models.TextField(null=True, blank=True)
+    adhd_report = models.TextField(null=True, blank=True)
+    social_anxiety_report = models.TextField(null=True, blank=True)
+    mood_learning_capacity_report = models.TextField(null=True, blank=True)
+    master_report = models.TextField(null=True, blank=True)
+    created_at = models.DateTimeField(null=True, blank=True)
+    updated_at = models.DateTimeField(null=True, blank=True)
+
+    notes = models.JSONField(null=True, blank=True, default=list)
+    evidence = models.JSONField(null=True, blank=True, default=list)
+    status = models.TextField(null=True, blank=True, default="active")
+    is_archived = models.BooleanField(null=True, blank=True, default=False)
+    progress_tier = models.IntegerField(null=True, blank=True)
+
+    class Meta:
+        managed = False
+        db_table = "learner_inclusiveness_reports"
+
+
+class InclusionTicket(models.Model):
+    """Manual inclusion cases, separate from the one-per-learner screening report."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    source_report_id = models.TextField(blank=True)
+    roster_learner_id = models.TextField(blank=True, default="", db_index=True)
+    learner_id = models.BigIntegerField(null=True, blank=True)
+    learner_email = models.TextField()
+    learner_name = models.TextField(blank=True)
+    academic_email = models.TextField(blank=True)
+    previous_emails = models.TextField(blank=True)
+    programme = models.TextField(blank=True)
+    organization_name = models.TextField(blank=True)
+    coach_name = models.TextField(blank=True)
+    coach_email = models.TextField(blank=True)
+    manager_name = models.TextField(blank=True)
+    manager_email = models.TextField(blank=True)
+    subject = models.CharField(max_length=200)
+    details = models.TextField()
+    category = models.CharField(max_length=50)
+    risk_level = models.CharField(max_length=20)
+    preferred_contact = models.CharField(max_length=10, default="email")
+    incident_date = models.DateField(null=True, blank=True)
+    incident_time = models.TimeField(null=True, blank=True)
+    created_by = models.TextField()
+    status = models.TextField(default="active")
+    progress_tier = models.PositiveSmallIntegerField(null=True, blank=True)
+    notes = models.JSONField(default=list)
+    evidence = models.JSONField(default=list)
+    is_archived = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "inclusion_tickets"
+        ordering = ["-created_at", "-id"]
+
+
+class Coach(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    full_name = models.TextField(null=True, blank=True)
+    email = models.TextField(null=True, blank=True)
+    created_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        managed = False
+        db_table = "coaches"
+
+
+class MicrosoftOAuthState(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    coach_id = models.BigIntegerField()
+    state = models.TextField()
+    redirect_uri = models.TextField(null=True, blank=True)
+    expires_at = models.DateTimeField()
+    used = models.BooleanField(default=False, null=True)
+
+    class Meta:
+        managed = False
+        db_table = "microsoft_oauth_states"
+
+
+class MicrosoftConnection(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    coach_id = models.BigIntegerField(unique=True)
+    microsoft_user_id = models.TextField(null=True, blank=True)
+    microsoft_email = models.TextField(null=True, blank=True)
+    tenant_id = models.TextField(null=True, blank=True)
+    access_token = models.TextField(null=True, blank=True)
+    refresh_token = models.TextField(null=True, blank=True)
+    token_type = models.TextField(null=True, blank=True)
+    scope = models.TextField(null=True, blank=True)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    connected_at = models.DateTimeField(null=True, blank=True)
+    last_refreshed_at = models.DateTimeField(null=True, blank=True)
+    is_active = models.BooleanField(default=True, null=True)
+    status = models.TextField(null=True, blank=True)
+    created_at = models.DateTimeField(null=True, blank=True)
+    updated_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        managed = False
+        db_table = "microsoft_connections"

@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="160 90 880 720" role="img" aria-labelledby="title desc">
+  <title id="title">Kent Business College mark</title>
+  <desc id="desc">Logo mark with career growth figure, arrow, and steps.</desc>
+  <defs>
+    <linearGradient id="navy" x1="220" y1="220" x2="850" y2="900" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#06345f"/>
+      <stop offset="1" stop-color="#061f48"/>
+    </linearGradient>
+    <linearGradient id="teal" x1="290" y1="710" x2="900" y2="710" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#03a6b2"/>
+      <stop offset="1" stop-color="#043969"/>
+    </linearGradient>
+    <linearGradient id="gold" x1="300" y1="210" x2="880" y2="720" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffc629"/>
+      <stop offset="1" stop-color="#f4a000"/>
+    </linearGradient>
+    <filter id="softShadow" x="-18%" y="-18%" width="136%" height="136%">
+      <feDropShadow dx="0" dy="10" stdDeviation="10" flood-color="#0f1c3a" flood-opacity=".14"/>
+    </filter>
+  </defs>
+
+  <g filter="url(#softShadow)">
+    <path d="M276 548c20-124 121-226 276-294-133 82-204 176-195 282 8 99 92 177 217 193-141 27-277-32-298-181Z" fill="url(#gold)"/>
+    <path d="M276 620c58 98 178 124 327 91-88 65-231 65-320 8-49-31-79-74-86-121 19 20 46 27 79 22Z" fill="url(#teal)"/>
+    <path d="M520 720c122-14 213-68 276-161-24 79-104 158-200 189 117-2 203-29 272-85-75 87-194 132-348 130Z" fill="#06345f"/>
+  </g>
+
+  <g fill="url(#navy)" filter="url(#softShadow)">
+    <path d="M653 433c-10 35-23 71-39 109l-49 116c-8 20-31 30-51 22-19-9-28-31-20-51l48-115c8-20 15-40 20-60l-62 44c-12 8-29 6-38-5-10-13-8-31 5-41l90-65c21-15 49-18 73-7 23 10 33 29 23 53Z"/>
+    <circle cx="648" cy="300" r="43"/>
+    <path d="M613 447l95 48c18 9 25 31 16 49-9 17-31 24-48 15l-99-50Z"/>
+    <path d="M605 551l77 27c16 6 25 23 21 39l-21 81c-5 20-25 31-44 26-20-5-31-25-26-44l13-50-66-23Z"/>
+    <path d="M430 460l83 48c15 9 21 28 12 43l-43 75c-9 15-28 20-43 12l-83-48c-15-9-20-28-12-43l43-75c9-15 28-20 43-12Zm-4 42-29 50 50 29 29-50-50-29Z"/>
+  </g>
+
+  <path d="M683 382c89-76 143-162 173-245l-97 44 36 18c-42 72-83 123-150 171 9 15 23 19 38 12Z" fill="url(#gold)" filter="url(#softShadow)"/>
+  <path d="M748 660h76V568h75V452h96v308H748Z" fill="url(#teal)" filter="url(#softShadow)"/>
+</svg>

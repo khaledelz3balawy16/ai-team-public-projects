@@ -1,0 +1,186 @@
+# ------------------------------------------------------------
+# CI/CD pipeline (AWS)
+#   Pull request -> test only what changed
+#   Push to main -> test, then deploy only what changed:
+#     backend/  -> build image, push to ECR, redeploy the ECS service
+#     frontend/ -> build site, upload to S3, clear the CloudFront cache
+# Infrastructure itself is managed with Terraform (infrastructure/).
+# ------------------------------------------------------------
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # "Run workflow" button in the Actions tab: tests and deploys both parts
+  workflow_dispatch:
+
+env:
+  AWS_REGION: eu-north-1
+  ECR_REPOSITORY: image_uploader
+  ECS_CLUSTER: image-uploader-cluster
+  ECS_SERVICE: iu-backend
+  S3_BUCKET: kbc-image-uploader-frontend
+  CLOUDFRONT_DISTRIBUTION_ID: E1J5QB1GNG15KZ
+
+jobs:
+  # ---------------- Which parts changed? ----------------
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      backend: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.backend == 'true' }}
+      frontend: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.frontend == 'true' }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: filter
+        if: github.event_name != 'workflow_dispatch'
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            backend:
+              - 'backend/**'
+            frontend:
+              - 'frontend/**'
+
+  # ---------------- CI: frontend ----------------
+  frontend:
+    name: Frontend - lint & build
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # npm ci = clean, exact install from package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      # tsc type-check + vite production build
+      - run: npm run build
+
+  # ---------------- CI: backend ----------------
+  backend:
+    name: Backend - check & test
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - run: pip install -r requirements.txt
+      # Django's system checks (settings, models, urls)
+      - run: python manage.py check
+      - run: python manage.py test
+
+  # ---------------- CD: backend -> ECR -> ECS ----------------
+  deploy-backend:
+    name: Deploy backend (ECR + ECS)
+    needs: backend
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # One backend deploy at a time; a newer push waits for the current one
+    concurrency:
+      group: deploy-backend
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Tags: "latest" (what the ECS task definition runs) + the commit SHA
+      # (so any earlier version can be found and redeployed)
+      - uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          push: true
+          provenance: false # push a plain image, no extra attestation manifests
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+
+      # Start new tasks with the new :latest image; ECS swaps them in once
+      # /health/ passes (and rolls back automatically if it never does)
+      - name: Redeploy ECS service
+        run: |
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --force-new-deployment \
+            --query 'service.deployments[0].id' --output text
+
+      - name: Wait until the new version is live
+        run: aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
+
+  # ---------------- CD: frontend -> S3 -> CloudFront ----------------
+  deploy-frontend:
+    name: Deploy frontend (S3 + CloudFront)
+    needs: frontend
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-frontend
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+
+      # Empty on purpose: the site calls /api/... on its own domain and
+      # CloudFront forwards /api/* to the load balancer
+      - run: npm run build
+        env:
+          VITE_API_URL: ""
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Upload the new build and delete files that are no longer part of it
+      - run: aws s3 sync ./dist "s3://$S3_BUCKET" --delete
+
+      # Make CloudFront fetch the new files instead of serving cached ones
+      - run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" \
+            --paths "/*" \
+            --query 'Invalidation.Id' --output text

@@ -1,0 +1,64 @@
+import type { LearnerKind } from './learnerDetail';
+import type { LearnerCalendarEvent } from './learnerCalendar';
+import { subjectRequest } from './studentActivity';
+import { readLearnerJson } from './learnerRead';
+
+export type PlanMonth = { label: string; topics: string[]; planned: number | null; source: string;
+  activities?: { date: string; title: string; method: string; hours: number }[]; weeklyTarget?: number | null };
+export type PlanSession = { id: string; moduleId: string; title: string; start: string; end: string | null;
+  minutes: number; joinUrl: string | null; status: string; attended: boolean | null };
+/** A holiday, exactly as the curriculum stores and the scheduler serves it. */
+export type PlanSlotHoliday = { id?: string; label: string; startDate: string; endDate: string; type?: string; notes?: string };
+/**
+ * One position in the module's curriculum, open or closed.
+ *
+ * The wire shape of the curriculum scheduler's own slot spine — the same
+ * `slots[]` the Module Builder reads, produced by `build_module_session_plan`
+ * and passed straight through by the learner dashboard. A `reading-week` slot
+ * is a delivery day a cohort holiday closed: it holds no session (`sessionNumber`
+ * is null) and carries the holidays that closed it.
+ *
+ * Reading Weeks come from here and nowhere else. Inferring them from gaps
+ * between session dates cannot work: a gap is equally what a term break, an
+ * unauthored week, or a module that simply does not deliver looks like.
+ */
+export type PlanCurriculumSlot = { slotNumber: number; date: string; day: string;
+  type: 'live-session' | 'reading-week'; cause?: string; sessionNumber: number | null; holidays: PlanSlotHoliday[] };
+export type PlanModule = { id: string; title: string; description: string; start_date: string | null; end_date: string | null; tutor_name: string; coach_name: string;
+  programme_name?: string; cohort_name?: string; group_name?: string; total_otjh?: number | null;
+  weeks_number?: number | null; sessions_number?: number | null;
+  session_week_day?: string; session_start_time?: string; session_end_time?: string; learning_outcomes?: string[];
+  /** The curriculum spine for this module. Empty when the module has no plannable schedule. */
+  curriculumSlots?: PlanCurriculumSlot[];
+  /**
+   * The scheduler's own delivery end — the last DELIVERED session, holiday
+   * shifts included. Distinct from `end_date`, which is the stored date a human
+   * may have typed and which stops describing the run once a closure moves it.
+   */
+  effectiveEndDate?: string;
+  /** Where the run would have ended with nothing closed. */
+  originalEndDate?: string };
+export type PlanReview = Pick<LearnerCalendarEvent, 'id' | 'eventKey' | 'title' | 'source' | 'sequence' | 'status' | 'date' | 'targetDate' | 'scheduledDate' | 'scheduledTime' | 'durationMinutes' | 'coachName' | 'invited'> & { meetingLink?: string | null };
+export type TrainingPlanDashboard = {
+  months: Record<string, PlanMonth>;
+  monthlyOtjh?: Record<string, { planned: number | null; actual: number; missingPlannedActivities: number }>;
+  actual: { month: string; groupId: string | null; hours: number; count: number }[];
+  actualAvailable: boolean;
+  modules: PlanModule[];
+  moduleLinks: Record<string, { id: string; title: string }>;
+  sessions: PlanSession[];
+  reviews: PlanReview[];
+  coach: { name: string; bookingUrl: string | null };
+  contractStatus: string;
+  generatedAt: string;
+};
+
+export function fetchTrainingPlanDashboard(kind: LearnerKind, id: string, signal?: AbortSignal) {
+  // Share the same in-flight schedule read as This week / Upcoming on Dashboard.
+  return readLearnerJson<TrainingPlanDashboard>(`/learner_api/training-plan-dashboard/${kind}/${encodeURIComponent(id)}/?section=overview`, { signal, ttlMs: 30_000, revalidate: true });
+}
+
+export type TrainingPlanContract = Pick<TrainingPlanDashboard, 'months' | 'contractStatus'>;
+export function fetchTrainingPlanContract(kind: LearnerKind, id: string, signal?: AbortSignal) {
+  return subjectRequest<TrainingPlanContract>(`/learner_api/training-plan-dashboard/${kind}/${encodeURIComponent(id)}/?section=contract`, { signal });
+}

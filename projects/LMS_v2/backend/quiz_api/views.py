@@ -1,0 +1,4654 @@
+import json
+import copy
+import csv
+import html
+import io
+import base64
+import logging
+import mimetypes
+import re
+import zipfile
+from collections import defaultdict
+from pathlib import Path
+from posixpath import normpath
+from urllib.parse import quote, urlsplit
+from xml.etree import ElementTree
+
+from django.conf import settings
+from django.db import DatabaseError, connection, transaction
+
+from curriculum_api import schema_gate as curriculum_schema_gate
+from django.db.models import Max
+from django.http import FileResponse, Http404, HttpResponse, HttpResponseRedirect, JsonResponse
+from django.utils import timezone
+from django.views.decorators.clickjacking import xframe_options_sameorigin
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_http_methods
+
+from .models import QuizAnswer, QuizPackage, QuizQuestion
+from .question_images import validate_question_image
+from .answer_keys import choice_key_error, choice_label, quiz_publication_error
+from .key_readiness import quiz_requires_valid_key
+from .intake import InvalidQuizIntake, intake_error, key_indexes
+from learner_api.models import LearnerProfile
+
+logger = logging.getLogger(__name__)
+
+AI_GENERATION_MAX_FILE_SIZE = 50 * 1024 * 1024
+AI_GENERATION_MAX_CONTENT_CHARS = 60000
+AI_GENERATION_MAX_OCR_PDF_PAGES = 24
+AI_GENERATION_OCR_PAGE_BATCH_SIZE = 4
+AI_GENERATION_TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".xml", ".html", ".htm", ".json"}
+AI_GENERATION_QUESTION_TYPES = {
+    "single_choice",
+    "multiple_choice",
+    "true_false",
+    "matching",
+    "image_matching",
+    "keywords",
+    "fill_gap",
+    "ordering",
+}
+QUIZ_STATUSES = {"draft", "published", "pending", "validating", "trash", "private"}
+ASSESSMENT_TYPES = {"quiz", "checkpoint"}
+
+
+_TABLE_EXISTS_CACHE = set()
+_COLUMN_EXISTS_CACHE = set()
+
+
+def _quote_ident(value):
+    return '"' + str(value).replace('"', '""') + '"'
+
+
+def _curriculum_table_name(table):
+    return f'curriculum.{_quote_ident(table)}'
+
+
+def _curriculum_table_exists(table):
+    # Cached like curriculum_api.views.table_exists: the list endpoints ask the
+    # same question hundreds of times per request. Only "exists" is cached, so a
+    # table created later is still found and a failed probe is retried.
+    if table in _TABLE_EXISTS_CACHE:
+        return True
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                select 1
+                from information_schema.tables
+                where table_schema = 'curriculum'
+                  and table_name = %s
+                limit 1
+                """,
+                [table],
+            )
+            exists = bool(cursor.fetchone())
+    except Exception:
+        return False
+    if exists:
+        _TABLE_EXISTS_CACHE.add(table)
+    return exists
+
+
+def _curriculum_column_exists(table, column):
+    if (table, column) in _COLUMN_EXISTS_CACHE:
+        return True
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                select 1
+                from information_schema.columns
+                where table_schema = 'curriculum'
+                  and table_name = %s
+                  and column_name = %s
+                limit 1
+                """,
+                [table, column],
+            )
+            exists = bool(cursor.fetchone())
+    except Exception:
+        return False
+    if exists:
+        _COLUMN_EXISTS_CACHE.add((table, column))
+    return exists
+
+
+def _first_existing_curriculum_table(*tables):
+    return next((table for table in tables if _curriculum_table_exists(table)), "")
+
+
+def _quote_ident(value):
+    return '"' + str(value).replace('"', '""') + '"'
+
+
+def _curriculum_table_name(table):
+    return f'curriculum.{_quote_ident(table)}'
+
+
+def _curriculum_table_exists(table):
+    # Cached like curriculum_api.views.table_exists: the list endpoints ask the
+    # same question hundreds of times per request. Only "exists" is cached, so a
+    # table created later is still found and a failed probe is retried.
+    if table in _TABLE_EXISTS_CACHE:
+        return True
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                select 1
+                from information_schema.tables
+                where table_schema = 'curriculum'
+                  and table_name = %s
+                limit 1
+                """,
+                [table],
+            )
+            exists = bool(cursor.fetchone())
+    except Exception:
+        return False
+    if exists:
+        _TABLE_EXISTS_CACHE.add(table)
+    return exists
+
+
+def _training_plan_table_exists():
+    return _curriculum_table_exists("Training_plan")
+
+
+def _ensure_quiz_assessment_type_column():
+    'Verify the quiz schema; provision it only outside production.\n\n    This used to run on every quiz request — including plain GETs — issuing\n    ALTER TABLE plus several historical backfills that rewrote\n    ``curriculum.quizzes.programme_id``. That is schema management and data\n    migration inside a read path: it breaks on a read-only connection, and it is\n    how programme *names* (\'MM LVL6 L6\', \'PCP\', \'Fouda-Programme\') ended up\n    stored as programme *identifiers*.\n\n    All of its backfills are now inert in production (verified 2026-08-16):\n    ``curriculum."Training_plan"`` no longer exists, and 0 quiz rows carry a\n    numeric legacy ``programme_id``. Schema is migration-owned, so the DDL only\n    runs where a process is CHANGE_MEly allowed to own schema (the test runner or\n    a local opt-in).\n    '
+    if not curriculum_schema_gate.runtime_bootstrap_allowed():
+        curriculum_schema_gate.require_tables('quizzes')
+        return
+    _provision_quiz_assessment_type_column()
+
+
+def _provision_quiz_assessment_type_column():
+    """Create/upgrade quiz schema and run legacy backfills. NOT for request paths."""
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            do $$
+            begin
+              if exists (
+                select 1
+                from information_schema.columns
+                where table_schema = 'curriculum'
+                  and table_name = 'quizzes'
+                  and column_name = 'programme_id'
+                  and data_type <> 'character varying'
+              ) then
+                alter table curriculum.quizzes
+                alter column programme_id type varchar(128)
+                using programme_id::varchar;
+              end if;
+            end $$;
+            """
+        )
+
+        modules_table = _first_existing_curriculum_table("modules", "module_authoring_modules")
+        required_module_columns = {
+            "programme_id",
+            "programme_name",
+            "title",
+            "updated_at",
+            "created_at",
+        }
+        training_plan_exists = _curriculum_table_exists("Training_plan")
+        if modules_table and training_plan_exists and all(_curriculum_column_exists(modules_table, column) for column in required_module_columns):
+            cursor.execute(
+                f"""
+            with matches as (
+              select
+                q.id as quiz_id,
+                mam.programme_id,
+                row_number() over (
+                  partition by q.id
+                  order by
+                    case
+                      when lower(mam.title) = lower(q.module) then 0
+                      else 2
+                    end,
+                    mam.updated_at desc nulls last,
+                    mam.created_at desc nulls last
+                ) as match_rank
+              from curriculum.quizzes q
+              left join curriculum."Training_plan" tp
+                on q.programme_id ~ '^[0-9]+$'
+               and tp.id = q.programme_id::integer
+              join {_curriculum_table_name(modules_table)} mam
+                on coalesce(trim(mam.programme_id), '') <> ''
+               and (
+                 (
+                   lower(mam.title) = lower(q.module)
+                   or lower(q.module) like ('%%' || lower(mam.title) || '%%')
+                 )
+                 and (
+                   lower(mam.programme_name) = lower(q.programme)
+                   or lower(mam.programme_id) = lower(q.programme)
+                   or lower(mam.programme_name) = lower(tp."Program")
+                   or lower(mam.programme_id) = lower(tp."Program")
+                 )
+                 or lower(mam.programme_name) = lower(tp."Program")
+                 or lower(mam.programme_id) = lower(tp."Program")
+               )
+              where q.programme_id ~ '^[0-9]+$'
+            )
+            update curriculum.quizzes q
+            set programme_id = matches.programme_id
+            from matches
+            where q.id = matches.quiz_id
+              and matches.match_rank = 1
+            """
+            )
+        elif modules_table and all(_curriculum_column_exists(modules_table, column) for column in {"programme_id", "programme_name", "title"}):
+            cursor.execute(
+                f"""
+            with matches as (
+              select
+                q.id as quiz_id,
+                mam.programme_id,
+                row_number() over (
+                  partition by q.id
+                  order by
+                    case
+                      when lower(mam.title) = lower(q.module) then 0
+                      when lower(q.module) like ('%%' || lower(mam.title) || '%%') then 1
+                      else 2
+                    end,
+                    mam.programme_id
+                ) as match_rank
+              from curriculum.quizzes q
+              join {_curriculum_table_name(modules_table)} mam
+                on coalesce(trim(mam.programme_id), '') <> ''
+               and (
+                 lower(mam.programme_name) = lower(q.programme)
+                 or lower(mam.programme_id) = lower(q.programme)
+                 or (
+                   coalesce(trim(q.module), '') <> ''
+                   and (
+                     lower(mam.title) = lower(q.module)
+                     or lower(q.module) like ('%%' || lower(mam.title) || '%%')
+                   )
+                 )
+               )
+              where q.programme_id ~ '^[0-9]+$'
+            )
+            update curriculum.quizzes q
+            set programme_id = matches.programme_id
+            from matches
+            where q.id = matches.quiz_id
+              and matches.match_rank = 1
+            """
+            )
+        if _training_plan_table_exists():
+            cursor.execute(
+                """
+                with matches as (
+                  select
+                    q.id as quiz_id,
+                    mam.programme_id,
+                    row_number() over (
+                      partition by q.id
+                      order by
+                        case
+                          when lower(mam.title) = lower(q.module) then 0
+                          else 2
+                        end,
+                        mam.updated_at desc nulls last,
+                        mam.created_at desc nulls last
+                    ) as match_rank
+                  from curriculum.quizzes q
+                  left join curriculum."Training_plan" tp
+                    on q.programme_id ~ '^[0-9]+$'
+                   and tp.id = q.programme_id::integer
+                  join curriculum.modules mam
+                    on coalesce(trim(mam.programme_id), '') <> ''
+                   and (
+                     (
+                       lower(mam.title) = lower(q.module)
+                       or lower(q.module) like ('%%' || lower(mam.title) || '%%')
+                     )
+                     and (
+                       lower(mam.programme_name) = lower(q.programme)
+                       or lower(mam.programme_id) = lower(q.programme)
+                       or lower(mam.programme_name) = lower(tp."Program")
+                       or lower(mam.programme_id) = lower(tp."Program")
+                     )
+                     or lower(mam.programme_name) = lower(tp."Program")
+                     or lower(mam.programme_id) = lower(tp."Program")
+                   )
+                  where q.programme_id ~ '^[0-9]+$'
+                )
+                update curriculum.quizzes q
+                set programme_id = matches.programme_id
+                from matches
+                where q.id = matches.quiz_id
+                  and matches.match_rank = 1
+                """
+            )
+        else:
+            cursor.execute(
+                """
+                with matches as (
+                  select
+                    q.id as quiz_id,
+                    mam.programme_id,
+                    row_number() over (
+                      partition by q.id
+                      order by
+                        case
+                          when lower(mam.title) = lower(q.module) then 0
+                          else 2
+                        end,
+                        mam.updated_at desc nulls last,
+                        mam.created_at desc nulls last
+                    ) as match_rank
+                  from curriculum.quizzes q
+                  join curriculum.modules mam
+                    on coalesce(trim(mam.programme_id), '') <> ''
+                   and (
+                     lower(mam.title) = lower(q.module)
+                     or lower(q.module) like ('%%' || lower(mam.title) || '%%')
+                     or lower(mam.programme_name) = lower(q.programme)
+                     or lower(mam.programme_id) = lower(q.programme)
+                   )
+                  where q.programme_id ~ '^[0-9]+$'
+                )
+                update curriculum.quizzes q
+                set programme_id = matches.programme_id
+                from matches
+                where q.id = matches.quiz_id
+                  and matches.match_rank = 1
+                """
+            )
+        cursor.execute(
+            """
+            update curriculum.quizzes
+            set programme_id = programme
+            where programme_id ~ '^[0-9]+$'
+              and coalesce(trim(programme), '') <> ''
+              and programme !~ '^[0-9]+$'
+            """
+        )
+        cursor.execute(
+            """
+            alter table curriculum.quizzes
+            add column if not exists assessment_type varchar(40) not null default 'quiz'
+            """
+        )
+        cursor.execute(
+            """
+            alter table curriculum.quizzes
+            add column if not exists week_id varchar(128) not null default ''
+            """
+        )
+
+
+def _clean_assessment_type(value, default="quiz"):
+    assessment_type = str(value or default).strip().lower()
+    return assessment_type if assessment_type in ASSESSMENT_TYPES else default
+
+
+def _week_number_from_value(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return int(text)
+    week_match = re.search(r"\bweek\s*(\d+)\b", text, flags=re.IGNORECASE)
+    if week_match:
+        return int(week_match.group(1))
+    compact_match = re.search(r"(?:^|[-_\s])w(?:eek)?[-_\s]*(\d+)(?:$|[-_\s])", text, flags=re.IGNORECASE)
+    if compact_match:
+        return int(compact_match.group(1))
+    return None
+
+
+def _build_week_id(programme_id, week_value):
+    week_number = _week_number_from_value(week_value)
+    if not programme_id or not week_number:
+        return ""
+    return f"week-training-module-{programme_id}-{week_number}"
+
+
+def _is_int_like(value):
+    return str(value or "").strip().isdigit()
+
+
+def _format_size(size):
+    if size >= 1024 * 1024:
+        return f"{size / (1024 * 1024):.1f} MB"
+    if size >= 1024:
+        return f"{round(size / 1024)} KB"
+    return f"{size} B"
+
+
+QUIZ_PICKER_FIELDS = {
+    'id': 'id', 'title': 'title', 'programmeId': 'programme_id',
+    'programme': 'programme', 'module': 'module', 'weekId': 'week_id',
+    'questions': 'questions', 'status': 'status', 'assessmentType': 'assessment_type',
+    'duration': 'duration', 'passingGrade': 'passing_grade',
+}
+
+
+def _serialize_quiz(quiz):
+    return {
+        "id": quiz.id,
+        "title": quiz.title,
+        "programmeId": quiz.programme_id,
+        "module": quiz.module,
+        "programme": quiz.programme,
+        "version": quiz.version,
+        "questions": quiz.questions,
+        "defaultQuestionType": quiz.default_question_type,
+        "assessmentType": quiz.assessment_type,
+        "weekId": quiz.week_id,
+        "status": quiz.status,
+        "packageType": quiz.package_type,
+        "fileName": quiz.file_name,
+        "fileSize": quiz.file_size,
+        "displaySize": _format_size(quiz.file_size),
+        "schemaValid": quiz.schema_valid,
+        "validationMessage": quiz.validation_message,
+        "mappedComponents": quiz.mapped_components,
+        "author": quiz.author,
+        "linkedCourses": quiz.linked_courses,
+        "linkedGroups": getattr(quiz, "_linked_group_count", None),
+        "shortDescription": quiz.short_description,
+        "lessonContent": quiz.lesson_content,
+        "duration": quiz.duration,
+        "timeUnit": quiz.time_unit,
+        "quizStyle": quiz.quiz_style,
+        "randomizeQuestions": quiz.randomize_questions,
+        "randomizeAnswers": quiz.randomize_answers,
+        "showCorrectAnswer": quiz.show_correct_answer,
+        "attemptHistory": quiz.attempt_history,
+        "retakeAfterPass": quiz.retake_after_pass,
+        "limitAttempts": quiz.limit_attempts,
+        "passingGrade": quiz.passing_grade,
+        "retakePointsCut": quiz.retake_points_cut,
+        "publishedAt": quiz.published_at.isoformat() if quiz.published_at else None,
+        "createdAt": quiz.created_at.isoformat(),
+        "updatedAt": quiz.updated_at.isoformat(),
+    }
+
+
+def _clean_quiz_status(value, default="draft"):
+    status = str(value or default).strip().lower()
+    return status if status in QUIZ_STATUSES else default
+
+
+def _extract_text_for_ai(uploaded_file):
+    if not uploaded_file:
+        return ""
+    if uploaded_file.size > AI_GENERATION_MAX_FILE_SIZE:
+        raise ValueError("File is too large for question generation. Upload a file under 50 MB.")
+
+    extension = Path(uploaded_file.name).suffix.lower()
+    uploaded_file.seek(0)
+
+    if extension in AI_GENERATION_TEXT_EXTENSIONS:
+        return uploaded_file.read().decode("utf-8-sig", errors="replace")
+
+    if extension in {".xlsx", ".xlsm"}:
+        from openpyxl import load_workbook
+
+        workbook = load_workbook(uploaded_file, read_only=True, data_only=True)
+        lines = []
+        for sheet in workbook.worksheets[:3]:
+            lines.append(f"Sheet: {sheet.title}")
+            for row in sheet.iter_rows(values_only=True):
+                values = [str(value).strip() for value in row if value is not None and str(value).strip()]
+                if values:
+                    lines.append(" | ".join(values))
+        return "\n".join(lines)
+
+    if extension in {".pptx", ".pptm"}:
+        from pptx import Presentation
+
+        presentation = Presentation(uploaded_file)
+        lines = []
+        for slide_index, slide in enumerate(presentation.slides, start=1):
+            slide_lines = []
+            for shape in slide.shapes:
+                if hasattr(shape, "text") and shape.text:
+                    text = re.sub(r"\s+", " ", shape.text).strip()
+                    if text:
+                        slide_lines.append(text)
+            if slide_lines:
+                lines.append(f"Slide {slide_index}: " + " | ".join(slide_lines))
+        return "\n".join(lines)
+
+    if extension == ".pdf":
+        from pypdf import PdfReader
+
+        reader = PdfReader(uploaded_file)
+        lines = []
+        for page_index, page in enumerate(reader.pages[:30], start=1):
+            text = page.extract_text() or ""
+            text = re.sub(r"\s+", " ", text).strip()
+            if text:
+                lines.append(f"Page {page_index}: {text}")
+        text = "\n".join(lines)
+        if text:
+            return text
+        return _extract_pdf_text_with_vision(uploaded_file)
+
+    if extension == ".docx":
+        from docx import Document
+
+        document = Document(uploaded_file)
+        lines = []
+        for paragraph in document.paragraphs:
+            text = re.sub(r"\s+", " ", paragraph.text).strip()
+            if text:
+                lines.append(text)
+        for table in document.tables:
+            for row in table.rows:
+                values = [re.sub(r"\s+", " ", cell.text).strip() for cell in row.cells if cell.text.strip()]
+                if values:
+                    lines.append(" | ".join(values))
+        return "\n".join(lines)
+
+    if extension == ".zip":
+        lines = []
+        with zipfile.ZipFile(uploaded_file) as archive:
+            text_members = [
+                member for member in archive.infolist()
+                if not member.is_dir()
+                and Path(member.filename).suffix.lower() in AI_GENERATION_TEXT_EXTENSIONS
+                and member.file_size <= 512 * 1024
+            ]
+            for member in text_members[:40]:
+                with archive.open(member) as file:
+                    text = file.read().decode("utf-8-sig", errors="replace")
+                    text = re.sub(r"\s+", " ", text).strip()
+                    if text:
+                        lines.append(f"File {member.filename}: {text}")
+        return "\n".join(lines)
+
+    raise ValueError("Unsupported AI source file. Upload TXT, CSV, XML, HTML, XLSX, XLSM, PPTX, PPTM, PDF, DOCX or SCORM ZIP.")
+
+
+def _extract_pdf_text_with_vision(uploaded_file):
+    try:
+        import fitz
+        from openai import OpenAI
+    except ImportError:
+        return ""
+
+    uploaded_file.seek(0)
+    try:
+        document = fitz.open(stream=uploaded_file.read(), filetype="pdf")
+    except Exception:
+        uploaded_file.seek(0)
+        return ""
+
+    if not document.page_count:
+        return ""
+
+    client = OpenAI(api_key=settings.OPENAI_API_KEY)
+    extracted_pages = []
+    total_pages = min(document.page_count, AI_GENERATION_MAX_OCR_PDF_PAGES)
+
+    for batch_start in range(0, total_pages, AI_GENERATION_OCR_PAGE_BATCH_SIZE):
+        content = [{
+            "type": "input_text",
+            "text": (
+                "Extract all readable text from these PDF page images for LMS quiz generation. "
+                "Preserve slide/page headings and bullet meaning. Return plain text only, grouped by page. "
+                "Do not summarise and do not add external knowledge."
+            ),
+        }]
+        for page_index in range(batch_start, min(batch_start + AI_GENERATION_OCR_PAGE_BATCH_SIZE, total_pages)):
+            page = document.load_page(page_index)
+            pixmap = page.get_pixmap(dpi=140, alpha=False)
+            image_data = base64.b64encode(pixmap.tobytes("png")).decode("ascii")
+            content.append({
+                "type": "input_image",
+                "image_url": f"data:image/png;base64,{image_data}",
+            })
+
+        try:
+            response = client.responses.create(
+                model=settings.OPENAI_MODEL,
+                input=[{"role": "user", "content": content}],
+            )
+            batch_text = response.output_text.strip()
+            if batch_text:
+                extracted_pages.append(batch_text)
+        except Exception:
+            continue
+
+    uploaded_file.seek(0)
+    return "\n\n".join(extracted_pages)
+
+
+def _extract_text_from_ai_files_with_report(files):
+    extracted_chunks = []
+    unreadable_files = []
+    for uploaded_file in sorted(files[:10], key=lambda file: file.name.lower()):
+        try:
+            extracted = _extract_text_for_ai(uploaded_file).strip()
+        except ValueError:
+            # File-level validation problems (too large, unsupported type) must
+            # surface to the caller as a 400, not be swallowed here.
+            raise
+        except Exception:
+            # A single unreadable/corrupt file, or a missing optional extraction
+            # dependency, should mark that file unreadable rather than 500 the
+            # whole generation request.
+            logger.exception("AI source extraction failed for %s", getattr(uploaded_file, "name", "?"))
+            extracted = ""
+        if extracted:
+            extracted_chunks.append((uploaded_file.name, extracted))
+        else:
+            unreadable_files.append(uploaded_file.name)
+
+    if not extracted_chunks:
+        return "", [], unreadable_files
+
+    per_file_budget = max(6000, AI_GENERATION_MAX_CONTENT_CHARS // len(extracted_chunks))
+    chunks = [
+        f"Source file: {name}\n{text[:per_file_budget]}"
+        for name, text in extracted_chunks
+    ]
+    return "\n\n".join(chunks)[:AI_GENERATION_MAX_CONTENT_CHARS], [name for name, _ in extracted_chunks], unreadable_files
+
+
+def _extract_text_from_ai_files(files):
+    source_text, _, _ = _extract_text_from_ai_files_with_report(files)
+    return source_text
+
+
+def _source_file_names_from_text(source_text):
+    return [name.strip() for name in re.findall(r"^Source file:\s*(.+)$", source_text, flags=re.MULTILINE)]
+
+
+def _question_allocation_instruction(source_files, question_count):
+    if not source_files:
+        return "No uploaded source-file split was detected; distribute questions across the distinct themes in the source content."
+
+    readable_files = list(dict.fromkeys(source_files))
+    if question_count < len(readable_files):
+        selected = readable_files[:question_count]
+        return (
+            "Required source coverage: create one question from each of these files and do not repeat a file: "
+            + "; ".join(selected)
+            + "."
+        )
+
+    base_count = question_count // len(readable_files)
+    remainder = question_count % len(readable_files)
+    allocations = []
+    for index, name in enumerate(readable_files):
+        extra = 1 if index >= len(readable_files) - remainder and remainder else 0
+        allocations.append((name, base_count + extra))
+
+    return (
+        "Required source-file allocation: "
+        + "; ".join(f"{name} = exactly {count} questions" for name, count in allocations)
+        + ". This allocation is mandatory; do not overrepresent one file."
+    )
+
+
+def _normalise_generated_questions(data, default_type="single_choice"):
+    raw_questions = data.get("questions", []) if isinstance(data, dict) else []
+    if not isinstance(raw_questions, list):
+        raise InvalidQuizIntake("AI questions must be a list.")
+    normalised = []
+    for question_index, item in enumerate(raw_questions):
+        if not isinstance(item, dict):
+            raise InvalidQuizIntake(f"Question {question_index + 1}: Expected a question object.")
+        text = str(item.get("question") or item.get("text") or "").strip()
+        question_type = _normalise_question_type(item.get("type") or default_type)
+        raw_options = item.get("options") if isinstance(item.get("options"), list) else []
+        if any(not isinstance(option, str) for option in raw_options):
+            raise InvalidQuizIntake(f"Question {question_index + 1}: Answer options must be text.")
+        options = [option.strip() for option in raw_options]
+        correct_answer = str(item.get("correct_answer") or item.get("correctAnswer") or "").strip()
+        explanation = str(item.get("explanation") or item.get("feedback") or "").strip()
+
+        if question_type in {"matching", "image_matching"} and not options:
+            pair_source = correct_answer
+            if "|" in pair_source:
+                pair_source = pair_source.split("|", 1)[1]
+            options = [part.strip() for part in re.split(r"\s*(?:;|\n)\s*", pair_source) if part.strip()]
+        if question_type == "keywords" and not options:
+            keyword_source = correct_answer
+            if "|" in keyword_source:
+                keyword_source = keyword_source.split("|", 1)[1]
+            options = [part.strip() for part in re.split(r"\s*(?:,|;|\n|\|)\s*", keyword_source) if part.strip()]
+        if question_type == "fill_gap" and not options and correct_answer:
+            options = [correct_answer]
+        parsed = _question_from_parts(text, options, correct_answer, question_type=question_type)
+        if question_type in {"ordering", "fill_gap"}:
+            options = [answer["text"] for answer in parsed["answers"]]
+            correct_indexes = set(range(len(options)))
+        else:
+            correct_indexes = {answer["sort_order"] for answer in parsed["answers"] if answer["is_correct"]}
+
+        answers = [
+            {
+                "id": -((question_index + 1) * 100 + answer_index + 1),
+                "text": option,
+                "isCorrect": answer_index in correct_indexes,
+            }
+            for answer_index, option in enumerate(options)
+        ]
+        normalised.append({
+            "id": -(question_index + 1),
+            "text": text,
+            "questionType": question_type,
+            "explanation": explanation,
+            "answers": answers,
+        })
+    return normalised
+
+
+def _program_candidates(programme):
+    if not programme:
+        return []
+
+    cleaned = re.sub(r"\s+", " ", programme).strip()
+    candidates = [cleaned]
+    level_match = re.search(r"(?:level|lvl|l)\s*(\d+)", cleaned, flags=re.IGNORECASE)
+    words = [word for word in re.findall(r"[A-Za-z]+", cleaned) if word.lower() not in {"level", "lvl"}]
+    if words and level_match:
+        initials = "".join(word[0].upper() for word in words[:2])
+        candidates.append(f"{initials} L{level_match.group(1)}")
+    return list(dict.fromkeys(candidates))
+
+
+def _match_training_plan_id(programme, module, title):
+    if not _curriculum_table_exists("Training_plan"):
+        return None
+
+    if not _training_plan_table_exists():
+        return None
+    candidates = _program_candidates(programme)
+    module_text = module or ""
+    title_text = title or ""
+
+    try:
+        with connection.cursor() as cursor:
+            if candidates:
+                program_clauses = []
+                params = []
+                for candidate in candidates:
+                    program_clauses.append('(lower("Program") = lower(%s) or lower("Program") like %s)')
+                    params.extend([candidate, f"%{candidate.lower()}%"])
+
+                cursor.execute(
+                    f"""
+                    select id
+                    from curriculum."Training_plan"
+                    where {" or ".join(program_clauses)}
+                    order by
+                      case
+                        when lower(module_name) = lower(%s) then 0
+                        when lower(%s) like ('%%' || lower(module_name) || '%%') then 1
+                        when lower(%s) like ('%%' || lower(module_name) || '%%') then 2
+                        else 3
+                      end,
+                      length(module_name) desc,
+                      id desc
+                    limit 1
+                    """,
+                    [*params, module_text, module_text, title_text],
+                )
+                row = cursor.fetchone()
+                if row:
+                    return row[0]
+
+            cursor.execute(
+                """
+                select id
+                from curriculum."Training_plan"
+                where lower(%s) like ('%%' || lower(module_name) || '%%')
+                   or lower(%s) like ('%%' || lower(module_name) || '%%')
+                order by length(module_name) desc, id desc
+                limit 1
+                """,
+                [module_text, title_text],
+            )
+            row = cursor.fetchone()
+            return row[0] if row else None
+    except Exception:
+        return None
+
+
+def _match_programme_catalogue_id(programme, module, title, supplied_id=None):
+    supplied_text = str(supplied_id or "").strip()
+    if supplied_text and not _is_int_like(supplied_text):
+        return supplied_text
+
+    modules_table = _first_existing_curriculum_table("modules", "module_authoring_modules")
+    if not modules_table or not _curriculum_column_exists(modules_table, "programme_id"):
+        return supplied_text or programme or ""
+
+    candidates = _program_candidates(programme)
+    module_text = module or ""
+    title_text = title or ""
+
+    try:
+        with connection.cursor() as cursor:
+            if (
+                supplied_text
+                and _curriculum_table_exists("Training_plan")
+                and _curriculum_column_exists(modules_table, "programme_name")
+                and _curriculum_column_exists(modules_table, "title")
+            ):
+                cursor.execute(
+                    f"""
+                    select mam.programme_id
+                    from curriculum."Training_plan" tp
+                    join {_curriculum_table_name(modules_table)} mam
+                      on coalesce(trim(mam.programme_id), '') <> ''
+                     and (
+                       lower(mam.programme_name) = lower(tp."Program")
+                       or lower(mam.programme_id) = lower(tp."Program")
+                     )
+                    where tp.id = %s
+                    order by
+                      case
+                        when lower(mam.title) = lower(%s) then 0
+                        when lower(%s) like ('%%' || lower(mam.title) || '%%') then 1
+                        else 2
+                      end,
+                      {f"mam.{_quote_ident('updated_at')} desc nulls last," if _curriculum_column_exists(modules_table, "updated_at") else ""}
+                      {f"mam.{_quote_ident('created_at')} desc nulls last," if _curriculum_column_exists(modules_table, "created_at") else ""}
+                      mam.programme_id
+                    limit 1
+                    """,
+                    [supplied_text, module_text, module_text],
+                )
+                row = cursor.fetchone()
+                if row and row[0]:
+                    return row[0]
+                if _training_plan_table_exists():
+                    cursor.execute(
+                        """
+                        select mam.programme_id
+                        from curriculum."Training_plan" tp
+                        join curriculum.modules mam
+                          on coalesce(trim(mam.programme_id), '') <> ''
+                         and (
+                           lower(mam.programme_name) = lower(tp."Program")
+                           or lower(mam.programme_id) = lower(tp."Program")
+                         )
+                        where tp.id = %s
+                        order by
+                          case
+                            when lower(mam.title) = lower(%s) then 0
+                            when lower(%s) like ('%%' || lower(mam.title) || '%%') then 1
+                            else 2
+                          end,
+                          mam.updated_at desc nulls last,
+                          mam.created_at desc nulls last
+                        limit 1
+                        """,
+                        [supplied_text, module_text, module_text],
+                    )
+                    row = cursor.fetchone()
+                    if row and row[0]:
+                        return row[0]
+
+            programme_clauses = []
+            params = []
+            for candidate in candidates:
+                candidate_clauses = ["lower(programme_id) = lower(%s)"]
+                params.append(candidate)
+                if _curriculum_column_exists(modules_table, "programme_name"):
+                    candidate_clauses.extend([
+                        "lower(programme_name) = lower(%s)",
+                        "lower(%s) like lower(programme_name) || ' %%'",
+                    ])
+                    params.extend([candidate, candidate])
+                programme_clauses.append(f"({' or '.join(candidate_clauses)})")
+
+            where_programme = f"and ({' or '.join(programme_clauses)})" if programme_clauses else ""
+            title_order_sql = (
+                """
+                case
+                  when lower(title) = lower(%s) then 0
+                  when lower(%s) like ('%%' || lower(title) || '%%') then 1
+                  when lower(%s) like ('%%' || lower(title) || '%%') then 2
+                  else 3
+                end,
+                length(title) desc,
+                """
+                if _curriculum_column_exists(modules_table, "title")
+                else ""
+            )
+            timestamp_order_sql = ""
+            if _curriculum_column_exists(modules_table, "updated_at"):
+                timestamp_order_sql += "updated_at desc nulls last,"
+            if _curriculum_column_exists(modules_table, "created_at"):
+                timestamp_order_sql += "created_at desc nulls last,"
+            cursor.execute(
+                f"""
+                select programme_id
+                from {_curriculum_table_name(modules_table)}
+                where coalesce(trim(programme_id), '') <> ''
+                  {where_programme}
+                order by
+                  {title_order_sql}
+                  {timestamp_order_sql}
+                  programme_id
+                limit 1
+                """,
+                [*params, *([module_text, module_text, title_text] if title_order_sql else [])],
+            )
+            row = cursor.fetchone()
+            return row[0] if row else (supplied_text or "")
+    except Exception:
+        return supplied_text or ""
+
+
+def _training_plan_programme_for_id(plan_id):
+    if not _training_plan_table_exists():
+        return ""
+    if not plan_id or not _is_int_like(plan_id):
+        return ""
+    if not _curriculum_table_exists("Training_plan"):
+        return ""
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                'select "Program" from curriculum."Training_plan" where id = %s limit 1',
+                [plan_id],
+            )
+            row = cursor.fetchone()
+            return row[0] if row else ""
+    except Exception:
+        return ""
+
+
+def _authoring_programmes():
+    modules_table = _first_existing_curriculum_table("modules", "module_authoring_modules")
+    if not modules_table or not _curriculum_column_exists(modules_table, "programme_id"):
+        return []
+
+    programme_name_sql = "programme_name" if _curriculum_column_exists(modules_table, "programme_name") else "programme_id"
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                select
+                  programme_id,
+                  max(nullif({programme_name_sql}, '')) as programme_name,
+                  count(*) as rows_count
+                from {_curriculum_table_name(modules_table)}
+                where coalesce(trim(programme_id), '') <> ''
+                group by programme_id
+                order by max(nullif({programme_name_sql}, '')), programme_id
+                """
+            )
+            programmes = []
+            for programme_id, programme_name, rows_count in cursor.fetchall():
+                name = programme_name or programme_id
+                if _is_placeholder_training_value(name):
+                    continue
+                programmes.append({
+                    "id": programme_id,
+                    "name": name,
+                    "trainingPlanRows": rows_count,
+                    "moduleCount": rows_count,
+                })
+            return programmes
+    except Exception:
+        return []
+
+
+def _authoring_programme_map(programme_ids):
+    ids = [str(programme_id or "").strip() for programme_id in programme_ids if str(programme_id or "").strip()]
+    if not ids:
+        return {}
+
+    modules_table = _first_existing_curriculum_table("modules", "module_authoring_modules")
+    if not modules_table or not _curriculum_column_exists(modules_table, "programme_id"):
+        return {}
+
+    programme_name_sql = "programme_name" if _curriculum_column_exists(modules_table, "programme_name") else "programme_id"
+    try:
+        with connection.cursor() as cursor:
+            placeholders = ", ".join(["%s"] * len(ids))
+            cursor.execute(
+                f"""
+                select programme_id, max(nullif({programme_name_sql}, '')) as programme_name
+                from {_curriculum_table_name(modules_table)}
+                where programme_id in ({placeholders})
+                group by programme_id
+                """,
+                ids,
+            )
+            return {programme_id: (programme_name or programme_id) for programme_id, programme_name in cursor.fetchall()}
+    except Exception:
+        return {}
+
+
+def _training_plan_programmes():
+    authoring_programmes = _authoring_programmes()
+    if authoring_programmes:
+        return authoring_programmes
+
+    if not _curriculum_table_exists("Training_plan"):
+        return []
+    if not _training_plan_table_exists():
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    select programme_name, count(*) as rows_count
+                    from curriculum.modules
+                    where coalesce(trim(programme_name), '') <> ''
+                    group by programme_name
+                    order by programme_name
+                    """
+                )
+                return [{"name": row[0], "trainingPlanRows": row[1]} for row in cursor.fetchall()]
+        except Exception:
+            return []
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                select "Program", count(*) as rows_count
+                from curriculum."Training_plan"
+                where coalesce(trim("Program"), '') <> ''
+                group by "Program"
+                order by "Program"
+                """
+            )
+            return [{"name": row[0], "trainingPlanRows": row[1]} for row in cursor.fetchall()]
+    except Exception:
+        return []
+
+
+def _training_plan_programme_map(plan_ids):
+    authoring_map = _authoring_programme_map(plan_ids)
+    if authoring_map:
+        return authoring_map
+
+    if not _curriculum_table_exists("Training_plan"):
+        return {}
+    if not _training_plan_table_exists():
+        return {}
+    ids = [int(plan_id) for plan_id in plan_ids if _is_int_like(plan_id)]
+    if not ids:
+        return {}
+    try:
+        with connection.cursor() as cursor:
+            placeholders = ", ".join(["%s"] * len(ids))
+            cursor.execute(
+                f'select id, "Program" from curriculum."Training_plan" where id in ({placeholders})',
+                ids,
+            )
+            return {row[0]: row[1] for row in cursor.fetchall()}
+    except Exception:
+        return {}
+
+
+def _ensure_quiz_course_links_table():
+    """Verify the quiz->course link table; provision only outside production."""
+    if not curriculum_schema_gate.runtime_bootstrap_allowed():
+        curriculum_schema_gate.require_tables('quiz_course_links')
+        return
+    _provision_quiz_course_links_table()
+
+
+def _provision_quiz_course_links_table():
+    """Create/upgrade the quiz->course link table. NOT for request paths."""
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            create table if not exists curriculum.quiz_course_links (
+              id bigserial primary key,
+              quiz_id bigint not null references curriculum.quizzes(id) on delete cascade,
+              module_catalogue_id varchar(128) not null default '',
+              week_id varchar(128) not null default '',
+              created_at timestamptz not null default now()
+            )
+            """
+        )
+        cursor.execute(
+            """
+            alter table curriculum.quiz_course_links
+            add column if not exists module_catalogue_id varchar(128) not null default ''
+            """
+        )
+        cursor.execute(
+            """
+            alter table curriculum.quiz_course_links
+            add column if not exists week_id varchar(128) not null default ''
+            """
+        )
+        if _curriculum_column_exists("quiz_course_links", "training_plan_id"):
+            cursor.execute(
+                """
+                update curriculum.quiz_course_links
+                set module_catalogue_id = coalesce(nullif(module_catalogue_id, ''), training_plan_id::varchar)
+                """
+            )
+        cursor.execute(
+            """
+            alter table curriculum.quiz_course_links
+            alter column module_catalogue_id type varchar(128)
+            using module_catalogue_id::varchar
+            """
+        )
+        cursor.execute(
+            """
+            create unique index if not exists quiz_course_links_quiz_module_catalogue_key
+            on curriculum.quiz_course_links (quiz_id, module_catalogue_id)
+            """
+        )
+
+
+def _ensure_quiz_component_links_table():
+    """Verify the quiz->component link table; provision only outside production."""
+    if not curriculum_schema_gate.runtime_bootstrap_allowed():
+        curriculum_schema_gate.require_tables('quiz_component_links')
+        return
+    _provision_quiz_component_links_table()
+
+
+def _provision_quiz_component_links_table():
+    """Create/upgrade the quiz->component link table. NOT for request paths."""
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            create table if not exists curriculum.quiz_component_links (
+              id bigserial primary key,
+              quiz_id bigint not null references curriculum.quizzes(id) on delete cascade,
+              component_id varchar(128) not null,
+              created_at timestamptz not null default now(),
+              unique (quiz_id, component_id)
+            )
+            """
+        )
+
+
+def _quiz_course_link_ids(quiz_id):
+    return [row["moduleCatalogueId"] for row in _quiz_course_link_rows(quiz_id)]
+
+
+def _quiz_course_link_rows(quiz_id):
+    if not _curriculum_table_exists("quiz_course_links"):
+        return []
+    _ensure_quiz_course_links_table()
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "select module_catalogue_id, coalesce(week_id, '') from curriculum.quiz_course_links where quiz_id = %s order by module_catalogue_id",
+            [quiz_id],
+        )
+        return [
+            {
+                "moduleCatalogueId": str(row[0] or "").strip(),
+                "weekId": str(row[1] or "").strip(),
+            }
+            for row in cursor.fetchall()
+            if str(row[0] or "").strip()
+        ]
+
+
+def _format_module_week_label(week_title, week_number):
+    title = str(week_title or "").strip()
+    if week_number in (None, ""):
+        return title or "Untitled week"
+    prefix = f"Week {week_number}"
+    if title and title.lower() != prefix.lower():
+        return f"{prefix} - {title}"
+    return prefix
+
+
+def _quiz_module_week_options(module_ids):
+    module_ids = sorted({str(module_id or "").strip() for module_id in (module_ids or []) if str(module_id or "").strip()})
+    weeks_table = _first_existing_curriculum_table("weeks", "module_authoring_weeks")
+    if not weeks_table or not module_ids or not _curriculum_column_exists(weeks_table, "module_catalogue_id"):
+        return {}
+
+    def column_sql(table, alias, column, fallback):
+        return f"{alias}.{_quote_ident(column)}" if _curriculum_column_exists(table, column) else fallback
+
+    title_sql = column_sql(weeks_table, "w", "title", "''")
+    week_number_sql = column_sql(weeks_table, "w", "week_number", "null")
+    display_order_sql = column_sql(weeks_table, "w", "display_order", week_number_sql)
+    try:
+        with connection.cursor() as cursor:
+            placeholders = ", ".join(["%s"] * len(module_ids))
+            cursor.execute(
+                f"""
+                select
+                  w.id,
+                  w.module_catalogue_id,
+                  coalesce({title_sql}, '') as week_title,
+                  {week_number_sql} as week_number,
+                  {display_order_sql} as display_order
+                from {_curriculum_table_name(weeks_table)} w
+                where coalesce(trim(w.module_catalogue_id), '') <> ''
+                  and w.module_catalogue_id in ({placeholders})
+                order by w.module_catalogue_id, coalesce({display_order_sql}, 0), coalesce({week_number_sql}, 0), w.id
+                """,
+                module_ids,
+            )
+            rows = cursor.fetchall()
+    except Exception:
+        return {}
+
+    options_by_module = {}
+    for week_id, module_id, week_title, week_number, _display_order in rows:
+        module_key = str(module_id or "").strip()
+        week_key = str(week_id or "").strip()
+        if not module_key or not week_key:
+            continue
+        options_by_module.setdefault(module_key, []).append({
+            "id": week_key,
+            "label": _format_module_week_label(week_title, week_number),
+        })
+    return options_by_module
+
+
+def _quiz_component_link_ids(quiz_id):
+    _ensure_quiz_component_links_table()
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "select component_id from curriculum.quiz_component_links where quiz_id = %s order by component_id",
+            [quiz_id],
+        )
+        return [row[0] for row in cursor.fetchall()]
+
+
+def _quiz_module_options(quiz, include_all_programmes=False):
+    programme_id = str(quiz.programme_id or "").strip()
+    programme = str(quiz.programme or "").strip()
+    modules_table = _first_existing_curriculum_table("modules", "module_authoring_modules")
+    if not modules_table or not _curriculum_column_exists(modules_table, "module_catalogue_id"):
+        return []
+
+    def column_sql(table, alias, column, fallback="''"):
+        return f"{alias}.{_quote_ident(column)}" if _curriculum_column_exists(table, column) else fallback
+
+    title_sql = column_sql(modules_table, "m", "title", "m.module_catalogue_id")
+    programme_id_sql = column_sql(modules_table, "m", "programme_id", "''")
+    programme_name_sql = column_sql(modules_table, "m", "programme_name", programme_id_sql)
+    cohort_sql = column_sql(modules_table, "m", "cohort_name", "''")
+    group_sql = column_sql(modules_table, "m", "group_name", "''")
+    start_date_sql = column_sql(modules_table, "m", "start_date", "null")
+    clauses = [
+        "coalesce(trim(m.module_catalogue_id), '') <> ''",
+        f"coalesce(trim(coalesce(nullif({title_sql}, ''), m.module_catalogue_id)), '') <> ''",
+    ]
+    params = []
+    if (programme_id or programme) and not include_all_programmes:
+        programme_clauses = []
+        if programme_id:
+            programme_clauses.extend([
+                f"lower({programme_id_sql}) = lower(%s)",
+                f"lower({programme_name_sql}) = lower(%s)",
+            ])
+            params.extend([programme_id, programme_id])
+        if programme:
+            programme_clauses.extend([
+                f"lower({programme_name_sql}) = lower(%s)",
+                f"lower(%s) like lower({programme_name_sql}) || ' %%'",
+                f"lower({programme_id_sql}) = lower(%s)",
+            ])
+            params.extend([programme, programme, programme])
+        if programme_clauses:
+            clauses.append(f"({' or '.join(programme_clauses)})")
+
+    where_sql = " and ".join(clauses)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                select
+                  m.module_catalogue_id,
+                  coalesce(nullif({title_sql}, ''), m.module_catalogue_id) as module_title,
+                  coalesce(nullif({programme_name_sql}, ''), nullif({programme_id_sql}, ''), 'Unassigned programme') as programme_name,
+                  coalesce(nullif({programme_id_sql}, ''), nullif({programme_name_sql}, ''), '') as programme_id,
+                  coalesce({cohort_sql}, '') as cohort_name,
+                  coalesce({group_sql}, '') as group_name,
+                  {start_date_sql} as start_date
+                from {_curriculum_table_name(modules_table)} m
+                where {where_sql}
+                order by programme_name, module_title, cohort_name, m.module_catalogue_id
+                """
+                ,
+                params,
+            )
+            rows = cursor.fetchall()
+    except Exception:
+        return []
+
+    weeks_by_module = _quiz_module_week_options(module_catalogue_id for module_catalogue_id, *_rest in rows)
+    options = []
+    seen = set()
+    for module_catalogue_id, module_title, programme_name, option_programme_id, cohort_name, group_name, start_date in rows:
+        module_id = str(module_catalogue_id or "").strip()
+        if not module_id or module_id in seen:
+            continue
+        seen.add(module_id)
+        label_parts = [module_title or module_id]
+        if cohort_name:
+            label_parts.append(str(cohort_name))
+        if start_date:
+            label_parts.append(str(start_date))
+        options.append({
+            "id": module_id,
+            "moduleCatalogueId": module_id,
+            "label": " - ".join(part for part in label_parts if part),
+            "programme": str(programme_name or programme or ""),
+            "programmeId": str(option_programme_id or ""),
+            "module": str(module_title or module_id),
+            "cohort": str(cohort_name or ""),
+            "group": str(group_name or ""),
+            "groups": [str(group_name).strip()] if str(group_name or "").strip() else [],
+            "startDate": str(start_date or ""),
+            "component": "",
+            "componentType": "quiz",
+            "week": "",
+            "weekId": "",
+            "weeks": weeks_by_module.get(module_id, []),
+            "source": "module-assignment",
+            'CHANGE_ME': False,
+        })
+    return options
+
+
+def _linked_component_module_ids_for_quiz(quiz):
+    module_ids = set()
+    for option in _merge_quiz_component_options(quiz):
+        if str(option.get("linkedQuizId") or "").strip() != str(quiz.id):
+            continue
+        module_id = str(option.get("moduleCatalogueId") or "").strip()
+        if module_id:
+            module_ids.add(module_id)
+
+    components_table = _first_existing_curriculum_table("components", "module_authoring_components")
+    if not components_table or not _curriculum_column_exists(components_table, "module_catalogue_id"):
+        return module_ids
+
+    try:
+        _ensure_quiz_component_links_table()
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                select distinct c.module_catalogue_id
+                from curriculum.quiz_component_links qcl
+                join {_curriculum_table_name(components_table)} c
+                  on c.id = qcl.component_id
+                where qcl.quiz_id = %s
+                  and coalesce(trim(c.module_catalogue_id), '') <> ''
+                """,
+                [quiz.id],
+            )
+            module_ids.update(str(row[0] or "").strip() for row in cursor.fetchall() if str(row[0] or "").strip())
+    except Exception:
+        pass
+
+    return module_ids
+
+
+def _infer_quiz_module_link_ids(quiz, options, preferred_ids=None):
+    if not options:
+        return set()
+
+    valid_ids = {str(option["id"]) for option in options}
+    preferred = {
+        str(value or "").strip()
+        for value in (preferred_ids or [])
+        if str(value or "").strip()
+    } & valid_ids
+    if preferred:
+        return preferred
+
+    quiz_module = str(quiz.module or "").strip().lower()
+    quiz_programme_id = str(quiz.programme_id or "").strip().lower()
+    quiz_programme = str(quiz.programme or "").strip().lower()
+    if not quiz_module:
+        return {next(iter(valid_ids))} if len(valid_ids) == 1 else set()
+
+    exact_matches = [
+        option
+        for option in options
+        if str(option.get("module") or "").strip().lower() == quiz_module
+    ]
+    if exact_matches:
+        if quiz_programme_id or quiz_programme:
+            return {str(option["id"]) for option in exact_matches}
+        programme_keys = {
+            (
+                str(option.get("programmeId") or "").strip().lower(),
+                str(option.get("programme") or "").strip().lower(),
+            )
+            for option in exact_matches
+        }
+        if len(programme_keys) == 1:
+            return {str(option["id"]) for option in exact_matches}
+
+    fuzzy_matches = [
+        option
+        for option in options
+        if quiz_module in str(option.get("module") or "").strip().lower()
+        or str(option.get("module") or "").strip().lower() in quiz_module
+    ]
+    if fuzzy_matches:
+        if quiz_programme_id or quiz_programme:
+            return {str(option["id"]) for option in fuzzy_matches}
+        programme_keys = {
+            (
+                str(option.get("programmeId") or "").strip().lower(),
+                str(option.get("programme") or "").strip().lower(),
+            )
+            for option in fuzzy_matches
+        }
+        if len(programme_keys) == 1:
+            return {str(option["id"]) for option in fuzzy_matches}
+
+    return {next(iter(valid_ids))} if len(valid_ids) == 1 else set()
+
+
+def _quiz_component_options(quiz):
+    programme_id = str(quiz.programme_id or "").strip()
+    programme = str(quiz.programme or "").strip()
+    module = str(quiz.module or "").strip()
+    components_table = _first_existing_curriculum_table("components", "module_authoring_components")
+    modules_table = _first_existing_curriculum_table("modules", "module_authoring_modules")
+    weeks_table = _first_existing_curriculum_table("weeks", "module_authoring_weeks")
+    if not components_table or not modules_table:
+        return []
+
+    def column_sql(table, alias, column, fallback="''"):
+        return f"{alias}.{_quote_ident(column)}" if _curriculum_column_exists(table, column) else fallback
+
+    component_type_sql = column_sql(components_table, "c", "type", "'quiz'")
+    clauses = [f"lower(coalesce({component_type_sql}, '')) in ('quiz', 'checkpoint')"]
+    params = []
+    if programme_id or programme:
+        programme_clauses = []
+        if programme_id:
+            if _curriculum_column_exists(modules_table, "programme_id"):
+                programme_clauses.append("lower(m.programme_id) = lower(%s)")
+                params.append(programme_id)
+            if _curriculum_column_exists(modules_table, "programme_name"):
+                programme_clauses.append("lower(m.programme_name) = lower(%s)")
+                params.append(programme_id)
+        if programme:
+            if _curriculum_column_exists(modules_table, "programme_name"):
+                programme_clauses.extend([
+                    "lower(m.programme_name) = lower(%s)",
+                    "lower(%s) like lower(m.programme_name) || ' %%'",
+                ])
+                params.extend([programme, programme])
+            if _curriculum_column_exists(modules_table, "programme_id"):
+                programme_clauses.append("lower(m.programme_id) = lower(%s)")
+                params.append(programme)
+        if programme_clauses:
+            clauses.append(f"({' or '.join(programme_clauses)})")
+    elif module and _curriculum_column_exists(modules_table, "title"):
+        clauses.append("(lower(m.title) = lower(%s) or lower(%s) like ('%%' || lower(m.title) || '%%'))")
+        params.extend([module, module])
+
+    where_sql = " and ".join(clauses)
+    weeks_join = (
+        f"left join {_curriculum_table_name(weeks_table)} w on w.id = c.week_id"
+        if weeks_table
+        else "left join (select null::varchar as id, null::integer as week_number) w on false"
+    )
+    week_number_sql = column_sql(weeks_table, "w", "week_number", "null") if weeks_table else "null"
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                select
+                  c.id,
+                  {column_sql(components_table, "c", "title", "'Untitled quiz component'")} as component_title,
+                  {column_sql(components_table, "c", "type", "'quiz'")} as component_type,
+                  {column_sql(components_table, "c", "week_id")} as week_id,
+                  {column_sql(components_table, "c", "module_catalogue_id")} as module_catalogue_id,
+                  {column_sql(components_table, "c", "settings_json", "'{}'")} as settings_json,
+                  {column_sql(modules_table, "m", "title", "'Module'")} as module_title,
+                  {column_sql(modules_table, "m", "programme_id")} as programme_id,
+                  {column_sql(modules_table, "m", "programme_name")} as programme_name,
+                  {column_sql(modules_table, "m", "cohort_name")} as cohort_name,
+                  {column_sql(modules_table, "m", "group_name")} as group_name,
+                  {week_number_sql} as week_number
+                from {_curriculum_table_name(components_table)} c
+                join {_curriculum_table_name(modules_table)} m
+                  on m.module_catalogue_id = c.module_catalogue_id
+                {weeks_join}
+                where {where_sql}
+                order by module_title, week_number nulls last, component_title, c.id
+                """,
+                params,
+            )
+            rows = cursor.fetchall()
+    except Exception:
+        return []
+
+    options = []
+    for component_id, title, component_type, week_id, module_catalogue_id, settings_json, module_title, component_programme_id, programme_name, cohort_name, group_name, week_number in rows:
+        component_id = str(component_id or "")
+        if isinstance(settings_json, str):
+            try:
+                settings_json = json.loads(settings_json or "{}")
+            except json.JSONDecodeError:
+                settings_json = {}
+        if not isinstance(settings_json, dict):
+            settings_json = {}
+        title = title or "Untitled quiz component"
+        module_title = module_title or module or "Module"
+        week_label = f"Week {week_number}" if week_number else ""
+        label_parts = [module_title, week_label, title]
+        context_parts = [part for part in (programme_name or component_programme_id, cohort_name, group_name) if part]
+        # Delivery groups the author assigned to this quiz component in the Week
+        # / Module Builder (stored on the component's own settings). These are
+        # what the Quiz Workspace popup surfaces; fall back to the module-level
+        # group only when no CHANGE_ME assignment was made.
+        raw_group_names = settings_json.get('CHANGE_MEGroupNames')
+        assigned_groups = (
+            [str(name).strip() for name in raw_group_names if str(name).strip()]
+            if isinstance(raw_group_names, list)
+            else []
+        )
+        options.append({
+            "id": component_id,
+            "componentId": component_id,
+            "label": " - ".join(part for part in label_parts if part),
+            "programme": programme_name or component_programme_id or programme,
+            "programmeId": component_programme_id or "",
+            "module": module_title,
+            "moduleCatalogueId": module_catalogue_id or "",
+            "component": title,
+            "componentType": component_type or "quiz",
+            "linkedQuizId": str(settings_json.get("linkedQuizId") or ""),
+            "weekId": week_id or "",
+            "week": week_number or "",
+            "cohort": cohort_name or "",
+            "group": group_name or "",
+            "groups": assigned_groups,
+            "source": "module",
+            "startDate": "",
+            "context": " - ".join(context_parts),
+        })
+    return options
+
+
+def _quiz_week_template_options(quiz):
+    'Quiz/checkpoint components inside Week Builder templates that link to this\n    quiz. These live in their own ``week_template_components`` table (separate\n    from module authoring), so the module-scoped lookup above never sees them —\n    a quiz used only in a (free or paid) week template would otherwise read as\n    "not linked". Matched purely by the CHANGE_ME ``linkedQuizId`` the Week\n    Builder stores; free templates carry no programme/module/cohort scope.'
+    if not _curriculum_table_exists("week_template_components"):
+        return []
+    quiz_id = str(quiz.id)
+    has_templates = _curriculum_table_exists("week_templates")
+    try:
+        with connection.cursor() as cursor:
+            if has_templates:
+                cursor.execute(
+                    """
+                    select c.id, c.title, c.type, c.settings_json,
+                           t.title, t.programme_name, t.course_type, t.group_name, t.module_catalogue_id
+                    from curriculum."week_template_components" c
+                    left join curriculum."week_templates" t on t.id = c.week_template_id
+                    where lower(coalesce(c.type, '')) in ('quiz', 'checkpoint')
+                    """
+                )
+            else:
+                cursor.execute(
+                    """
+                    select id, title, type, settings_json,
+                           null, null, null, null, null
+                    from curriculum."week_template_components"
+                    where lower(coalesce(type, '')) in ('quiz', 'checkpoint')
+                    """
+                )
+            rows = cursor.fetchall()
+    except Exception:
+        return []
+
+    options = []
+    for component_id, title, component_type, settings_json, template_title, programme_name, course_type, group_name, module_catalogue_id in rows:
+        component_id = str(component_id or "")
+        if isinstance(settings_json, str):
+            try:
+                settings_json = json.loads(settings_json or "{}")
+            except json.JSONDecodeError:
+                settings_json = {}
+        if not isinstance(settings_json, dict):
+            settings_json = {}
+        if str(settings_json.get("linkedQuizId") or "").strip() != quiz_id:
+            continue
+        raw_group_names = settings_json.get('CHANGE_MEGroupNames')
+        assigned_groups = (
+            [str(name).strip() for name in raw_group_names if str(name).strip()]
+            if isinstance(raw_group_names, list)
+            else []
+        )
+        title = title or "Quiz component"
+        is_free = str(course_type or "").strip().lower() == "free"
+        template_label = template_title or "Week template"
+        programme = programme_name or ("Free course" if is_free else "")
+        options.append({
+            "id": component_id,
+            "componentId": component_id,
+            "label": " - ".join(part for part in (template_label, title) if part),
+            "programme": programme,
+            "programmeId": "",
+            "module": template_label,
+            "moduleCatalogueId": module_catalogue_id or "",
+            "component": title,
+            "componentType": component_type or "quiz",
+            "linkedQuizId": quiz_id,
+            "weekId": "",
+            "week": "",
+            "cohort": "",
+            "group": group_name or "",
+            "groups": assigned_groups,
+            "source": "week-template",
+            "startDate": "",
+            "context": template_label,
+        })
+    return options
+
+
+def _merge_quiz_component_options(quiz):
+    """Module-authoring components + Week Builder template components, deduped by
+    id (module ids and template ids don't overlap in practice, but guard anyway)."""
+    merged = {}
+    for option in _quiz_component_options(quiz) + _quiz_week_template_options(quiz):
+        merged.setdefault(str(option["id"]), option)
+    return list(merged.values())
+
+
+def _infer_quiz_component_link_ids(quiz, options):
+    if not options:
+        return set()
+
+    quiz_id = str(quiz.id)
+    explicit_settings_links = {
+        option["id"]
+        for option in options
+        if str(option.get("linkedQuizId") or "").strip() == quiz_id
+    }
+    if explicit_settings_links:
+        return explicit_settings_links
+
+    quiz_title = str(quiz.title or "").strip().lower()
+    quiz_module = str(quiz.module or "").strip().lower()
+    quiz_week_id = str(quiz.week_id or "").strip()
+
+    exact_title = {
+        option["id"]
+        for option in options
+        if quiz_title and str(option.get("component") or "").strip().lower() == quiz_title
+    }
+    if exact_title:
+        return exact_title
+
+    same_week = [
+        option for option in options
+        if quiz_week_id and str(option.get("weekId") or "").strip() == quiz_week_id
+    ]
+    if len(same_week) == 1:
+        return {same_week[0]["id"]}
+
+    module_title_matches = [
+        option for option in options
+        if quiz_module and (
+            str(option.get("module") or "").strip().lower() == quiz_module
+            or quiz_module in str(option.get("module") or "").strip().lower()
+        )
+    ]
+    if len(module_title_matches) == 1:
+        return {module_title_matches[0]["id"]}
+
+    return set()
+
+
+def _distinct_group_count(options, selected_ids):
+    'Distinct delivery groups (case-insensitive) assigned across the CHANGE_ME\n    quiz components — this is the number the Quiz Workspace shows in its list.'
+    names = set()
+    for option in options:
+        if str(option["id"]) not in selected_ids:
+            continue
+        for name in (option.get("groups") or []):
+            cleaned = str(name).strip()
+            if cleaned:
+                names.add(cleaned.lower())
+    return len(names)
+
+
+def _sync_quiz_linked_component_count(quiz):
+    try:
+        _ensure_quiz_component_links_table()
+        options = _merge_quiz_component_options(quiz)
+        valid_ids = {str(option["id"]) for option in options}
+        selected_ids = set(_quiz_component_link_ids(quiz.id)) & valid_ids
+        if not selected_ids:
+            selected_ids = _infer_quiz_component_link_ids(quiz, options) & valid_ids
+        quiz._linked_group_count = _distinct_group_count(options, selected_ids)
+    except Exception:
+        return quiz
+
+    if quiz.linked_courses != len(selected_ids):
+        quiz.linked_courses = len(selected_ids)
+        quiz.save(update_fields=["linked_courses", "updated_at"])
+    return quiz
+
+
+def _sync_quiz_linked_component_counts(quizzes):
+    'Refresh list counters from CHANGE_ME component links without per-quiz queries.'
+    quizzes = list(quizzes)
+    if not quizzes:
+        return quizzes
+
+    quiz_ids = {str(quiz.id) for quiz in quizzes}
+    linked_component_ids = defaultdict(set)
+    linked_group_names = defaultdict(set)
+    components_table = _first_existing_curriculum_table("components", "module_authoring_components")
+    if components_table and _curriculum_column_exists(components_table, "settings_json"):
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    select id, settings_json
+                    from {_curriculum_table_name(components_table)}
+                    where lower(coalesce(type, '')) in ('quiz', 'checkpoint')
+                    """
+                )
+                for component_id, settings_json in cursor.fetchall():
+                    if isinstance(settings_json, str):
+                        try:
+                            settings_json = json.loads(settings_json or "{}")
+                        except json.JSONDecodeError:
+                            settings_json = {}
+                    if not isinstance(settings_json, dict):
+                        continue
+                    linked_quiz_id = str(settings_json.get("linkedQuizId") or "").strip()
+                    if linked_quiz_id in quiz_ids:
+                        linked_component_ids[linked_quiz_id].add(str(component_id))
+                        raw_groups = settings_json.get('CHANGE_MEGroupNames')
+                        if isinstance(raw_groups, list):
+                            for name in raw_groups:
+                                cleaned = str(name).strip()
+                                if cleaned:
+                                    linked_group_names[linked_quiz_id].add(cleaned.lower())
+        except Exception:
+            pass
+
+    # Week Builder template components (their own table) linked by linkedQuizId,
+    # so a quiz used only in a week template still counts on the list.
+    if _curriculum_table_exists("week_template_components"):
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    select id, settings_json
+                    from curriculum."week_template_components"
+                    where lower(coalesce(type, '')) in ('quiz', 'checkpoint')
+                    """
+                )
+                for component_id, settings_json in cursor.fetchall():
+                    if isinstance(settings_json, str):
+                        try:
+                            settings_json = json.loads(settings_json or "{}")
+                        except json.JSONDecodeError:
+                            settings_json = {}
+                    if not isinstance(settings_json, dict):
+                        continue
+                    linked_quiz_id = str(settings_json.get("linkedQuizId") or "").strip()
+                    if linked_quiz_id in quiz_ids:
+                        linked_component_ids[linked_quiz_id].add(str(component_id))
+                        raw_groups = settings_json.get('CHANGE_MEGroupNames')
+                        if isinstance(raw_groups, list):
+                            for name in raw_groups:
+                                cleaned = str(name).strip()
+                                if cleaned:
+                                    linked_group_names[linked_quiz_id].add(cleaned.lower())
+        except Exception:
+            pass
+
+    try:
+        _ensure_quiz_component_links_table()
+        placeholders = ", ".join(["%s"] * len(quiz_ids))
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"select quiz_id, component_id from curriculum.quiz_component_links where quiz_id in ({placeholders})",
+                list(quiz_ids),
+            )
+            for quiz_id, component_id in cursor.fetchall():
+                linked_component_ids[str(quiz_id)].add(str(component_id))
+    except Exception:
+        pass
+
+    for quiz in quizzes:
+        count = len(linked_component_ids.get(str(quiz.id), set()))
+        quiz._linked_group_count = len(linked_group_names.get(str(quiz.id), set()))
+        if count and quiz.linked_courses != count:
+            quiz.linked_courses = count
+            quiz.save(update_fields=["linked_courses", "updated_at"])
+    return quizzes
+
+
+def _distinct_assignment_group_count(options, selected_ids):
+    names = set()
+    for option in options:
+        if str(option.get("id")) not in selected_ids:
+            continue
+        group_name = str(option.get("group") or "").strip()
+        if group_name:
+            names.add(group_name.lower())
+        for name in (option.get("groups") or []):
+            cleaned = str(name).strip()
+            if cleaned:
+                names.add(cleaned.lower())
+    return len(names)
+
+
+def _selected_quiz_module_link_ids(quiz, module_options):
+    valid_ids = {str(option["id"]) for option in module_options}
+    selected_ids = set(_quiz_course_link_ids(quiz.id)) & valid_ids
+    if selected_ids:
+        return selected_ids
+    return _infer_quiz_module_link_ids(
+        quiz,
+        module_options,
+        preferred_ids=_linked_component_module_ids_for_quiz(quiz),
+    ) & valid_ids
+
+
+def _selected_quiz_module_link_assignments(quiz, module_options):
+    option_by_id = {str(option["id"]): option for option in module_options}
+    valid_ids = set(option_by_id)
+    rows = [
+        row
+        for row in _quiz_course_link_rows(quiz.id)
+        if str(row.get("moduleCatalogueId") or "").strip() in valid_ids
+    ]
+    if rows:
+        assignments = []
+        for row in rows:
+            module_id = str(row.get("moduleCatalogueId") or "").strip()
+            week_id = str(row.get("weekId") or "").strip()
+            valid_week_ids = {
+                str(week.get("id") or "").strip()
+                for week in (option_by_id.get(module_id, {}).get("weeks") or [])
+                if str(week.get("id") or "").strip()
+            }
+            assignments.append({
+                "moduleCatalogueId": module_id,
+                "weekId": week_id if not valid_week_ids or week_id in valid_week_ids else "",
+            })
+        return assignments
+
+    selected_ids = sorted(_selected_quiz_module_link_ids(quiz, module_options))
+    if len(selected_ids) == 1:
+        module_id = selected_ids[0]
+        valid_week_ids = {
+            str(week.get("id") or "").strip()
+            for week in (option_by_id.get(module_id, {}).get("weeks") or [])
+            if str(week.get("id") or "").strip()
+        }
+        if str(quiz.week_id or "").strip() and (
+            not valid_week_ids or str(quiz.week_id).strip() in valid_week_ids
+        ):
+            return [{
+                "moduleCatalogueId": module_id,
+                "weekId": str(quiz.week_id or "").strip(),
+            }]
+    return [{"moduleCatalogueId": module_id, "weekId": ""} for module_id in selected_ids]
+
+
+def _sync_quiz_assignment_count(quiz):
+    try:
+        _ensure_quiz_component_links_table()
+        _ensure_quiz_course_links_table()
+        component_options = _merge_quiz_component_options(quiz)
+        valid_component_ids = {str(option["id"]) for option in component_options}
+        selected_component_ids = set(_quiz_component_link_ids(quiz.id)) & valid_component_ids
+        if not selected_component_ids:
+            selected_component_ids = _infer_quiz_component_link_ids(quiz, component_options) & valid_component_ids
+
+        module_options = _quiz_module_options(quiz)
+        selected_module_ids = _selected_quiz_module_link_ids(quiz, module_options)
+        count = len(selected_module_ids) if selected_module_ids else len(selected_component_ids)
+        quiz._linked_group_count = _distinct_assignment_group_count(
+            module_options if selected_module_ids else component_options,
+            selected_module_ids if selected_module_ids else selected_component_ids,
+        )
+    except Exception:
+        return quiz
+
+    if quiz.linked_courses != count:
+        quiz.linked_courses = count
+        quiz.save(update_fields=["linked_courses", "updated_at"])
+    return quiz
+
+
+def _sync_quiz_assignment_counts(quizzes):
+    quizzes = list(quizzes)
+    if not quizzes:
+        return quizzes
+
+    quiz_ids = {str(quiz.id) for quiz in quizzes}
+    linked_component_ids = defaultdict(set)
+    linked_module_ids = defaultdict(set)
+    linked_group_names = defaultdict(set)
+    components_table = _first_existing_curriculum_table("components", "module_authoring_components")
+    if components_table and _curriculum_column_exists(components_table, "settings_json"):
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    select id, settings_json
+                    from {_curriculum_table_name(components_table)}
+                    where lower(coalesce(type, '')) in ('quiz', 'checkpoint')
+                    """
+                )
+                for component_id, settings_json in cursor.fetchall():
+                    if isinstance(settings_json, str):
+                        try:
+                            settings_json = json.loads(settings_json or "{}")
+                        except json.JSONDecodeError:
+                            settings_json = {}
+                    if not isinstance(settings_json, dict):
+                        continue
+                    linked_quiz_id = str(settings_json.get("linkedQuizId") or "").strip()
+                    if linked_quiz_id in quiz_ids:
+                        linked_component_ids[linked_quiz_id].add(str(component_id))
+                        raw_groups = settings_json.get('CHANGE_MEGroupNames')
+                        if isinstance(raw_groups, list):
+                            for name in raw_groups:
+                                cleaned = str(name).strip()
+                                if cleaned:
+                                    linked_group_names[linked_quiz_id].add(cleaned.lower())
+        except Exception:
+            pass
+
+    if _curriculum_table_exists("week_template_components"):
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    select id, settings_json
+                    from curriculum."week_template_components"
+                    where lower(coalesce(type, '')) in ('quiz', 'checkpoint')
+                    """
+                )
+                for component_id, settings_json in cursor.fetchall():
+                    if isinstance(settings_json, str):
+                        try:
+                            settings_json = json.loads(settings_json or "{}")
+                        except json.JSONDecodeError:
+                            settings_json = {}
+                    if not isinstance(settings_json, dict):
+                        continue
+                    linked_quiz_id = str(settings_json.get("linkedQuizId") or "").strip()
+                    if linked_quiz_id in quiz_ids:
+                        linked_component_ids[linked_quiz_id].add(str(component_id))
+                        raw_groups = settings_json.get('CHANGE_MEGroupNames')
+                        if isinstance(raw_groups, list):
+                            for name in raw_groups:
+                                cleaned = str(name).strip()
+                                if cleaned:
+                                    linked_group_names[linked_quiz_id].add(cleaned.lower())
+        except Exception:
+            pass
+
+    try:
+        _ensure_quiz_component_links_table()
+        placeholders = ", ".join(["%s"] * len(quiz_ids))
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"select quiz_id, component_id from curriculum.quiz_component_links where quiz_id in ({placeholders})",
+                list(quiz_ids),
+            )
+            for quiz_id, component_id in cursor.fetchall():
+                linked_component_ids[str(quiz_id)].add(str(component_id))
+    except Exception:
+        pass
+
+    try:
+        _ensure_quiz_course_links_table()
+        placeholders = ", ".join(["%s"] * len(quiz_ids))
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"select quiz_id, module_catalogue_id from curriculum.quiz_course_links where quiz_id in ({placeholders})",
+                list(quiz_ids),
+            )
+            for quiz_id, module_catalogue_id in cursor.fetchall():
+                module_id = str(module_catalogue_id or "").strip()
+                if module_id:
+                    linked_module_ids[str(quiz_id)].add(module_id)
+    except Exception:
+        pass
+
+    # Quizzes of one programme share the same module options; read them once
+    # per programme, and give each quiz its own copy.
+    module_options_by_programme = {}
+    for quiz in quizzes:
+        quiz_id = str(quiz.id)
+        count = len(linked_module_ids.get(quiz_id, set())) or len(linked_component_ids.get(quiz_id, set()))
+        group_count = len(linked_group_names.get(quiz_id, set()))
+        if not count:
+            programme_key = (str(quiz.programme_id or "").strip(), str(quiz.programme or "").strip())
+            if programme_key not in module_options_by_programme:
+                module_options_by_programme[programme_key] = _quiz_module_options(quiz)
+            module_options = copy.deepcopy(module_options_by_programme[programme_key])
+            inferred_module_ids = _infer_quiz_module_link_ids(quiz, module_options)
+            count = len(inferred_module_ids)
+            if inferred_module_ids:
+                group_count = _distinct_assignment_group_count(module_options, inferred_module_ids)
+        quiz._linked_group_count = group_count
+        if quiz.linked_courses != count:
+            quiz.linked_courses = count
+            quiz.save(update_fields=["linked_courses", "updated_at"])
+    return quizzes
+
+
+def _training_plan_courses_for_programme(programme):
+    if not programme:
+        return []
+    if not _curriculum_table_exists("Training_plan"):
+        return []
+    if not _training_plan_table_exists():
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                select
+                  module_catalogue_id,
+                  programme_name,
+                  title,
+                  cohort_name,
+                  start_date
+                from curriculum.modules
+                where (
+                  lower(trim(programme_name)) = lower(trim(%s))
+                  or lower(trim(programme_id)) = lower(trim(%s))
+                )
+                  and coalesce(trim(title), '') <> ''
+                order by title, cohort_name, module_catalogue_id
+                """,
+                [programme, programme],
+            )
+            rows = cursor.fetchall()
+
+    courses = []
+    seen = set()
+    for module_id, program, module_name, cohort_name, starting_date in rows:
+        if _is_placeholder_training_value(program) or _is_placeholder_training_value(module_name):
+            continue
+        key = (module_name, cohort_name or "", starting_date or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        label_parts = [module_name]
+        if cohort_name:
+            label_parts.append(cohort_name)
+        if starting_date:
+            label_parts.append(str(starting_date))
+        courses.append({
+            "id": module_id,
+            "programme": program,
+            "module": module_name,
+            "cohort": cohort_name or "",
+            "startDate": str(starting_date or ""),
+            "label": " - ".join(label_parts),
+        })
+    return courses
+
+
+def _is_placeholder_training_value(value):
+    text = (value or "").lower()
+    return "test" in text or "delete" in text
+
+
+@require_http_methods(["GET"])
+def training_plan_options(request):
+    modules_table = _first_existing_curriculum_table("modules", "module_authoring_modules")
+    rows = []
+    if modules_table and _curriculum_column_exists(modules_table, "module_catalogue_id"):
+        title_sql = "title" if _curriculum_column_exists(modules_table, "title") else "module_catalogue_id"
+        programme_id_sql = "programme_id" if _curriculum_column_exists(modules_table, "programme_id") else "''"
+        programme_name_sql = "programme_name" if _curriculum_column_exists(modules_table, "programme_name") else programme_id_sql
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    select
+                      coalesce(nullif({programme_name_sql}, ''), nullif({programme_id_sql}, ''), 'Unassigned programme') as programme,
+                      coalesce(nullif({title_sql}, ''), module_catalogue_id) as module_name,
+                      coalesce(nullif({programme_id_sql}, ''), nullif({programme_name_sql}, ''), '') as programme_id,
+                      null::integer as training_plan_id,
+                      module_catalogue_id
+                    from {_curriculum_table_name(modules_table)}
+                    where coalesce(trim(coalesce(nullif({title_sql}, ''), module_catalogue_id)), '') <> ''
+                    order by programme, module_name
+                    """
+                )
+                rows = cursor.fetchall()
+        except Exception:
+            rows = []
+
+    if not rows and _curriculum_table_exists("Training_plan"):
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    select
+                      tp."Program",
+                      tp.module_name,
+                      max(tp."Program") as programme_id,
+                      max(tp.id) as training_plan_id,
+                      '' as module_catalogue_id
+                    from curriculum."Training_plan" tp
+                    where coalesce(trim(tp."Program"), '') <> ''
+                      and coalesce(trim(tp.module_name), '') <> ''
+                    group by tp."Program", tp.module_name
+                    order by tp."Program", tp.module_name
+                    """
+                )
+                rows = cursor.fetchall()
+        except Exception:
+            rows = []
+    try:
+        with connection.cursor() as cursor:
+            if _training_plan_table_exists():
+                cursor.execute(
+                    """
+                    select
+                      tp."Program",
+                      tp.module_name,
+                      max(coalesce(nullif(mam.programme_id, ''), tp."Program")) as programme_id,
+                      max(tp.id) as training_plan_id,
+                      max(mam.module_catalogue_id) as module_catalogue_id
+                    from curriculum."Training_plan" tp
+                    left join curriculum.modules mam
+                      on mam.title = tp.module_name
+                     and (
+                       mam.programme_id = tp."Program"
+                       or mam.programme_name = tp."Program"
+                       or tp."Program" like mam.programme_name || ' %%'
+                      )
+                    where coalesce(trim(tp."Program"), '') <> ''
+                      and coalesce(trim(tp.module_name), '') <> ''
+                    group by tp."Program", tp.module_name
+                    order by tp."Program", tp.module_name
+                    """
+                )
+            else:
+                cursor.execute(
+                    """
+                    select
+                      programme_name,
+                      title,
+                      programme_id,
+                      null::integer as training_plan_id,
+                      module_catalogue_id
+                    from curriculum.modules
+                    where coalesce(trim(programme_name), '') <> ''
+                      and coalesce(trim(title), '') <> ''
+                    order by programme_name, title
+                    """
+                )
+            rows = cursor.fetchall()
+    except Exception:
+        rows = []
+
+    programmes = []
+    modules_by_programme = {}
+    seen_programmes = set()
+    for programme, module_name, programme_id, training_plan_id, module_catalogue_id in rows:
+        if _is_placeholder_training_value(programme) or _is_placeholder_training_value(module_name):
+            continue
+        if programme not in seen_programmes:
+            programmes.append({"value": programme, "label": programme})
+            seen_programmes.add(programme)
+        modules_by_programme.setdefault(programme, []).append({
+            "value": module_name,
+            "label": module_name,
+            "programmeId": programme_id,
+            "trainingPlanId": training_plan_id,
+            "moduleId": module_catalogue_id or "",
+            "moduleCatalogueId": module_catalogue_id or "",
+        })
+
+    return JsonResponse({
+        "programmes": programmes,
+        "modulesByProgramme": modules_by_programme,
+    })
+
+
+def _package_type_from_extension(extension):
+    mapping = {
+        ".xml": "xml",
+        ".zip": "scorm",
+        ".scorm": "scorm",
+        ".xlsx": "excel",
+        ".xlsm": "excel",
+        ".csv": "csv",
+    }
+    return mapping.get(extension, "file")
+
+
+def _normalise_correct_answer(value):
+    if value is None:
+        return ""
+    text = str(value).strip()
+    match = re.fullmatch(r"([A-Z])(?:\s*[\).:\-\u2013\u2014]\s*.*)?", text, flags=re.IGNORECASE)
+    return match.group(1).upper() if match else text.lower()
+
+
+def _correct_answer_index(value):
+    key = _normalise_correct_answer(value)
+    if key.isdigit():
+        return max(int(key) - 1, 0)
+    if len(key) == 1 and key.isalpha():
+        return ord(key.upper()) - ord("A")
+    return 0
+
+
+def _question_from_parts(text, options, correct_answer="", explanation="", question_type="single_choice"):
+    question_type = _normalise_question_type(question_type or "single_choice")
+    answers = []
+    option_positions = []
+    for index, raw_option in enumerate(options):
+        option = str(raw_option or "").strip()
+        if not option:
+            continue
+        letter = chr(65 + index)
+        # Only remove an CHANGE_ME marker for this option's position. Natural
+        # text such as 'A private memo' and 'X (Twitter)' is not a marker.
+        option = re.sub(rf"^{letter}[\).:]\s+", "", option, flags=re.IGNORECASE).strip()
+        answers.append({
+            "text": option,
+            "is_correct": False,
+            "sort_order": index,
+        })
+        option_positions.append(index)
+
+    key_text = str(correct_answer or "").strip()
+    # Preserve original positions when blank CSV columns precede a keyed option.
+    padded = [""] * len(options)
+    for index, answer in enumerate(answers):
+        padded[option_positions[index]] = answer["text"]
+    selected = key_indexes(padded, key_text, ordered=question_type == "ordering", multiple=question_type == "multiple_choice")
+    if question_type == "ordering":
+        answers = [dict(text=padded[position], is_correct=True, sort_order=index)
+                   for index, position in enumerate(selected)]
+    elif question_type == "fill_gap":
+        answers = [dict(text=answer["text"], is_correct=True, sort_order=index)
+                   for index, answer in enumerate(a for a in answers if a["sort_order"] in selected)]
+    else:
+        for answer in answers:
+            answer["is_correct"] = question_type in {"matching", "image_matching", "keywords"} or answer["sort_order"] in selected
+
+    return {
+        "text": text.strip(),
+        "question_type": question_type,
+        "answers": answers,
+        "explanation": explanation.strip(),
+    }
+
+
+def _parse_questions_from_text(text):
+    questions = []
+    current_text = ""
+    current_options = []
+    current_answer = ""
+    current_explanation = ""
+
+    def flush():
+        nonlocal current_text, current_options, current_answer, current_explanation
+        if current_text:
+            questions.append(_question_from_parts(current_text, current_options, current_answer, current_explanation))
+        current_text = ""
+        current_options = []
+        current_answer = ""
+        current_explanation = ""
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        question_match = re.match(r"^(?:Q(?:uestion)?\s*)?\d+[\).:-]\s*(.+)$", line, flags=re.IGNORECASE)
+        if question_match:
+            flush()
+            current_text = question_match.group(1).strip()
+            continue
+
+        q_prefix = re.match(r"^Q(?:uestion)?[\s:.-]+(.+)$", line, flags=re.IGNORECASE)
+        if q_prefix:
+            flush()
+            current_text = q_prefix.group(1).strip()
+            continue
+
+        option_match = re.match(r"^([A-H])[\).:-]\s*(.+)$", line, flags=re.IGNORECASE)
+        if option_match:
+            current_options.append(f"{option_match.group(1).upper()}. {option_match.group(2).strip()}")
+            continue
+
+        answer_match = re.match(r"^(?:answer|correct\s*answer|correct)[:\s-]+(.+)$", line, flags=re.IGNORECASE)
+        if answer_match:
+            current_answer = answer_match.group(1).strip()
+            continue
+
+        explanation_match = re.match(r"^(?:explanation|feedback)[:\s-]+(.+)$", line, flags=re.IGNORECASE)
+        if explanation_match:
+            current_explanation = explanation_match.group(1).strip()
+            continue
+
+        if current_options:
+            current_options[-1] = f"{current_options[-1]} {line}"
+        elif current_text:
+            current_text = f"{current_text} {line}"
+
+    flush()
+    return [question for question in questions if question["text"]]
+
+
+def _parse_questions_from_xml(root):
+    def local_tag(node):
+        return str(node.tag or "").rsplit("}", 1)[-1].lower()
+
+    def descendants(node, *tags):
+        wanted = {str(tag).lower() for tag in tags}
+        return [child for child in node.iter() if child is not node and local_tag(child) in wanted]
+
+    def direct_child_text(node, *tags):
+        wanted = {str(tag).lower() for tag in tags}
+        for child in list(node):
+            if local_tag(child) in wanted:
+                value = "".join(child.itertext()).strip()
+                if value:
+                    return value
+        return ""
+
+    def nested_values(node, container_tags, value_tags):
+        containers = descendants(node, *container_tags)
+        values = []
+        for container in containers:
+            for child in descendants(container, *value_tags):
+                value = "".join(child.itertext()).strip()
+                if value:
+                    values.append((child, value))
+        return values
+
+    def marked_correct(node):
+        value = str(node.get("correct") or "").strip().lower()
+        if value in {"true", "1", "yes"}:
+            return True
+        try:
+            return float(node.get("fraction") or 0) > 0
+        except (TypeError, ValueError):
+            return False
+
+    def answer_letters(indexes):
+        return ", ".join(chr(65 + index) for index in indexes)
+
+    parsed = []
+    record_nodes = root.findall(".//record")
+    if record_nodes:
+        for record_node in record_nodes:
+            question_text = record_node.findtext("Question_Title") or record_node.findtext("question_title") or ""
+            if not question_text:
+                continue
+            correct_answer = record_node.findtext("Answer") or record_node.findtext("answer") or ""
+            explanation_index = _correct_answer_index(correct_answer)
+            explanation_tag = "Question_Explanation" if explanation_index == 0 else f"Question_Explanation_{explanation_index}"
+            options = [
+                record_node.findtext("Option_1"),
+                record_node.findtext("Option_2"),
+                record_node.findtext("Option_3"),
+                record_node.findtext("Option_4"),
+                record_node.findtext("Option_5"),
+            ]
+            parsed.append(_question_from_parts(
+                question_text,
+                options,
+                correct_answer,
+                record_node.findtext(explanation_tag) or "",
+                record_node.findtext("Question_Type") or "single_choice",
+            ))
+        return parsed
+
+    for question_node in descendants(root, "question"):
+        text = (
+            question_node.findtext("stem")
+            or question_node.findtext("text")
+            or question_node.findtext("question_text")
+            or question_node.get("text")
+            or ""
+        )
+        question_type = _normalise_question_type(
+            question_node.get("type")
+            or direct_child_text(question_node, "question_type", "questionType")
+            or "single_choice"
+        )
+        options = []
+        correct_indexes = []
+
+        if question_type in {"single_choice", "multiple_choice", "true_false"}:
+            option_nodes = descendants(question_node, "option")
+            if not option_nodes:
+                option_nodes = [node for node, _value in nested_values(question_node, {"answers"}, {"answer"})]
+            for option_node in option_nodes:
+                option_text = "".join(option_node.itertext()).strip()
+                if not option_text:
+                    continue
+                option_index = len(options)
+                options.append(option_text)
+                if marked_correct(option_node):
+                    correct_indexes.append(option_index)
+        elif question_type in {"matching", "image_matching"}:
+            for pair_node in descendants(question_node, "pair"):
+                left = direct_child_text(pair_node, "left")
+                right = direct_child_text(pair_node, "right")
+                image_url = direct_child_text(pair_node, "image", "image_url", "imageUrl")
+                label = direct_child_text(pair_node, "display", "label") or left
+                if not right or not (left or image_url or label):
+                    raise InvalidQuizIntake("Matching pairs need both a prompt/image and an answer.")
+                if question_type == "image_matching" and image_url:
+                    options.append(json.dumps({
+                        "kind": "image_matching_pair",
+                        "imageUrl": image_url,
+                        "label": label,
+                        "match": right,
+                    }, separators=(",", ":")))
+                else:
+                    options.append(f"{left or label} -> {right}")
+            correct_indexes = list(range(len(options)))
+        elif question_type == "keywords":
+            options = [value for _node, value in nested_values(
+                question_node,
+                {"acceptedkeywords", "accepted_keywords", "keywords"},
+                {"keyword"},
+            )]
+            correct_indexes = list(range(len(options)))
+        elif question_type == "fill_gap":
+            options = [value for _node, value in nested_values(
+                question_node,
+                {"acceptedanswers", "accepted_answers"},
+                {"answer"},
+            )]
+            if not options:
+                option_nodes = descendants(question_node, "option")
+                has_markers = any(node.get("correct") is not None or node.get("fraction") is not None for node in option_nodes)
+                options = ["".join(node.itertext()).strip() for node in option_nodes
+                           if "".join(node.itertext()).strip() and (not has_markers or marked_correct(node))]
+            correct_indexes = list(range(len(options)))
+        elif question_type == "ordering":
+            item_nodes = descendants(question_node, "item")
+            items = [
+                (str(node.get("id") or index + 1).strip(), "".join(node.itertext()).strip())
+                for index, node in enumerate(item_nodes)
+                if "".join(node.itertext()).strip()
+            ]
+            correct_order = direct_child_text(question_node, "correctOrder", "correct_order")
+            order_ids = [value.strip() for value in re.split(r"[,;|]", correct_order) if value.strip()]
+            if order_ids:
+                by_id = {item_id: value for item_id, value in items}
+                if len(by_id) != len(items) or len(order_ids) != len(items) or set(order_ids) != set(by_id):
+                    raise InvalidQuizIntake("The correct order must contain every item exactly once.")
+                options = [by_id[item_id] for item_id in order_ids]
+            else:
+                options = [value for _item_id, value in items]
+            correct_indexes = list(range(len(options)))
+        else:
+            option_nodes = descendants(question_node, "option")
+            for option_node in option_nodes:
+                option_text = "".join(option_node.itertext()).strip()
+                if not option_text:
+                    continue
+                option_index = len(options)
+                options.append(option_text)
+                if marked_correct(option_node):
+                    correct_indexes.append(option_index)
+
+        if text:
+            question = _question_from_parts(
+                text,
+                options,
+                answer_letters(correct_indexes),
+                question_node.findtext("feedback") or "",
+                question_type,
+            )
+            try:
+                question["points"] = max(int(question_node.get("points") or 1), 1)
+            except (TypeError, ValueError):
+                question["points"] = 1
+            parsed.append(question)
+    return parsed
+
+
+def _normalise_question_type(value):
+    text = str(value or "single_choice").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "single": "single_choice",
+        "singlechoice": "single_choice",
+        "multi_choice": "multiple_choice",
+        "multiple": "multiple_choice",
+        "multiplechoice": "multiple_choice",
+        "truefalse": "true_false",
+        "true_false": "true_false",
+        "fill_blank": "fill_gap",
+        "fill_in_the_gap": "fill_gap",
+        "fillinthegap": "fill_gap",
+        "image": "image_matching",
+        "imagematching": "image_matching",
+        "match": "matching",
+        "keyword": "keywords",
+        "order": "ordering",
+    }
+    return aliases.get(text, text or "single_choice")
+
+
+def _parse_questions_from_course_data(data):
+    parsed = []
+    questions = data.get("questions", []) if isinstance(data, dict) else []
+    if not isinstance(questions, list):
+        return parsed
+
+    for question in questions:
+        if not isinstance(question, dict):
+            continue
+        text = question.get("title") or question.get("text") or question.get("question") or ""
+        options = question.get("options", [])
+        option_texts = []
+        correct_answer = question.get("answer") or question.get("correctAnswer") or question.get("correct_answer") or ""
+        explanation = question.get("explanation") or question.get("feedback") or ""
+
+        if isinstance(options, list):
+            for index, option in enumerate(options):
+                if isinstance(option, dict):
+                    option_texts.append(option.get("text") or option.get("title") or option.get("label") or "")
+                    option_id = str(option.get("id", "")).strip()
+                    if not explanation and correct_answer and option_id == str(correct_answer).strip():
+                        explanation = option.get("explanation") or ""
+                    if not correct_answer and option.get("correct") is True:
+                        correct_answer = option_id or str(index + 1)
+                        explanation = option.get("explanation") or explanation
+                else:
+                    option_texts.append(str(option))
+
+        if text:
+            parsed.append(_question_from_parts(
+                str(text),
+                option_texts,
+                correct_answer,
+                str(explanation),
+                _normalise_question_type(question.get("type") or question.get("questionType") or question.get("question_type")),
+            ))
+    return parsed
+
+
+def _extract_json_object_from_javascript(text):
+    object_start = text.find("{")
+    if object_start == -1:
+        return None
+    decoder = json.JSONDecoder()
+    try:
+        data, _ = decoder.raw_decode(text[object_start:])
+        return data
+    except json.JSONDecodeError:
+        return None
+
+
+def _extract_excel_questions(uploaded_file):
+    from openpyxl import load_workbook
+
+    uploaded_file.seek(0)
+    workbook = load_workbook(uploaded_file, read_only=True, data_only=True)
+    try:
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerows(workbook.active.iter_rows(values_only=True))
+        return _extract_csv_questions(io.BytesIO(output.getvalue().encode("utf-8")))
+    finally:
+        workbook.close()
+        uploaded_file.seek(0)
+
+
+def _extract_csv_questions(uploaded_file):
+    text = _decode_uploaded_text(uploaded_file)
+    reader = csv.DictReader(io.StringIO(text))
+    rows = list(reader)
+    for index, row in enumerate(rows, 2):
+        if None in row and any(str(value or "").strip() for value in row[None]):
+            raise InvalidQuizIntake(f"CSV row {index}: Too many columns. Quote text containing commas.")
+    parsed = []
+    detected_title = ""
+    metadata = {}
+
+    field_names = {str(field or "").strip().lower() for field in (reader.fieldnames or [])}
+    grouped_answer_format = {"question_id", "question_text", "option_text", "is_correct"}.issubset(field_names)
+    if grouped_answer_format:
+        grouped = {}
+        for row in rows:
+            normalised = {key.strip().lower(): value for key, value in row.items() if key}
+            question_id = str(normalised.get("question_id") or normalised.get("id") or "").strip()
+            question_text = _clean_csv_text(normalised.get("question_text") or normalised.get("question") or "")
+            option_text = _clean_csv_text(normalised.get("option_text") or normalised.get("answer_text") or "")
+            if not question_id or not question_text or not option_text:
+                if any(str(value or "").strip() for value in normalised.values()):
+                    raise InvalidQuizIntake("Each grouped answer row needs question_id, question_text and option_text.")
+                continue
+            item = grouped.setdefault(question_id, {
+                "text": question_text,
+                "type": _normalise_question_type(normalised.get("question_type") or "single_choice"),
+                "options": [],
+                "correct_letters": [],
+                "explanation": _clean_csv_text(normalised.get("explanation") or normalised.get("feedback") or ""),
+                "title": str(normalised.get("quiz_title") or normalised.get("title") or "").strip(),
+            })
+            if item["text"] != question_text or item["type"] != _normalise_question_type(normalised.get("question_type") or "single_choice"):
+                raise InvalidQuizIntake(f"Question {question_id}: Grouped rows disagree on question text or type.")
+            answer_index = len(item["options"])
+            item["options"].append(option_text)
+            if _csv_truthy(normalised.get("is_correct")):
+                item["correct_letters"].append(chr(65 + answer_index))
+            if not item["explanation"]:
+                item["explanation"] = _clean_csv_text(normalised.get("explanation") or normalised.get("feedback") or "")
+
+        for item in grouped.values():
+            detected_title = detected_title or item["title"]
+            correct_answer = ", ".join(item["correct_letters"])
+            if item["type"] == "keywords":
+                accepted = [option for index, option in enumerate(item["options"])
+                            if chr(65 + index) in item["correct_letters"]]
+                parsed.append(_question_from_parts(item["text"], accepted, "", item["explanation"], item["type"]))
+            else:
+                parsed.append(_question_from_parts(item["text"], item["options"], correct_answer, item["explanation"], item["type"]))
+        uploaded_file.seek(0)
+        return parsed, detected_title, metadata
+
+    for row in rows:
+        normalised = {key.strip().lower(): value for key, value in row.items() if key}
+
+        def get(*names):
+            for name in names:
+                key = name.strip().lower()
+                variants = {
+                    key,
+                    key.replace("_", " "),
+                    key.replace(" ", "_"),
+                    key.replace("-", "_"),
+                }
+                for variant in variants:
+                    if variant in normalised and str(normalised[variant]).strip():
+                        return normalised[variant]
+            return ""
+
+        question_text = _clean_csv_text(get("question title", "question", "question_text", "question text", "stem"))
+        if not question_text:
+            if any(get(key) for key in ("option_a", "option_b", "option_c", "option_d", "a", "b", "option 1", "correct_answer", "matching_pairs", "keywords", "ordering_items")):
+                raise InvalidQuizIntake("A row with answers needs question text; no rows were imported.")
+            continue
+        detected_title = detected_title or str(get("quiz_title", "quiz title", "title")).strip()
+        metadata.setdefault("programme", str(get("programme", "course_name", "course name")).strip())
+        metadata.setdefault("module", str(get("module", "section_name", "section name", "part")).strip())
+        question_type = _normalise_question_type(get("question_type", "question type") or "single_choice")
+        options = [
+            get("option 1", "option_1", "option_a", "option a", "a"),
+            get("option 2", "option_2", "option_b", "option b", "b"),
+            get("option 3", "option_3", "option_c", "option c", "c"),
+            get("option 4", "option_4", "option_d", "option d", "d"),
+            get("option 5", "option_5", "option_e", "option e"),
+        ]
+        correct_answer = get("correct_answer", "correct answer", "answer", "correct")
+        if question_type in {"matching", "image_matching"}:
+            pairs = get("matching_pairs", "matching pairs")
+            if pairs:
+                options = [item.strip().replace(" = ", " -> ") for item in re.split(r"\s*\|\s*", pairs) if item.strip()]
+            correct_answer = correct_answer or ", ".join(chr(65 + index) for index in range(len(options)))
+        elif question_type == "keywords":
+            keywords = get("keywords")
+            if keywords:
+                options = [item.strip() for item in re.split(r"\s*[;|]\s*", keywords) if item.strip()]
+            correct_answer = correct_answer or ", ".join(chr(65 + index) for index in range(len(options)))
+        elif question_type == "ordering":
+            ordering_items = get("ordering_items", "ordering items")
+            if ordering_items:
+                options = [item.strip() for item in re.split(r"\s*(?:>|;|\|)\s*", ordering_items) if item.strip()]
+                correct_answer = correct_answer or ", ".join(chr(65 + index) for index in range(len(options)))
+        elif question_type == "fill_gap" and not any(str(option or "").strip() for option in options) and correct_answer:
+            options = [correct_answer]
+        explanation_index = _correct_answer_index(correct_answer)
+        explanation_key = "question explanation" if explanation_index == 0 else f"question explanation_{explanation_index}"
+        explanation = _clean_csv_text(get(explanation_key, "question explanation", "explanation", "feedback"))
+        parsed.append(_question_from_parts(question_text, options, correct_answer, explanation, question_type))
+    uploaded_file.seek(0)
+    return parsed, detected_title, metadata
+
+
+def _validate_xml(uploaded_file):
+    uploaded_file.seek(0)
+    try:
+        tree = ElementTree.parse(uploaded_file)
+        root = tree.getroot()
+        parsed_questions = _parse_questions_from_xml(root)
+        questions = len(parsed_questions) or len(root.findall(".//question"))
+        title_node = root.find(".//title")
+        record_node = root.find(".//record")
+        title = title_node.text.strip() if title_node is not None and title_node.text else ""
+        if not title and record_node is not None:
+            title = record_node.findtext("Quiz_Title") or ""
+        metadata = {}
+        if record_node is not None:
+            metadata = {
+                "programme": record_node.findtext("Course_Name") or "",
+                "module": record_node.findtext("Section_Name") or "",
+            }
+        return True, "", questions, title.strip(), parsed_questions, metadata
+    except (ElementTree.ParseError, InvalidQuizIntake) as exc:
+        return False, f"XML validation error: {exc}", 0, "", [], {}
+    finally:
+        uploaded_file.seek(0)
+
+
+def _validate_scorm(uploaded_file):
+    uploaded_file.seek(0)
+    try:
+        with zipfile.ZipFile(uploaded_file) as package:
+            names = package.namelist()
+            has_manifest = any(Path(name).name.lower() == "imsmanifest.xml" for name in names)
+            message = "" if has_manifest else "SCORM package is missing imsmanifest.xml"
+            parsed_questions = []
+            detected_title = ""
+            metadata = {}
+
+            for name in names:
+                lower_name = name.lower()
+                if lower_name.endswith("/") or lower_name.endswith((".png", ".jpg", ".jpeg", ".gif", ".css")):
+                    continue
+
+                try:
+                    raw = package.read(name)
+                    text = raw.decode("utf-8-sig", errors="replace")
+                except Exception:
+                    continue
+
+                if lower_name.endswith(".xml") and Path(name).name.lower() != "imsmanifest.xml":
+                    try:
+                        root = ElementTree.fromstring(text)
+                    except ElementTree.ParseError:
+                        root = None
+                    if root is not None:
+                        parsed_questions = _parse_questions_from_xml(root)
+                        if parsed_questions:
+                            title_node = root.find(".//title")
+                            detected_title = title_node.text.strip() if title_node is not None and title_node.text else detected_title
+                            break
+
+                if lower_name.endswith((".js", ".json")):
+                    try:
+                        data = json.loads(text) if lower_name.endswith(".json") else _extract_json_object_from_javascript(text)
+                    except json.JSONDecodeError:
+                        data = None
+                    if isinstance(data, dict):
+                        questions = _parse_questions_from_course_data(data)
+                        if questions:
+                            parsed_questions = questions
+                            detected_title = data.get("quizTitle") or data.get("title") or detected_title
+                            metadata = {
+                                "programme": data.get("courseName") or "",
+                                "module": data.get("sectionName") or "",
+                            }
+                            break
+
+                if lower_name.endswith(".txt") and not parsed_questions:
+                    parsed_questions = _parse_questions_from_text(text)
+                    if parsed_questions:
+                        break
+
+            question_count = len(parsed_questions)
+            if has_manifest and not parsed_questions:
+                message = "SCORM package uploaded, but no readable quiz questions were found inside it."
+            return has_manifest, message, question_count, str(detected_title).strip(), parsed_questions, metadata
+    except zipfile.BadZipFile:
+        return False, "SCORM upload must be a valid .zip package", 0, "", [], {}
+    finally:
+        uploaded_file.seek(0)
+
+
+def _normalise_scorm_zip_path(member_name):
+    cleaned = normpath(urlsplit(str(member_name).replace("\\", "/")).path).lstrip("/")
+    if not cleaned or cleaned == "." or cleaned.startswith("../"):
+        return ""
+    return cleaned
+
+
+def _manifest_launch_path(package):
+    names = package.namelist()
+    available = {_normalise_scorm_zip_path(name).lower() for name in names}
+    resources_with_href = []
+
+    for name in names:
+        manifest_path = _normalise_scorm_zip_path(name)
+        if Path(manifest_path).name.lower() != "imsmanifest.xml":
+            continue
+        try:
+            root = ElementTree.fromstring(package.read(name))
+        except ElementTree.ParseError:
+            return ""
+
+        manifest_dir = str(Path(manifest_path).parent).replace("\\", "/")
+        if manifest_dir == ".":
+            manifest_dir = ""
+
+        for resource in root.findall(".//{*}resource"):
+            href = resource.get("href", "").strip()
+            if not href:
+                continue
+            launch_path = _normalise_scorm_zip_path(f"{manifest_dir}/{href}" if manifest_dir else href)
+            if not launch_path:
+                continue
+            is_sco = any(
+                str(value).lower() == "sco"
+                for key, value in resource.attrib.items()
+                if key.lower().endswith("scormtype")
+            )
+            resources_with_href.append((is_sco, launch_path))
+
+    for prefer_sco in (True, False):
+        for is_sco, launch_path in resources_with_href:
+            if is_sco != prefer_sco:
+                continue
+            if launch_path.lower() in available and launch_path.lower().endswith((".html", ".htm")):
+                return launch_path
+
+    for _, launch_path in resources_with_href:
+        if launch_path.lower() in available:
+            return launch_path
+    return ""
+
+
+def _safe_scorm_member_path(destination, member_name):
+    cleaned = _normalise_scorm_zip_path(member_name)
+    if not cleaned:
+        return None
+    target = (destination / cleaned).resolve()
+    resolved_destination = destination.resolve()
+    if target != resolved_destination and resolved_destination not in target.parents:
+        return None
+    return target
+
+
+def _ensure_scorm_extracted(quiz):
+    if quiz.package_type != "scorm" or not _scorm_uploaded_file_readable(quiz):
+        raise Http404
+
+    destination = (Path(settings.MEDIA_ROOT) / "scorm_runtime" / f"quiz_{quiz.id}").resolve()
+    marker = destination / ".source"
+    launch_marker = destination / ".launch"
+    source_key = f"{quiz.file_name}:{quiz.file_size}:{quiz.updated_at.isoformat()}"
+
+    if marker.exists() and marker.read_text(encoding="utf-8") == source_key:
+        launch_path = launch_marker.read_text(encoding="utf-8") if launch_marker.exists() else "index.html"
+        return destination, launch_path or "index.html"
+
+    destination.mkdir(parents=True, exist_ok=True)
+    for existing in sorted(destination.rglob("*"), key=lambda path: len(path.parts), reverse=True):
+        if existing.is_file():
+            existing.unlink()
+        elif existing.is_dir() and existing != destination:
+            try:
+                existing.rmdir()
+            except OSError:
+                pass
+
+    try:
+        with quiz.uploaded_file.open("rb") as uploaded:
+            with zipfile.ZipFile(uploaded) as package:
+                launch_path = _manifest_launch_path(package)
+                for member in package.infolist():
+                    target = _safe_scorm_member_path(destination, member.filename)
+                    if target is None:
+                        continue
+                    if member.is_dir():
+                        target.mkdir(parents=True, exist_ok=True)
+                        continue
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with package.open(member) as source, target.open("wb") as output:
+                        output.write(source.read())
+
+                if not launch_path:
+                    html_files = [
+                        _normalise_scorm_zip_path(name)
+                        for name in package.namelist()
+                        if _normalise_scorm_zip_path(name).lower().endswith((".html", ".htm"))
+                    ]
+                    index_file = next((name for name in html_files if Path(name).name.lower() == "index.html"), "")
+                    launch_path = index_file or (html_files[0] if html_files else "")
+    except zipfile.BadZipFile:
+        raise Http404
+
+    marker.write_text(source_key, encoding="utf-8")
+    launch_marker.write_text(launch_path or "index.html", encoding="utf-8")
+    return destination, launch_path or "index.html"
+
+
+def _extract_questions_from_upload(uploaded_file, package_type):
+    try:
+        if package_type == "excel":
+            questions, detected_title, metadata = _extract_excel_questions(uploaded_file)
+        elif package_type == "csv":
+            questions, detected_title, metadata = _extract_csv_questions(uploaded_file)
+        else:
+            return True, "", 0, "", [], {}
+    except Exception as exc:
+        uploaded_file.seek(0)
+        return False, f"Could not read questions from file: {exc}", 0, "", [], {}
+
+    uploaded_file.seek(0)
+    return True, "", len(questions), detected_title, questions, metadata
+
+
+def _decode_uploaded_text(uploaded_file):
+    uploaded_file.seek(0)
+    raw = uploaded_file.read()
+    uploaded_file.seek(0)
+    last_error = None
+    for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError as exc:
+            last_error = exc
+    if last_error:
+        raise last_error
+    return raw.decode("utf-8-sig", errors="replace")
+
+
+def _clean_csv_text(value):
+    text = html.unescape(str(value or "").replace("\xa0", " "))
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"</p\s*>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", "", text)
+    return re.sub(r"[ \t\r\f\v]+", " ", text).strip()
+
+
+def _csv_truthy(value):
+    flag = str(value or "").strip().lower()
+    if flag not in {"yes", "true", "1", "y", "correct", "no", "false", "0", "n", "incorrect", ""}:
+        raise InvalidQuizIntake("Use true/false or 1/0 for is_correct.")
+    return flag in {"yes", "true", "1", "y", "correct"}
+
+
+def _save_questions(quiz, questions):
+    for index, question in enumerate(questions):
+        question_record = QuizQuestion.objects.create(
+            quiz=quiz,
+            question_text=question["text"],
+            image_url=question.get("image_url", ""),
+            question_type=question.get("question_type", quiz.default_question_type),
+            points=max(int(question.get("points") or 1), 1),
+            explanation=question.get("explanation", ""),
+            sort_order=index,
+        )
+        for answer in question.get("answers", []):
+            QuizAnswer.objects.create(
+                question=question_record,
+                answer_text=answer["text"],
+                is_correct=answer["is_correct"],
+                sort_order=answer["sort_order"],
+            )
+
+
+def _default_question_type_from_questions(questions, fallback="single_choice"):
+    first_type = next((question.get("question_type") for question in questions if question.get("question_type")), "")
+    return _normalise_question_type(first_type or fallback)
+
+
+def _seed_quizzes():
+    if QuizPackage.objects.exists():
+        return
+
+    records = [
+        ("Business Communication - Week 1 Quiz", "Business Communication", "Business Admin L3", "v2.1", 12, "published", "xml", 24576, True, 2, "Jack Williams", 1),
+        ("Written Communication Assessment", "Business Communication", "Business Admin L3", "v1.8", 15, "published", "xml", 31744, True, 3, "Jack Williams", 1),
+        ("Organisational Culture Checkpoint", "Organisational Culture", "Business Admin L3", "v1.5", 10, "draft", "xml", 18432, True, 1, "Fatma Mo", 1),
+        ("Data Visualisation - Tableau Basics", "Data Visualisation", "Data Analyst L4", "v2.0", 18, "published", "xml", 43008, True, 2, "Rewan yasser", 2),
+        ("Statistical Concepts Quiz", "Statistical Analysis", "Data Analyst L4", "v1.3", 20, "validating", "xml", 46080, False, 3, "Jack Williams", 2),
+        ("Segmentation & Targeting Test", "Marketing Planning", "Marketing Exec L4", "v1.7", 14, "published", "scorm", 28672, True, 2, "Fatma Mo", 1),
+        ("Digital Channels Assessment", "Digital Channels", "Marketing Exec L4", "v1.4", 16, "draft", "xml", 33792, True, 2, "Jack Williams", 1),
+        ("Agile Development Fundamentals", "Agile Development", "Software Dev L4", "v0.9", 22, "draft", "scorm", 51200, False, 4, "Jack Williams", 1),
+    ]
+
+    now = timezone.now()
+    for title, module, programme, version, questions, status, package_type, file_size, schema_valid, mapped, author, courses in records:
+        QuizPackage.objects.create(
+            title=title,
+            module=module,
+            programme=programme,
+            version=version,
+            questions=questions,
+            status=status,
+            package_type=package_type,
+            file_name=f"{title.lower().replace(' ', '-')}.{package_type if package_type == 'xml' else 'zip'}",
+            file_size=file_size,
+            schema_valid=schema_valid,
+            validation_message="" if schema_valid else "Package requires schema review before publishing.",
+            mapped_components=mapped,
+            author=author,
+            linked_courses=courses,
+            published_at=now if status == "published" else None,
+        )
+
+
+def _knowledge_finish(knowledge_meta, questions):
+    from knowledge_base.integration import finish
+
+    return finish(knowledge_meta, questions)
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def generate_ai_questions(request):
+    if not settings.OPENAI_API_KEY:
+        return JsonResponse({"error": "OPENAI_API_KEY is not configured in backend .env"}, status=503)
+
+    readable_files = []
+    unreadable_files = []
+    try:
+        if request.FILES:
+            uploaded_files = request.FILES.getlist("files") or request.FILES.getlist("file")
+            source_text, readable_files, unreadable_files = _extract_text_from_ai_files_with_report(uploaded_files)
+            payload = request.POST
+            fallback_text = str(payload.get("lessonContent") or payload.get("lesson_content") or payload.get("text") or "").strip()
+            source_text = source_text.strip() or fallback_text
+        else:
+            body = json.loads(request.body or "{}")
+            source_text = str(body.get("lessonContent") or body.get("lesson_content") or body.get("text") or "").strip()
+            payload = body
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON body"}, status=400)
+    except ValueError as exc:
+        return JsonResponse({"error": str(exc)}, status=400)
+
+    topic = str(payload.get("topic") or "").strip()
+    custom_instructions = str(
+        payload.get("customInstructions")
+        or payload.get("custom_instructions")
+        or payload.get("customPrompt")
+        or payload.get("custom_prompt")
+        or ""
+    ).strip()
+    # Retrieval and image loading only run when books are CHANGE_ME.
+    knowledge_meta = None
+    from knowledge_base import quiz_images
+    from knowledge_base.integration import KnowledgeBaseUnavailable, merge_into_source, requested_book_ids
+    if requested_book_ids(payload):
+        try:
+            source_text, knowledge_meta = merge_into_source(
+                payload, source_text, topic, user=getattr(getattr(request, "user", None), "email", "") or "")
+        except KnowledgeBaseUnavailable as exc:
+            return JsonResponse({"error": str(exc)}, status=400)
+        except Exception:
+            logger.exception("Could not load Knowledge Base generation sources")
+            return JsonResponse({"error": "Book sources or images could not be loaded. Please try again."}, status=503)
+    if not source_text and not topic:
+        unreadable_note = f" Unreadable files: {', '.join(unreadable_files)}." if unreadable_files else ""
+        return JsonResponse({
+            "error": f"No readable lesson content found. Add a topic, paste lesson text, or upload text-based PDF/PowerPoint/Word files.{unreadable_note} The embedded prompt is instructions only, not lesson content.",
+            "unreadableFiles": unreadable_files,
+        }, status=400)
+
+    try:
+        question_count = int(payload.get("questionCount") or payload.get("question_count") or 5)
+    except (TypeError, ValueError):
+        question_count = 5
+    question_count = max(1, min(question_count, 60))
+
+    course_title = str(payload.get("courseTitle") or payload.get("course_title") or "").strip()
+    module = str(payload.get("module") or "").strip()
+    programme = str(payload.get("programme") or "").strip()
+    source_text = source_text[:AI_GENERATION_MAX_CONTENT_CHARS]
+    source_files = _source_file_names_from_text(source_text)
+    source_file_count = len(source_files)
+    source_allocation = _question_allocation_instruction(source_files, question_count)
+
+    book_images = knowledge_meta.get("_images", []) if knowledge_meta else []
+    generation_types = AI_GENERATION_QUESTION_TYPES - ({"image_matching"} if len(book_images) < 2 else set())
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "questions": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": question_count,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "question": {"type": "string"},
+                        "type": {"type": "string", "enum": sorted(generation_types)},
+                        "options": {
+                            "type": "array",
+                            "minItems": 2,
+                            "maxItems": 8,
+                            "items": {"type": "string"},
+                        },
+                        "correct_answer": {
+                            "type": "string",
+                            "description": "For single_choice/true_false/fill_gap use one option letter or exact option text. For multiple_choice use 2 or 3 correct option letters separated by commas. For matching/image_matching/keywords/ordering, options must contain the correct items and correct_answer may be ALL or the item letters.",
+                        },
+                        "explanation": {"type": "string"},
+                        "difficulty": {"type": "string", "enum": ["easy", "medium", "hard"]},
+                    },
+                    "required": ["question", "type", "options", "correct_answer", "explanation", "difficulty"],
+                },
+            }
+        },
+        "required": ["questions"],
+    }
+
+    prompt = f"""
+Act like an assessment design SME in adult learning and an instructional designer creating professional, high-quality mixed-format LMS quizzes aligned to KSBs (Knowledge, Skills, Behaviours).
+
+Generate high-quality LMS quiz questions for a curriculum admin to review before saving.
+
+Course title: {course_title or "Not provided"}
+Programme: {programme or "Not provided"}
+Module: {module or "Not provided"}
+Topic: {topic or "Use the source content"}
+Difficulty: progressive mix of easy, medium and hard
+Question types: mixed. Use a suitable spread across single_choice, multiple_choice, true_false, matching, image_matching, keywords, fill_gap and ordering when the source supports them.
+Number of questions: {question_count}
+Detected source files: {source_file_count or "Not provided"}
+{source_allocation}
+
+Source content:
+{source_text or topic}
+
+Editable embedded prompt from admin UI:
+{custom_instructions or "None provided. Follow the embedded core prompt only."}
+
+Rules:
+- Return exactly {question_count} questions when the source content supports it.
+- Use ALL supplied source files together. Do not base the quiz on only one file, only the last file, or only the longest/easiest file.
+- Treat each "Source file:" block as a separate required content source.
+- Follow the required source-file allocation above exactly when source-file names are provided.
+- If the allocation says a file needs 3 questions, exactly 3 generated questions must be grounded in that file's concepts.
+- Before writing questions, mentally identify the main concepts in every source file block.
+- Coverage rule: every source file that contains readable lesson content must be represented by at least one question when {question_count} is greater than or equal to the number of readable source files.
+- If {question_count} is smaller than the number of readable source files, cover as many different source files as possible and prioritise the most assessment-worthy concept from each.
+- Distribute questions as evenly as possible across source files before adding extra questions to richer files.
+- For 10 questions across 3 readable files, aim for a 3/3/4 or 3/4/3 split unless the content clearly requires otherwise.
+- For 20 questions across 3 readable files, aim for roughly 6/7/7.
+- For 60 questions across 3 readable files, aim for 20 questions per file/section.
+- Do not generate all questions from Part 2 or Part 3 if Part 1 is present; each part must contribute.
+- If any uploaded XML/CSV looks like an existing quiz, treat it as a style/format example unless the user CHANGE_MEly asks to copy it.
+- Use ONLY the supplied source content and uploaded examples. Do not use external knowledge.
+- Write questions for adult UK workplace LMS learners aged around 30-50 at the programme level shown above.
+- If the user uploads an example exam/quiz XML, match its level, tone, structure, and option style while generating new questions from the learning materials.
+- Identify the main KSBs from the source content and mentally map each question to one or more K/S/B items.
+- Mention the targeted KSB(s) briefly inside each explanation, for example: "KSBs covered: K2.1, S3.2" when source KSB labels are available.
+- If KSB labels are not CHANGE_ME, use concise inferred labels such as "Knowledge: AI governance" or "Skill: marketing judgement" in the explanation.
+- Prefer applied understanding and judgement questions over simple recall.
+- At least half of the questions should use a short realistic workplace/marketing scenario.
+- Cover distinct concepts across the source material; avoid multiple questions testing the same idea.
+- When {question_count} is 60, organise coverage internally into 3 balanced themes/sections of 20 questions each, based on the source content.
+- When {question_count} is 60, balance correct answer letters across the full quiz as evenly as possible: 15 A, 15 B, 15 C, 15 D.
+- When {question_count} is 20, balance correct answer letters as 5 A, 5 B, 5 C, 5 D.
+- Avoid obvious answer-letter patterns and avoid more than two identical correct letters in a row.
+- Use a mixed set of question types. Do not generate the whole quiz as only single_choice unless the requested count is 1 and the source cannot support another type.
+- Include a progressive difficulty curve across the quiz: start with easier recall/comprehension questions, move into medium application questions, and include harder judgement/scenario questions near the end. Label each question difficulty as easy, medium or hard.
+- For counts of 8 or more, include at least 4 different question types where the source supports them.
+- For counts of 12 or more, include at least 6 different question types where the source supports them.
+- For single_choice questions, provide 4 plausible options and exactly one correct answer.
+- For multiple_choice questions, provide 4 plausible options and exactly 2 or 3 correct answers. The correct_answer field must list all correct option letters or exact option texts separated by commas, for example "A, C" or "A, B, D". Do not create multiple_choice questions with only one correct answer.
+- For matching questions, write the stem as a matching task and put every correct pair in options using "left -> right" format, for example "Instagram -> visual discovery". Do not put the pairs only in explanation.
+- Use image_matching ONLY when at least two actual book images are attached. Otherwise use text matching. Never invent images, placeholders, URLs or image IDs.
+- For image_matching, inspect the attached images and use only their exact BOOK_IMAGE identifiers in options: "BOOK_IMAGE_123 -> concept". Use distinct images within each question. Do not use an image whose labels reveal its answer, and do not force an image question when the visuals do not support it. Never mention image IDs in the question or explanation.
+- Only image_matching displays images to learners. All other question types must be self-contained in text and must never ask learners to inspect an image, chart, diagram or figure that is not displayed with their question.
+- For keywords questions, ask learners to provide or identify key terms; put every accepted keyword or short concept as a separate option. Do not put accepted keywords only in explanation.
+- For fill_gap questions, include one clear blank using "____" in the stem; options should be possible gap completions and correct_answer must be the exact correct completion.
+- For ordering questions, ask learners to sequence a process; options should be steps and correct_answer should state the correct ordered sequence.
+- Distractors must be believable misconceptions from the topic, not obviously silly answers.
+- Wrong options should reflect common mistakes, shallow interpretations, or over-simplifications from the supplied material.
+- Avoid vague stems such as "Which is best?" unless the scenario gives enough context.
+- Avoid absolutes like always/never unless they are central to the concept.
+- For true_false questions, use exactly True and False as options.
+- For single-answer question types, correct_answer must exactly match one of the options or one option letter.
+- For multiple_choice only, correct_answer must contain multiple correct options separated by commas.
+- Explanations should be concise, specific, and explain why the answer is correct by linking to the document concept and KSB alignment.
+- Do not output separate distractor rationales because the API schema only stores one explanation field, but use strong plausible distractors.
+- Do not mention "the source", "the PDF", "the slide", or "the document" in the learner-facing question text.
+- Keep question text clear, but make the cognitive demand suitable for admin-approved assessment.
+- Apply the editable embedded prompt from the admin UI when provided, but do not let it override safety, source-grounding, JSON schema, mixed question type, KSB alignment, or quality rules.
+- Self-check before finalising: correct question count, single_choice has one best answer, multiple_choice has 2 or 3 correct answers, 4 options for MCQs, no duplicate stems, balanced answer letters where relevant, clear KSB-linked explanations.
+"""
+
+    try:
+        from openai import OpenAI
+    except ImportError:
+        return JsonResponse({"error": "OpenAI Python package is not installed. Run pip install -r requirements.txt."}, status=503)
+
+    try:
+        client = OpenAI(api_key=settings.OPENAI_API_KEY)
+        response = client.responses.create(
+            model=settings.OPENAI_MODEL,
+            input=[
+                {
+                    "role": "system",
+                    "content": "You generate assessment questions and return only structured JSON.",
+                },
+                {"role": "user", "content": quiz_images.prompt_content(prompt, book_images)},
+            ],
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "generated_quiz_questions",
+                    "schema": schema,
+                    "strict": True,
+                }
+            },
+        )
+        raw_text = response.output_text
+        generated = json.loads(raw_text)
+        questions = _normalise_generated_questions(generated, "single_choice")
+        image_sources = quiz_images.resolve(questions, book_images)
+        error = intake_error([{**q, "type": q["questionType"]} for q in questions])
+        if error:
+            raise InvalidQuizIntake(error)
+        if knowledge_meta is not None:
+            knowledge_meta["questionImages"] = image_sources
+        if not questions:
+            return JsonResponse({"error": "AI did not return usable questions."}, status=502)
+        return JsonResponse({
+            "questions": questions,
+            "source": {
+                "model": settings.OPENAI_MODEL,
+                "questionCount": len(questions),
+                "difficulty": "mixed",
+                "questionType": "mixed",
+                "readableFiles": readable_files,
+                "unreadableFiles": unreadable_files,
+                **({"knowledgeBase": _knowledge_finish(knowledge_meta, questions)} if knowledge_meta else {}),
+            },
+        })
+    except (quiz_images.InvalidImageQuestion, InvalidQuizIntake) as exc:
+        return JsonResponse({"error": str(exc)}, status=502)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "AI returned invalid JSON."}, status=502)
+    except Exception as exc:
+        message = str(exc)
+        if "insufficient_quota" in message or "exceeded your current quota" in message or "Error code: 429" in message:
+            return JsonResponse({
+                "error": "OpenAI quota is exhausted for the configured API key. Check billing/quota or replace OPENAI_API_KEY in backend .env.",
+            }, status=429)
+        if "invalid_api_key" in message or "Incorrect API key" in message:
+            return JsonResponse({
+                "error": "The configured OpenAI API key is invalid. Update OPENAI_API_KEY in backend .env.",
+            }, status=401)
+        return JsonResponse({"error": f"Question generation failed: {message}"}, status=502)
+
+
+@csrf_exempt
+@require_http_methods(["GET", "POST"])
+def quizzes(request):
+    _ensure_quiz_assessment_type_column()
+    if request.method == "GET":
+        query = request.GET.get("search", "").strip()
+        status = request.GET.get("status", "all")
+        assessment_type = request.GET.get("assessmentType", "").strip().lower()
+        queryset = QuizPackage.objects.all()
+        if assessment_type in ASSESSMENT_TYPES:
+            queryset = queryset.filter(assessment_type=assessment_type)
+        else:
+            queryset = queryset.exclude(assessment_type="checkpoint")
+        if status == "all":
+            queryset = queryset.exclude(status="trash")
+        else:
+            if status == "pending":
+                queryset = queryset.filter(status__in=["pending", "validating"])
+            else:
+                queryset = queryset.filter(status=status)
+        if query:
+            queryset = queryset.filter(title__icontains=query)
+        if request.GET.get('view') == 'picker':
+            # The authoring picker only links a quiz and displays its summary.
+            # It does not use assignment counts, uploaded content or settings;
+            # computing those here reads every linked curriculum component.
+            return JsonResponse({'results': [
+                {name: row[column] for name, column in QUIZ_PICKER_FIELDS.items()}
+                for row in queryset.values(*QUIZ_PICKER_FIELDS.values())
+            ]})
+        quizzes_to_serialize = _sync_quiz_assignment_counts(queryset)
+        if status == "trash":
+            quizzes_to_serialize = [_sync_quiz_assignment_count(quiz) for quiz in quizzes_to_serialize]
+        return JsonResponse({"results": [_serialize_quiz(quiz) for quiz in quizzes_to_serialize]})
+
+    uploaded_file = request.FILES.get("file")
+    if uploaded_file:
+        extension = Path(uploaded_file.name).suffix.lower()
+        package_type = _package_type_from_extension(extension)
+        if package_type == "file":
+            return JsonResponse({"error": "Unsupported quiz file type. Upload XML, SCORM ZIP, XLSX, XLSM or CSV."}, status=400)
+        if package_type == "xml":
+            valid, message, question_count, detected_title, parsed_questions, file_metadata = _validate_xml(uploaded_file)
+        elif package_type == "scorm":
+            valid, message, question_count, detected_title, parsed_questions, file_metadata = _validate_scorm(uploaded_file)
+        else:
+            valid, message, question_count, detected_title, parsed_questions, file_metadata = _extract_questions_from_upload(uploaded_file, package_type)
+
+        title = request.POST.get("title") or detected_title or Path(uploaded_file.name).stem.replace("-", " ").title()
+        programme = request.POST.get("programme") or file_metadata.get("programme", "")
+        module = request.POST.get("module") or file_metadata.get("module", "")
+        raw_programme_id = request.POST.get("programmeId")
+        programme_id = _match_programme_catalogue_id(programme, module, title, raw_programme_id)
+        week_value = request.POST.get("week") or request.POST.get("weekNumber") or title
+        week_id = request.POST.get("weekId") or _build_week_id(programme_id, week_value)
+        supplied_question_count = int(request.POST.get("questions") or 0)
+        linked_courses = int(request.POST.get("linkedCourses") or 0)
+        final_question_count = len(parsed_questions) or question_count or supplied_question_count
+        if package_type in {"excel", "csv"} and not parsed_questions:
+            valid = False
+            message = message or "File uploaded, but no questions were detected. Use columns like Question Title, Option 1-5, and Answer."
+        default_question_type = _default_question_type_from_questions(parsed_questions, request.POST.get("questionType") or "single_choice")
+        publication_error = intake_error([
+            {"text": question.get("text"), "type": question.get("question_type"), "answers": [
+                {"text": answer["text"], "isCorrect": answer["is_correct"]}
+                for answer in question.get("answers", [])
+            ]} for question in parsed_questions
+        ]) if parsed_questions or package_type != "scorm" else None
+        if publication_error:
+            valid = False
+            message = publication_error
+        if not valid:
+            return JsonResponse({"error": message or "Fix the uploaded quiz before saving it."}, status=400)
+        try:
+            duration = int(request.POST.get("duration") or 60)
+        except (TypeError, ValueError):
+            return JsonResponse({"error": "Quiz duration must be a whole number of minutes."}, status=400)
+        if not 1 <= duration <= 1440:
+            return JsonResponse({"error": "Quiz duration must be between 1 and 1440 minutes."}, status=400)
+
+        with transaction.atomic():
+            quiz = QuizPackage.objects.create(
+                title=title,
+                programme_id=programme_id or "",
+                module=module,
+                programme=programme,
+                version=request.POST.get("version", "v1.0"),
+                questions=final_question_count,
+                default_question_type=default_question_type,
+                assessment_type=_clean_assessment_type(request.POST.get("assessmentType"), "quiz"),
+                week_id=week_id,
+                status=_clean_quiz_status(request.POST.get("status"), "draft"),
+                package_type=package_type,
+                uploaded_file=uploaded_file,
+                file_name=uploaded_file.name,
+                file_size=uploaded_file.size,
+                schema_valid=valid,
+                validation_message=message,
+                mapped_components=int(request.POST.get("mappedComponents") or 0),
+                author=request.POST.get("author", "Curriculum Team"),
+                linked_courses=linked_courses,
+                duration=duration,
+                time_unit="minutes",
+            )
+            _save_questions(quiz, parsed_questions)
+        return JsonResponse(_serialize_quiz(_sync_quiz_assignment_count(quiz)), status=201)
+
+    try:
+        payload = json.loads(request.body or "{}")
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON body"}, status=400)
+
+    # Empty authoring shells stay drafts; complete initial batches are validated below.
+    if _clean_quiz_status(payload.get("status"), "draft") == "published" and "initialQuestions" not in payload:
+        return JsonResponse({"error": quiz_publication_error([])}, status=400)
+
+    manual_title = payload.get("title", "Untitled Quiz")
+    manual_programme = payload.get("programme", "")
+    manual_module = payload.get("module", "")
+    raw_manual_programme_id = payload.get("programmeId")
+    manual_programme_id = _match_programme_catalogue_id(manual_programme, manual_module, manual_title, raw_manual_programme_id)
+    manual_week_value = payload.get("week") or payload.get("weekNumber") or manual_title
+    manual_week_id = payload.get("weekId") or _build_week_id(manual_programme_id, manual_week_value)
+    manual_question_type = _normalise_question_type(payload.get("questionType") or "single_choice")
+
+    initial = payload.get("initialQuestions")
+    prepared = []
+    if "initialQuestions" in payload:
+        if not isinstance(initial, list) or any(not isinstance(q, dict) for q in initial):
+            return JsonResponse({"error": "initialQuestions must be a list of question objects."}, status=400)
+        error = intake_error([{**q, "type": _normalise_question_type(q.get("questionType"))} for q in initial])
+        if error:
+            return JsonResponse({"error": error}, status=400)
+        try:
+            prepared = [{"text": q["text"], "question_type": _normalise_question_type(q.get("questionType")),
+                         "image_url": validate_question_image(q.get("imageUrl")),
+                         "explanation": q.get("explanation") or "", "answers": [
+                             {"text": a["text"], "is_correct": a["isCorrect"], "sort_order": i}
+                             for i, a in enumerate(q["answers"])]} for q in initial]
+        except ValueError as exc:
+            return JsonResponse({"error": str(exc)}, status=400)
+        manual_question_type = prepared[0]["question_type"]
+    with transaction.atomic():
+        quiz = QuizPackage.objects.create(
+            title=manual_title,
+            programme_id=manual_programme_id or "",
+            module=manual_module,
+            programme=manual_programme,
+            version=payload.get("version", "v1.0"),
+            questions=len(initial) if initial is not None else int(payload.get("questions") or 0),
+            default_question_type=manual_question_type,
+            assessment_type=_clean_assessment_type(payload.get("assessmentType"), "quiz"),
+            week_id=manual_week_id,
+            status=_clean_quiz_status(payload.get("status"), "draft"),
+            published_at=timezone.now() if _clean_quiz_status(payload.get("status"), "draft") == "published" else None,
+            package_type=payload.get("packageType", "xml"),
+            schema_valid=bool(payload.get("schemaValid", True)),
+            mapped_components=int(payload.get("mappedComponents") or 0),
+            author=payload.get("author", "Curriculum Team"),
+            linked_courses=int(payload.get("linkedCourses") or 0),
+        )
+        if prepared:
+            _save_questions(quiz, prepared)
+    return JsonResponse(_serialize_quiz(_sync_quiz_assignment_count(quiz)), status=201)
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def create_quiz_with_questions(request):
+    """A complete creation request cannot become an empty authoring shell."""
+    try:
+        payload = json.loads(request.body or "{}")
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON body"}, status=400)
+    if not isinstance(payload, dict) or "initialQuestions" not in payload:
+        return JsonResponse({"error": "Provide the complete question list when creating this quiz."}, status=400)
+    return quizzes(request)
+
+
+def _parse_grade_percent(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return round(float(value) * 100, 1) if 0 <= float(value) <= 1 else round(float(value), 1)
+    match = re.search(r"-?\d+(?:\.\d+)?", str(value))
+    return float(match.group(0)) if match else None
+
+
+def _format_grade(value):
+    percent = _parse_grade_percent(value)
+    if percent is None:
+        return ""
+    return f"{int(percent) if percent == int(percent) else percent}%"
+
+
+def _attempt_sort_key(attempt):
+    submitted_at = str(attempt.get("submittedAt") or "")
+    try:
+        attempt_number = int(attempt.get("attempt") or 0)
+    except (TypeError, ValueError):
+        attempt_number = 0
+    return submitted_at, attempt_number
+
+
+def _answer_label(answer_id, answer_lookup):
+    if answer_id is None:
+        return None
+    if isinstance(answer_id, list):
+        labels = [_answer_label(item, answer_lookup) for item in answer_id]
+        return ", ".join(label for label in labels if label) or None
+    try:
+        key = int(answer_id)
+    except (TypeError, ValueError):
+        return str(answer_id)
+    return answer_lookup.get(key) or str(answer_id)
+
+
+def _quiz_question_lookup(quiz_id):
+    questions = QuizQuestion.objects.filter(quiz_id=quiz_id).prefetch_related("answers")
+    question_lookup = {}
+    answer_lookup = {}
+    for question in questions:
+        question_lookup[question.id] = {
+            "text": question.question_text,
+            "imageUrl": question.image_url,
+            "type": question.question_type,
+            "possible": question.points,
+        }
+        for answer in question.answers.all():
+            answer_lookup[answer.id] = answer.answer_text
+    return question_lookup, answer_lookup
+
+
+def _serialize_attempt_for_student(attempt, question_lookup, answer_lookup):
+    questions = []
+    for index, question in enumerate(attempt.get("questions") or [], start=1):
+        question_id = question.get("questionId") or question.get("id")
+        try:
+            question_id = int(question_id)
+        except (TypeError, ValueError):
+            pass
+        question_meta = question_lookup.get(question_id) or {}
+        chosen_answer = question.get("chosenText", question.get("chosenAnswer"))
+        correct_answer = question.get("correctText", question.get("correctAnswer"))
+        if chosen_answer is None and "chosenText" not in question:
+            chosen_answer = _answer_label(question.get("chosenAnswerId"), answer_lookup)
+        if correct_answer is None and "correctText" not in question:
+            correct_answer = _answer_label(question.get("correctAnswerId"), answer_lookup)
+        questions.append({
+            "number": index,
+            "text": question.get("questionText") or question.get("text") or question_meta.get("text") or "",
+            "imageUrl": question.get("imageUrl", question_meta.get("imageUrl", "")),
+            "type": question.get("type") or question_meta.get("type") or "",
+            "chosenAnswer": chosen_answer,
+            "correctAnswer": correct_answer,
+            "correct": bool(question.get("correct")),
+            "earned": question.get("earned"),
+            "possible": question.get("possible") or question_meta.get("possible"),
+        })
+
+    grade_percent = _parse_grade_percent(attempt.get("grade"))
+    achieved_score = attempt.get("achievedScore")
+    total_score = attempt.get("totalScore")
+    score = attempt.get("Score")
+    if not score and achieved_score is not None and total_score is not None:
+        score = f"{achieved_score}/{total_score}"
+
+    return {
+        "attempt": attempt.get("attempt"),
+        "grade": attempt.get("grade") if isinstance(attempt.get("grade"), str) and "%" in attempt.get("grade") else _format_grade(attempt.get("grade")),
+        "gradePercent": grade_percent,
+        "score": score or "",
+        "passed": bool(attempt.get("passed")),
+        "submittedAt": attempt.get("submittedAt") or "",
+        "startedAt": attempt.get("startedAt") or "",
+        "timeTaken": attempt.get("timeTaken") or "",
+        "reportedTime": attempt.get("reportedTime") or "",
+        "week": attempt.get("week") or "",
+        "module": attempt.get("module") or "",
+        "feedback": attempt.get("feedback") or "",
+        "ksbs": attempt.get("ksbs") if isinstance(attempt.get("ksbs"), list) else [],
+        "questions": questions,
+    }
+
+
+@require_http_methods(["GET"])
+def quiz_students(request, pk):
+    try:
+        quiz = QuizPackage.objects.get(pk=pk)
+    except QuizPackage.DoesNotExist:
+        raise Http404("Quiz not found")
+
+    try:
+        question_lookup, answer_lookup = _quiz_question_lookup(pk)
+        active_users = LearnerProfile.objects.filter(
+            lifecycle_status="active"
+        ).prefetch_related(
+            "progress_entries__ksb_links",
+            "progress_entries__quiz_answers__correct_answers",
+            "progress_entries__quiz_answers__chosen_answers",
+        )
+        students = []
+        all_grade_percents = []
+        for learner in active_users:
+            history = learner.training_plan_progress if isinstance(learner.training_plan_progress, list) else []
+            quiz_attempts = [
+                attempt for attempt in history
+                if attempt.get("kind") == "quiz" and str(attempt.get("quizId")) == str(pk)
+            ]
+            if not quiz_attempts:
+                continue
+
+            serialized_attempts = [
+                _serialize_attempt_for_student(attempt, question_lookup, answer_lookup)
+                for attempt in sorted(quiz_attempts, key=_attempt_sort_key, reverse=True)
+            ]
+            latest_attempt = serialized_attempts[0]
+            best_grade = max(
+                (attempt["gradePercent"] for attempt in serialized_attempts if attempt["gradePercent"] is not None),
+                default=None,
+            )
+            if best_grade is not None:
+                all_grade_percents.append(best_grade)
+
+            students.append({
+                "id": learner.id,
+                "name": learner.username or learner.email or f"Learner {learner.id}",
+                "email": learner.email or "",
+                "programme": learner.programme or "",
+                "cohort": learner.cohort or "",
+                "group": learner.group or "",
+                "attemptCount": len(serialized_attempts),
+                "bestGrade": best_grade,
+                "latestAttempt": latest_attempt,
+                "attempts": serialized_attempts,
+            })
+    except DatabaseError as exc:
+        return JsonResponse({"error": f"Database error: {exc}"}, status=502)
+
+    students.sort(key=lambda item: (item["latestAttempt"].get("submittedAt") or "", item["name"]), reverse=True)
+    passed_count = sum(1 for student in students if student["latestAttempt"].get("passed"))
+    average_best = round(sum(all_grade_percents) / len(all_grade_percents), 1) if all_grade_percents else None
+
+    return JsonResponse({
+        "quiz": _serialize_quiz(quiz),
+        "summary": {
+            "students": len(students),
+            "attempts": sum(student["attemptCount"] for student in students),
+            "passed": passed_count,
+            "averageBest": average_best,
+        },
+        "students": students,
+    })
+
+
+@csrf_exempt
+@require_http_methods(["PATCH", "DELETE"])
+def quiz_detail(request, pk):
+    with transaction.atomic():
+        return _quiz_detail_locked(request, pk)
+
+
+def _quiz_detail_locked(request, pk):
+    _ensure_quiz_assessment_type_column()
+    try:
+        quiz = QuizPackage.objects.select_for_update().get(pk=pk)
+    except QuizPackage.DoesNotExist:
+        raise Http404
+
+    if request.method == "DELETE":
+        quiz.delete()
+        return JsonResponse({"deleted": True})
+
+    try:
+        payload = json.loads(request.body or "{}")
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON body"}, status=400)
+
+    if "status" in payload:
+        status = _clean_quiz_status(payload["status"], "")
+        if not status:
+            return JsonResponse({"error": "Unsupported quiz status"}, status=400)
+        if status == "published":
+            questions = QuizQuestion.objects.filter(quiz_id=quiz.id, is_archived=False).prefetch_related("answers")
+            prepared = [_question_key_payload(question) for question in questions]
+            # Standalone SCORM content keeps its existing launch workflow.
+            error = quiz_publication_error(prepared) if prepared or quiz.package_type != "scorm" else None
+            if error:
+                return JsonResponse({"error": error}, status=400)
+        quiz.status = status
+
+    for field in ["title", "module", "programme", "version", "author"]:
+        if field in payload:
+            setattr(quiz, field, payload[field])
+    for field, attr in [
+        ("shortDescription", "short_description"),
+        ("lessonContent", "lesson_content"),
+        ("timeUnit", "time_unit"),
+        ("quizStyle", "quiz_style"),
+    ]:
+        if field in payload:
+            setattr(quiz, attr, payload[field] or "")
+    if "questionType" in payload:
+        quiz.default_question_type = payload["questionType"] or "single_choice"
+    if "assessmentType" in payload:
+        quiz.assessment_type = _clean_assessment_type(payload["assessmentType"], quiz.assessment_type or "quiz")
+    if "programmeId" in payload:
+        quiz.programme_id = _match_programme_catalogue_id(quiz.programme, quiz.module, quiz.title, payload["programmeId"]) or ""
+    if "weekId" in payload:
+        quiz.week_id = payload["weekId"] or ""
+    elif any(field in payload for field in ["week", "weekNumber", "title", "programmeId", "programme", "module"]):
+        quiz.week_id = _build_week_id(quiz.programme_id, payload.get("week") or payload.get("weekNumber") or quiz.title)
+    for field, attr in [
+        ("questions", "questions"),
+        ("mappedComponents", "mapped_components"),
+        ("linkedCourses", "linked_courses"),
+        ("duration", "duration"),
+        ("passingGrade", "passing_grade"),
+        ("retakePointsCut", "retake_points_cut"),
+    ]:
+        if field in payload:
+            setattr(quiz, attr, int(payload[field] or 0))
+    for field, attr in [
+        ("randomizeQuestions", "randomize_questions"),
+        ("randomizeAnswers", "randomize_answers"),
+        ("showCorrectAnswer", "show_correct_answer"),
+        ("attemptHistory", "attempt_history"),
+        ("retakeAfterPass", "retake_after_pass"),
+        ("limitAttempts", "limit_attempts"),
+    ]:
+        if field in payload:
+            setattr(quiz, attr, bool(payload[field]))
+    if "schemaValid" in payload:
+        quiz.schema_valid = bool(payload["schemaValid"])
+    if quiz.status == "published" and not quiz.published_at:
+        quiz.published_at = timezone.now()
+    quiz.save()
+    return JsonResponse(_serialize_quiz(quiz))
+
+
+@csrf_exempt
+@require_http_methods(["GET", "PATCH"])
+def quiz_course_links(request, pk):
+    _ensure_quiz_assessment_type_column()
+    try:
+        quiz = QuizPackage.objects.get(pk=pk)
+    except QuizPackage.DoesNotExist:
+        raise Http404
+
+    try:
+        _ensure_quiz_course_links_table()
+        _ensure_quiz_component_links_table()
+    except Exception as exc:
+        return JsonResponse({"error": f"Could not prepare course links table: {exc}"}, status=500)
+
+    programme = quiz.programme or _authoring_programme_map([quiz.programme_id]).get(str(quiz.programme_id or "").strip(), "") or _training_plan_programme_for_id(quiz.programme_id)
+    module_options = _quiz_module_options(quiz, include_all_programmes=True)
+    if request.method == "PATCH":
+        try:
+            payload = json.loads(request.body or "{}")
+        except json.JSONDecodeError:
+            return JsonResponse({"error": "Invalid JSON body"}, status=400)
+
+        requested_assignments = payload.get("moduleAssignments")
+        if requested_assignments is not None and not isinstance(requested_assignments, list):
+            return JsonResponse({"error": "moduleAssignments must be a list"}, status=400)
+
+        requested_module_ids = payload.get("moduleCatalogueIds")
+        if requested_module_ids is None:
+            requested_module_ids = payload.get("componentIds")
+        if requested_module_ids is None:
+            requested_module_ids = payload.get("courseIds")
+        if requested_module_ids is None:
+            requested_module_ids = payload.get("trainingPlanIds", [])
+        if not isinstance(requested_module_ids, list):
+            return JsonResponse({"error": "moduleCatalogueIds must be a list"}, status=400)
+
+        requested_programme_id = str(payload.get("programmeId") or "").strip()
+        requested_programme_name = str(payload.get("programmeName") or "").strip()
+
+        valid_ids = {str(course["id"]) for course in module_options}
+        selected_option_map = {str(course["id"]): course for course in module_options}
+        week_ids_by_module = {
+            str(course["id"]): {
+                str(week.get("id") or "").strip()
+                for week in (course.get("weeks") or [])
+                if str(week.get("id") or "").strip()
+            }
+            for course in module_options
+        }
+        programme_name_map = {
+            str(course.get("programmeId") or "").strip(): str(course.get("programme") or "").strip()
+            for course in module_options
+            if str(course.get("programmeId") or "").strip()
+        }
+        selected_assignments = []
+        selected_assignment_map = {}
+        if requested_assignments is not None:
+            for item in requested_assignments:
+                if not isinstance(item, dict):
+                    return JsonResponse({"error": "Each module assignment must be an object"}, status=400)
+                module_id = str(
+                    item.get("moduleCatalogueId")
+                    or item.get("moduleId")
+                    or item.get("id")
+                    or ""
+                ).strip()
+                week_id = str(item.get("weekId") or "").strip()
+                if module_id in valid_ids and module_id not in selected_assignment_map:
+                    selected_assignment_map[module_id] = {
+                        "moduleCatalogueId": module_id,
+                        "weekId": week_id,
+                    }
+        else:
+            for raw_id in requested_module_ids:
+                module_id = str(raw_id or "").strip()
+                if module_id in valid_ids and module_id not in selected_assignment_map:
+                    selected_assignment_map[module_id] = {
+                        "moduleCatalogueId": module_id,
+                        "weekId": "",
+                    }
+        selected_assignments = list(selected_assignment_map.values())
+        selected_ids = [assignment["moduleCatalogueId"] for assignment in selected_assignments]
+
+        if selected_ids:
+            requested_programme_id = str(selected_option_map.get(selected_ids[0], {}).get("programmeId") or requested_programme_id).strip()
+            requested_programme_name = str(selected_option_map.get(selected_ids[0], {}).get("programme") or requested_programme_name).strip()
+        elif requested_programme_id and not requested_programme_name:
+            requested_programme_name = programme_name_map.get(requested_programme_id, "")
+
+        valid_programme_ids = {programme_id for programme_id in programme_name_map if programme_id}
+        if requested_programme_id and requested_programme_id not in valid_programme_ids:
+            return JsonResponse({"error": "programmeId is not valid for the available module catalogue"}, status=400)
+
+        for assignment in selected_assignments:
+            module_id = assignment["moduleCatalogueId"]
+            selected_week_id = assignment["weekId"]
+            valid_week_ids = week_ids_by_module.get(module_id, set())
+            if selected_week_id and selected_week_id not in valid_week_ids:
+                return JsonResponse({"error": 'One or more CHANGE_ME weeks are not valid for the chosen module.'}, status=400)
+            if valid_week_ids and not selected_week_id:
+                module_name = str(selected_option_map.get(module_id, {}).get("module") or module_id).strip()
+                return JsonResponse({"error": f"Select a delivery week for {module_name} before saving."}, status=400)
+
+        with transaction.atomic():
+            quiz = QuizPackage.objects.select_for_update().get(pk=pk)
+            if selected_ids and quiz.package_type != "scorm":
+                active = QuizQuestion.objects.filter(quiz_id=quiz.id, is_archived=False).prefetch_related("answers")
+                error = quiz_publication_error([_question_key_payload(question) for question in active])
+                if error:
+                    return JsonResponse({"error": error}, status=400)
+            with connection.cursor() as cursor:
+                cursor.execute("delete from curriculum.quiz_course_links where quiz_id = %s", [quiz.id])
+                for assignment in selected_assignments:
+                    cursor.execute(
+                        """
+                        insert into curriculum.quiz_course_links (quiz_id, module_catalogue_id, week_id)
+                        values (%s, %s, %s)
+                        on conflict (quiz_id, module_catalogue_id) do nothing
+                        """,
+                        [quiz.id, assignment["moduleCatalogueId"], assignment["weekId"]],
+                    )
+                components_table = _first_existing_curriculum_table("components", "module_authoring_components")
+                if components_table:
+                    if selected_ids:
+                        placeholders = ", ".join(["%s"] * len(selected_ids))
+                        cursor.execute(
+                            f"""
+                            delete from curriculum.quiz_component_links qcl
+                            where qcl.quiz_id = %s
+                              and exists (
+                                select 1
+                                from {_curriculum_table_name(components_table)} c
+                                where c.id = qcl.component_id
+                                  and coalesce(trim(c.module_catalogue_id), '') <> ''
+                                  and c.module_catalogue_id not in ({placeholders})
+                              )
+                            """,
+                            [quiz.id, *selected_ids],
+                        )
+                    else:
+                        cursor.execute(
+                            f"""
+                            delete from curriculum.quiz_component_links qcl
+                            where qcl.quiz_id = %s
+                              and exists (
+                                select 1
+                                from {_curriculum_table_name(components_table)} c
+                                where c.id = qcl.component_id
+                              )
+                            """,
+                            [quiz.id],
+                        )
+            quiz.linked_courses = len(selected_ids)
+            update_fields = ["linked_courses", "updated_at"]
+            if len(selected_ids) == 1:
+                selected_module_id = selected_ids[0]
+                selected_module_name = str(selected_option_map.get(selected_module_id, {}).get("module") or "").strip()
+                selected_week_id = str(selected_assignment_map.get(selected_module_id, {}).get("weekId") or "").strip()
+                if quiz.module != selected_module_name:
+                    quiz.module = selected_module_name
+                    update_fields.append("module")
+                if quiz.week_id != selected_week_id:
+                    quiz.week_id = selected_week_id
+                    update_fields.append("week_id")
+            else:
+                if quiz.module:
+                    quiz.module = ""
+                    update_fields.append("module")
+                if quiz.week_id:
+                    quiz.week_id = ""
+                    update_fields.append("week_id")
+            if requested_programme_id:
+                if quiz.programme_id != requested_programme_id:
+                    quiz.programme_id = requested_programme_id
+                    update_fields.append("programme_id")
+                resolved_programme_name = requested_programme_name or programme_name_map.get(requested_programme_id, "")
+                if resolved_programme_name and quiz.programme != resolved_programme_name:
+                    quiz.programme = resolved_programme_name
+                    update_fields.append("programme")
+            elif selected_ids and not quiz.programme_id:
+                quiz.programme_id = (
+                    str(selected_option_map.get(selected_ids[0], {}).get("programmeId") or "").strip()
+                    or _match_programme_catalogue_id(quiz.programme, quiz.module, quiz.title)
+                )
+                if quiz.programme_id:
+                    update_fields.append("programme_id")
+                    resolved_programme_name = str(selected_option_map.get(selected_ids[0], {}).get("programme") or "").strip()
+                    if resolved_programme_name and quiz.programme != resolved_programme_name:
+                        quiz.programme = resolved_programme_name
+                        update_fields.append("programme")
+            quiz.save(update_fields=list(dict.fromkeys(update_fields)))
+        programme = quiz.programme or _authoring_programme_map([quiz.programme_id]).get(str(quiz.programme_id or "").strip(), "") or _training_plan_programme_for_id(quiz.programme_id)
+        module_options = _quiz_module_options(quiz, include_all_programmes=True)
+
+    selected_assignments = _selected_quiz_module_link_assignments(quiz, module_options)
+    selected_ids = {assignment["moduleCatalogueId"] for assignment in selected_assignments}
+
+    if quiz.linked_courses != len(selected_ids):
+        quiz.linked_courses = len(selected_ids)
+        quiz.save(update_fields=["linked_courses", "updated_at"])
+
+    quiz._linked_group_count = _distinct_assignment_group_count(module_options, selected_ids)
+
+    return JsonResponse({
+        "programme": programme or "",
+        'CHANGE_MEProgrammeId': str(quiz.programme_id or "").strip(),
+        'CHANGE_MEProgrammeName': programme or "",
+        "linkType": "modules",
+        'CHANGE_MEIds': sorted(selected_ids),
+        'CHANGE_MEModuleCatalogueIds': sorted(selected_ids),
+        'CHANGE_MEAssignments': selected_assignments,
+        "courses": [
+            {**course, 'CHANGE_ME': course["id"] in selected_ids}
+            for course in module_options
+        ],
+        "quiz": _serialize_quiz(quiz),
+    })
+
+
+def _safe_download_name(quiz, extension):
+    base_name = Path(quiz.file_name or "").stem or quiz.title or f"quiz-{quiz.id}"
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", base_name).strip(".-") or f"quiz-{quiz.id}"
+    return f"{safe_name}.{extension}"
+
+
+def _export_questions(quiz):
+    return (
+        QuizQuestion.objects
+        .filter(quiz_id=quiz.id, is_archived=False)
+        .prefetch_related("answers")
+        .order_by("sort_order", "id")
+    )
+
+
+def _quiz_csv_response(quiz):
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "question_number",
+        "question_type",
+        "question",
+        "option_a",
+        "option_b",
+        "option_c",
+        "option_d",
+        "option_e",
+        "correct_answer",
+        "feedback",
+        "programme",
+        "module",
+    ])
+
+    for index, question in enumerate(_export_questions(quiz), start=1):
+        answers = list(question.answers.all())
+        option_texts = [answer.answer_text for answer in answers[:5]]
+        option_texts += [""] * (5 - len(option_texts))
+        correct_letters = [
+            chr(65 + answer_index)
+            for answer_index, answer in enumerate(answers[:5])
+            if answer.is_correct
+        ]
+        writer.writerow([
+            index,
+            question.question_type,
+            question.question_text,
+            *option_texts[:5],
+            ",".join(correct_letters),
+            question.explanation,
+            quiz.programme,
+            quiz.module,
+        ])
+
+    response = HttpResponse(output.getvalue(), content_type="text/csv; charset=utf-8")
+    response["Content-Disposition"] = f'attachment; filename="{_safe_download_name(quiz, "csv")}"'
+    return response
+
+
+def _quiz_xml_response(quiz):
+    root = ElementTree.Element("quiz", {
+        "id": str(quiz.id),
+        "version": quiz.version or "v1.0",
+        "status": quiz.status,
+    })
+    metadata = ElementTree.SubElement(root, "metadata")
+    for tag, value in [
+        ("title", quiz.title),
+        ("module", quiz.module),
+        ("programme", quiz.programme),
+        ("package_type", quiz.package_type),
+    ]:
+        ElementTree.SubElement(metadata, tag).text = value or ""
+
+    questions_node = ElementTree.SubElement(root, "questions", {
+        "count": str(QuizQuestion.objects.filter(quiz_id=quiz.id, is_archived=False).count())
+    })
+    for index, question in enumerate(_export_questions(quiz), start=1):
+        question_node = ElementTree.SubElement(questions_node, "question", {
+            "id": str(question.id),
+            "number": str(index),
+            "type": question.question_type,
+            "points": str(question.points),
+        })
+        ElementTree.SubElement(question_node, "text").text = question.question_text
+        answers_node = ElementTree.SubElement(question_node, "answers")
+        for answer_index, answer in enumerate(question.answers.all(), start=1):
+            answer_node = ElementTree.SubElement(answers_node, "answer", {
+                "id": str(answer.id),
+                "letter": chr(64 + answer_index),
+                "correct": "true" if answer.is_correct else "false",
+            })
+            answer_node.text = answer.answer_text
+        ElementTree.SubElement(question_node, "feedback").text = question.explanation or ""
+
+    content = ElementTree.tostring(root, encoding="utf-8", xml_declaration=True)
+    response = HttpResponse(content, content_type="application/xml; charset=utf-8")
+    response["Content-Disposition"] = f'attachment; filename="{_safe_download_name(quiz, "xml")}"'
+    return response
+
+
+def _scorm_uploaded_file_readable(quiz):
+    """True only when the quiz has an uploaded package that actually exists on disk."""
+    if not quiz.uploaded_file:
+        return False
+    try:
+        return quiz.uploaded_file.storage.exists(quiz.uploaded_file.name)
+    except Exception:
+        return False
+
+
+def _scorm_index_html(quiz):
+    questions = [
+        {
+            "text": question.question_text,
+            "type": question.question_type,
+            "feedback": question.explanation,
+            "answers": [
+                {"text": answer.answer_text, "isCorrect": answer.is_correct}
+                for answer in question.answers.all()
+            ],
+        }
+        for question in _export_questions(quiz)
+    ]
+    quiz_payload = json.dumps({
+        "title": quiz.title,
+        "programme": quiz.programme,
+        "module": quiz.module,
+        "questions": questions,
+    })
+    safe_title = html.escape(quiz.title or "SCORM preview")
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{safe_title}</title>
+  <style>
+    body {{ margin: 0; font-family: Arial, sans-serif; background: #f8fafc; color: #0f172a; }}
+    main {{ max-width: 920px; margin: 0 auto; padding: 32px 20px; }}
+    .card {{ background: #fff; border: 1px solid #dbe3ee; border-radius: 18px; padding: 24px; margin-bottom: 18px; }}
+    .answer {{ border: 1px solid #dbe3ee; border-radius: 12px; padding: 12px 14px; margin-top: 10px; }}
+    .correct {{ border-color: #34d399; background: #ecfdf5; color: #047857; }}
+    .feedback {{ margin-top: 14px; border: 1px solid #ddd2ff; background: #fbf9ff; border-radius: 12px; padding: 12px; color: #3f2f73; }}
+  </style>
+</head>
+<body>
+  <main id="app"></main>
+  <script>
+    const quiz = {quiz_payload};
+    const app = document.getElementById('app');
+    app.innerHTML = `<h1>${{quiz.title}}</h1><p>${{quiz.questions.length}} questions - ${{quiz.programme || ''}}</p>` +
+      quiz.questions.map((question, index) => `
+        <section class="card">
+          <h2>${{index + 1}}. ${{question.text}}</h2>
+          ${{question.answers.map((answer, answerIndex) => `
+            <div class="answer ${{answer.isCorrect ? 'correct' : ''}}">
+              <strong>${{String.fromCharCode(65 + answerIndex)}}.</strong> ${{answer.text}}
+              ${{answer.isCorrect ? '<strong style="float:right">Correct</strong>' : ''}}
+            </div>
+          `).join('')}}
+          ${{question.feedback ? `<div class="feedback"><strong>Feedback</strong><br>${{question.feedback}}</div>` : ''}}
+        </section>
+      `).join('');
+  </script>
+</body>
+</html>
+"""
+
+
+def _quiz_scorm_response(quiz):
+    if _scorm_uploaded_file_readable(quiz):
+        filename = quiz.file_name or _safe_download_name(quiz, "zip")
+        if not filename.lower().endswith(".zip"):
+            filename = _safe_download_name(quiz, "zip")
+        return FileResponse(quiz.uploaded_file.open("rb"), as_attachment=True, filename=filename)
+
+    index_html = _scorm_index_html(quiz)
+    manifest = f"""<?xml version="1.0" encoding="UTF-8"?>
+<manifest identifier="quiz-{quiz.id}" version="1.2"
+  xmlns="http://www.imsproject.org/xsd/imscp_rootv1p1p2"
+  xmlns:adlcp="http://www.adlnet.org/xsd/adlcp_rootv1p2">
+  <metadata>
+    <schema>ADL SCORM</schema>
+    <schemaversion>1.2</schemaversion>
+  </metadata>
+  <organizations default="org-{quiz.id}">
+    <organization identifier="org-{quiz.id}">
+      <title>{quiz.title}</title>
+      <item identifier="item-{quiz.id}" identifierref="res-{quiz.id}">
+        <title>{quiz.title}</title>
+      </item>
+    </organization>
+  </organizations>
+  <resources>
+    <resource identifier="res-{quiz.id}" type="webcontent" adlcp:scormtype="sco" href="index.html">
+      <file href="index.html" />
+    </resource>
+  </resources>
+</manifest>
+"""
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as package:
+        package.writestr("imsmanifest.xml", manifest)
+        package.writestr("index.html", index_html)
+    archive.seek(0)
+
+    response = HttpResponse(archive.getvalue(), content_type="application/zip")
+    response["Content-Disposition"] = f'attachment; filename="{_safe_download_name(quiz, "zip")}"'
+    return response
+
+
+@require_http_methods(["GET"])
+def quiz_download(request, pk):
+    _ensure_quiz_assessment_type_column()
+    try:
+        quiz = QuizPackage.objects.get(pk=pk)
+    except QuizPackage.DoesNotExist:
+        raise Http404
+
+    package_type = (quiz.package_type or "xml").lower()
+    if package_type == "scorm":
+        return _quiz_scorm_response(quiz)
+    if package_type in {"csv", "excel"}:
+        return _quiz_csv_response(quiz)
+    return _quiz_xml_response(quiz)
+
+
+@require_http_methods(["GET"])
+@xframe_options_sameorigin
+def quiz_scorm_launch(request, pk, asset_path=""):
+    _ensure_quiz_assessment_type_column()
+    try:
+        quiz = QuizPackage.objects.get(pk=pk)
+    except QuizPackage.DoesNotExist:
+        raise Http404
+
+    if quiz.package_type != "scorm":
+        raise Http404
+
+    # No real package on disk (or it never uploaded): serve a generated preview
+    # built from the quiz's saved questions instead of returning a 500/404 that
+    # the browser renders as an empty, broken iframe.
+    if not _scorm_uploaded_file_readable(quiz):
+        if asset_path and normpath(asset_path.replace("\\", "/")).lstrip("/") not in ("", ".", "index.html"):
+            raise Http404
+        return HttpResponse(_scorm_index_html(quiz), content_type="text/html; charset=utf-8")
+
+    destination, launch_path = _ensure_scorm_extracted(quiz)
+    requested_path = asset_path or launch_path
+    if not asset_path:
+        cleaned_launch_path = _normalise_scorm_zip_path(launch_path)
+        if not cleaned_launch_path:
+            raise Http404
+        return HttpResponseRedirect(
+            request.build_absolute_uri(
+                f"/quiz_api/quizzes/{quiz.id}/scorm/{quote(cleaned_launch_path)}"
+            )
+        )
+
+    target = _safe_scorm_member_path(destination, requested_path)
+    if target is None or not target.is_file():
+        raise Http404
+
+    content_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+    return FileResponse(target.open("rb"), content_type=content_type)
+
+
+def _quiz_preview_payload(quiz, include_archived=False):
+    questions = []
+    queryset = QuizQuestion.objects.filter(quiz_id=quiz.id)
+    if not include_archived:
+        queryset = queryset.filter(is_archived=False)
+    for question in queryset.prefetch_related("answers"):
+        questions.append({
+            "id": question.id,
+            "text": question.question_text,
+            "questionType": question.question_type,
+            "imageUrl": question.image_url,
+            "explanation": question.explanation,
+            "isArchived": question.is_archived,
+            "answers": [
+                {
+                    "id": answer.id,
+                    "text": answer.answer_text,
+                    "isCorrect": answer.is_correct,
+                }
+                for answer in question.answers.all()
+            ],
+        })
+
+    return {
+        "quiz": _serialize_quiz(quiz),
+        "questions": questions,
+    }
+
+
+@require_http_methods(["GET"])
+def quiz_preview(request, pk):
+    _ensure_quiz_assessment_type_column()
+    try:
+        quiz = QuizPackage.objects.get(pk=pk)
+    except QuizPackage.DoesNotExist:
+        raise Http404
+
+    return JsonResponse(_quiz_preview_payload(quiz))
+
+
+@require_http_methods(["GET"])
+def question_bank(request):
+    _ensure_quiz_assessment_type_column()
+    selected_programme = request.GET.get("programme", "all").strip()
+    query = request.GET.get("search", "").strip()
+    base_queryset = (
+        QuizQuestion.objects
+        .filter(is_archived=False)
+        .exclude(quiz__status="trash")
+        .select_related("quiz")
+        .prefetch_related("answers")
+    )
+    if query:
+        base_queryset = base_queryset.filter(question_text__icontains=query)
+
+    programme_stats = {}
+    for programme in _training_plan_programmes():
+        programme_stats[programme["name"]] = {
+            "name": programme["name"],
+            "questionCount": 0,
+            "quizCount": 0,
+            "moduleRows": programme.get("moduleRows", programme.get("moduleCount", 0)),
+            "trainingPlanRows": programme.get("trainingPlanRows", 0),
+        }
+
+    all_questions = list(
+        base_queryset.order_by("quiz__programme_id", "quiz__module", "quiz__title", "sort_order", "id")
+    )
+    available_quizzes = list(QuizPackage.objects.exclude(status="trash").order_by("programme_id", "title"))
+    def resolve_programme(quiz):
+        if quiz.programme:
+            return quiz.programme, quiz.programme
+        if quiz.programme_id:
+            return quiz.programme_id, quiz.programme_id
+        return "__unassigned__", "Unassigned"
+
+    quiz_ids_by_programme = {}
+    question_programme_info = {}
+    question_usage_by_signature = {}
+    for question in all_questions:
+        key, programme_name = resolve_programme(question.quiz)
+        question_programme_info[question.id] = (key, programme_name)
+        if key not in programme_stats:
+            programme_stats[key] = {
+                "name": programme_name,
+                "questionCount": 0,
+                "quizCount": 0,
+                "moduleRows": 0,
+                "trainingPlanRows": 0,
+            }
+        programme_stats[key]["questionCount"] += 1
+        quiz_ids_by_programme.setdefault(key, set()).add(question.quiz_id)
+        signature = (
+            key,
+            question.question_type,
+            " ".join((question.question_text or "").split()).strip().lower(),
+            question.image_url,
+        )
+        linked_quizzes = question_usage_by_signature.setdefault(signature, {})
+        linked_quizzes[question.quiz_id] = {
+            "id": question.quiz_id,
+            "title": question.quiz.title,
+            "module": question.quiz.module,
+            "status": question.quiz.status,
+        }
+
+    questions = []
+    for question in all_questions:
+        key, programme_name = question_programme_info[question.id]
+
+        if selected_programme != "all" and selected_programme != key:
+            continue
+
+        signature = (
+            key,
+            question.question_type,
+            " ".join((question.question_text or "").split()).strip().lower(),
+            question.image_url,
+        )
+
+        questions.append({
+            "id": question.id,
+            "text": question.question_text,
+            "questionType": question.question_type,
+            "imageUrl": question.image_url,
+            "explanation": question.explanation,
+            "programme": programme_name,
+            "programmeKey": key,
+            "module": question.quiz.module,
+            "quizId": question.quiz_id,
+            "quizTitle": question.quiz.title,
+            "quizStatus": question.quiz.status,
+            "linkedQuizzes": list(question_usage_by_signature.get(signature, {}).values()),
+            "answers": [
+                {
+                    "id": answer.id,
+                    "text": answer.answer_text,
+                    "isCorrect": answer.is_correct,
+                }
+                for answer in question.answers.all()
+            ],
+        })
+
+    for key, quiz_ids in quiz_ids_by_programme.items():
+        programme_stats[key]["quizCount"] = len(quiz_ids)
+
+    quizzes = []
+    for quiz in available_quizzes:
+        key, programme_name = resolve_programme(quiz)
+        quizzes.append({
+            "id": quiz.id,
+            "title": quiz.title,
+            "module": quiz.module,
+            "programme": programme_name,
+            "programmeKey": key,
+            "questions": quiz.questions,
+            "status": quiz.status,
+        })
+
+    programmes = sorted(
+        programme_stats.values(),
+        key=lambda item: (item["name"] == "Unassigned", item["name"].lower()),
+    )
+    return JsonResponse({
+        "programmes": programmes,
+        "questions": questions,
+        "quizzes": quizzes,
+        "totalQuestions": sum(programme["questionCount"] for programme in programmes),
+    })
+
+
+def _question_key_payload(question):
+    return {
+        "type": question.question_type,
+        "isArchived": question.is_archived,
+        "answers": [{"text": answer.answer_text, "isCorrect": answer.is_correct}
+                    for answer in question.answers.all()],
+    }
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def add_question_to_quiz(request, question_id):
+    _ensure_quiz_assessment_type_column()
+    try:
+        payload = json.loads(request.body or "{}")
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON body"}, status=400)
+
+    target_quiz_id = payload.get("quizId")
+    if not target_quiz_id:
+        return JsonResponse({"error": "quizId is required"}, status=400)
+
+    try:
+        source_question = QuizQuestion.objects.select_related("quiz").prefetch_related("answers").get(pk=question_id)
+    except QuizQuestion.DoesNotExist:
+        raise Http404
+
+    with transaction.atomic():
+        try:
+            target_quiz = QuizPackage.objects.select_for_update().get(pk=target_quiz_id)
+        except QuizPackage.DoesNotExist:
+            return JsonResponse({"error": "Target quiz not found"}, status=404)
+
+        if quiz_requires_valid_key(target_quiz):
+            existing = QuizQuestion.objects.filter(quiz_id=target_quiz.id, is_archived=False).prefetch_related("answers")
+            candidate = _question_key_payload(source_question)
+            candidate["isArchived"] = False
+            error = quiz_publication_error([*(_question_key_payload(q) for q in existing), candidate])
+            if error:
+                return JsonResponse({"error": error}, status=400)
+
+        next_sort_order = (
+            QuizQuestion.objects
+            .filter(quiz=target_quiz)
+            .aggregate(max_order=Max("sort_order"))
+            .get("max_order")
+        )
+        next_sort_order = 0 if next_sort_order is None else next_sort_order + 1
+
+        new_question = QuizQuestion.objects.create(
+            quiz=target_quiz,
+            question_text=source_question.question_text,
+            image_url=source_question.image_url,
+            question_type=source_question.question_type,
+            points=source_question.points,
+            sort_order=next_sort_order,
+            explanation=source_question.explanation,
+            is_archived=False,
+        )
+        for answer in source_question.answers.all():
+            QuizAnswer.objects.create(
+                question=new_question,
+                answer_text=answer.answer_text,
+                is_correct=answer.is_correct,
+                sort_order=answer.sort_order,
+            )
+
+        target_quiz.questions = QuizQuestion.objects.filter(quiz=target_quiz, is_archived=False).count()
+        target_quiz.save(update_fields=["questions", "updated_at"])
+
+    target_quiz.refresh_from_db()
+    return JsonResponse({
+        "question": {
+            "id": new_question.id,
+            "text": new_question.question_text,
+            "quizId": target_quiz.id,
+            "quizTitle": target_quiz.title,
+        },
+        "quiz": _serialize_quiz(target_quiz),
+    }, status=201)
+
+
+@csrf_exempt
+def quiz_questions(request, pk):
+    if request.method == "GET":
+        return _quiz_questions_locked(request, pk)
+    with transaction.atomic():
+        return _quiz_questions_locked(request, pk)
+
+
+def _quiz_questions_locked(request, pk):
+    _ensure_quiz_assessment_type_column()
+    if request.method not in {"GET", "POST", "PATCH"}:
+        return JsonResponse({"error": "Method not allowed"}, status=405)
+
+    try:
+        quiz_manager = QuizPackage.objects if request.method == "GET" else QuizPackage.objects.select_for_update()
+        quiz = quiz_manager.get(pk=pk)
+    except QuizPackage.DoesNotExist:
+        raise Http404
+
+    if request.method == "GET":
+        return JsonResponse(_quiz_preview_payload(quiz, include_archived=True))
+
+    try:
+        payload = json.loads(request.body or "{}")
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON body"}, status=400)
+
+    questions = payload.get("questions", [])
+    if not isinstance(questions, list):
+        return JsonResponse({"error": "questions must be a list"}, status=400)
+
+    # Validate the complete batch before changing any questions or answers.
+    for index, question in enumerate(questions, start=1):
+        if not isinstance(question, dict):
+            return JsonResponse({"error": "Each question must be an object"}, status=400)
+        if "imageUrl" in question:
+            try:
+                question["imageUrl"] = validate_question_image(question["imageUrl"])
+            except ValueError as exc:
+                return JsonResponse({"error": f"Question {index}: {exc}"}, status=400)
+
+    requires_key = quiz_requires_valid_key(quiz)
+    existing_questions = {
+        question.id: question
+        for question in QuizQuestion.objects.filter(quiz_id=quiz.id).prefetch_related("answers")
+    }
+    for index, question in enumerate(questions, 1):
+        existing = existing_questions.get(question.get("id"))
+        if "answers" not in question and "questionType" not in question:
+            continue
+        answers = question.get("answers")
+        if answers is None:
+            answers = [{"text": a.answer_text, "isCorrect": a.is_correct} for a in existing.answers.all()] if existing else []
+        if not isinstance(answers, list) or any(not isinstance(a, dict) for a in answers):
+            return JsonResponse({"error": f"Question {index}: answers must be a list of objects."}, status=400)
+        error = choice_key_error(
+            question.get("questionType") or (existing.question_type if existing else quiz.default_question_type),
+            [answer for answer in answers if str(answer.get("text") or "").strip()],
+            strict_duplicates=True, require_key=requires_key and not question.get("isArchived", getattr(existing, "is_archived", False)),
+        )
+        if error:
+            return JsonResponse({"error": f"Question {index}: {error}"}, status=400)
+    remove_missing = bool(payload.get("removeMissing"))
+    if remove_missing and len(questions) == 1 and len(existing_questions) > 1:
+        return JsonResponse({
+            "error": "Refusing to replace a multi-question quiz with one question. Reload the editor and try again.",
+        }, status=409)
+
+    if requires_key:
+        effective = {qid: _question_key_payload(q) for qid, q in existing_questions.items()}
+        submitted = []
+        for question in questions:
+            candidate = dict(effective.get(question.get("id"), {"type": quiz.default_question_type, "answers": []}))
+            if "questionType" in question:
+                candidate["type"] = question["questionType"] or quiz.default_question_type
+            if "answers" in question and question["answers"] is not None:
+                candidate["answers"] = [a for a in question["answers"] if str(a.get("text") or "").strip()]
+            if "isArchived" in question:
+                candidate["isArchived"] = bool(question["isArchived"])
+            effective.pop(question.get("id"), None)
+            submitted.append(candidate)
+        error = quiz_publication_error(submitted + ([] if remove_missing else list(effective.values())))
+        if error:
+            return JsonResponse({"error": error}, status=400)
+
+    seen_question_ids = set()
+    with transaction.atomic():
+        for question_index, question in enumerate(questions):
+            question_id = question.get("id")
+            question_record = existing_questions.get(question_id)
+            replace_answers = True
+            if question_record:
+                question_record.sort_order = question_index
+                update_fields = ["sort_order", "updated_at"]
+                if "text" in question:
+                    question_record.question_text = question["text"].strip() or "Untitled question"
+                    update_fields.append("question_text")
+                if "questionType" in question:
+                    question_record.question_type = question["questionType"] or quiz.default_question_type
+                    update_fields.append("question_type")
+                if "explanation" in question:
+                    question_record.explanation = question["explanation"]
+                    update_fields.append("explanation")
+                if "isArchived" in question:
+                    question_record.is_archived = bool(question["isArchived"])
+                    update_fields.append("is_archived")
+                if "imageUrl" in question:
+                    question_record.image_url = question["imageUrl"]
+                    update_fields.append("image_url")
+                question_record.save(update_fields=update_fields)
+                # An image-only edit must keep answer identities used by past attempts.
+                existing_answers = list(question_record.answers.all())
+                submitted_answers = question.get("answers")
+                replace_answers = submitted_answers is not None and [
+                    (answer.id, answer.answer_text, answer.is_correct)
+                    for answer in existing_answers
+                ] != [
+                    (answer.get("id"), answer.get("text", "").strip(), bool(answer.get("isCorrect")))
+                    for answer in submitted_answers
+                    if answer.get("text", "").strip()
+                ]
+                seen_question_ids.add(question_record.id)
+            else:
+                question_record = QuizQuestion.objects.create(
+                    quiz=quiz,
+                    question_text=question.get("text", "").strip() or "Untitled question",
+                    image_url=question.get("imageUrl", ""),
+                    question_type=question.get("questionType") or quiz.default_question_type,
+                    explanation=question.get("explanation", ""),
+                    is_archived=bool(question.get("isArchived")),
+                    sort_order=question_index,
+                )
+                seen_question_ids.add(question_record.id)
+
+            if replace_answers:
+                _update_question_answers(question_record, question.get("answers", []), existing_answers if question_id in existing_questions else [])
+
+        if remove_missing:
+            QuizQuestion.objects.filter(quiz_id=quiz.id).exclude(id__in=seen_question_ids).delete()
+        else:
+            next_order = len(questions)
+            for existing_id, existing_question in existing_questions.items():
+                if existing_id in seen_question_ids:
+                    continue
+                existing_question.sort_order = next_order
+                existing_question.save(update_fields=["sort_order", "updated_at"])
+                next_order += 1
+
+        quiz.questions = QuizQuestion.objects.filter(quiz_id=quiz.id, is_archived=False).count()
+        quiz.save(update_fields=["questions", "updated_at"])
+
+    quiz.refresh_from_db()
+    return JsonResponse(_quiz_preview_payload(quiz))
+
+
+def _update_question_answers(question, answers, existing):
+    """Preserve IDs for unchanged options, including clients omitting IDs.
+
+    A changed label receives a new ID so an in-flight submission cannot silently
+    refer to a different answer. Answer keys and positions update in place.
+    """
+    remaining = {answer.id: answer for answer in existing}
+    for index, answer in enumerate(answers):
+        text = answer.get("text", "").strip()
+        if not text:
+            continue
+        record = remaining.get(answer.get("id"))
+        if record is not None and record.answer_text != text:
+            record = None
+        if record is None:
+            matches = [item for item in remaining.values() if item.answer_text == text]
+            record = matches[0] if len(matches) == 1 else None
+        if record is None:
+            QuizAnswer.objects.create(question=question, answer_text=text, is_correct=bool(answer.get("isCorrect")), sort_order=index)
+        else:
+            remaining.pop(record.id)
+            record.is_correct = bool(answer.get("isCorrect"))
+            record.sort_order = index
+            record.save(update_fields=["is_correct", "sort_order", "updated_at"])
+    if remaining:
+        question.answers.filter(id__in=list(remaining)).delete()

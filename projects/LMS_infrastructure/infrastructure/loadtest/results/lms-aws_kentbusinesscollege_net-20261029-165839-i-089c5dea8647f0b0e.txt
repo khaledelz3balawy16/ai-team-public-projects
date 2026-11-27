@@ -1,0 +1,49 @@
+time="2026-10-29T13:58:43Z" level=info msg="signed in as role=admin subject=staff; 1 API paths per iteration" source=console
+
+
+  █ THRESHOLDS 
+
+    checks
+    ✓ 'rate>0.95' rate=99.99%
+
+    http_req_duration{kind:api}
+    ✓ 'p(95)<5000' p(95)=260.43ms
+
+    http_req_duration{kind:page}
+    ✓ 'p(95)<1000' p(95)=74.67ms
+
+    http_req_failed
+    ✓ 'rate<0.05' rate=0.00%
+
+
+  █ TOTAL RESULTS 
+
+    checks_total.......: 350854 610.408037/s
+    checks_succeeded...: 99.99% 350852 out of 350854
+    checks_failed......: 0.00%  2 out of 350854
+
+    ✓ page 200
+    ✗ api 200
+      ↳  99% — ✓ 175425 / ✗ 2
+
+    HTTP
+    http_req_duration..............: avg=178.27ms med=175.49ms p(90)=204.54ms p(95)=217.15ms p(99)=4.42s    max=9.48s   
+      { expected_response:true }...: avg=178.27ms med=175.5ms  p(90)=204.54ms p(95)=217.15ms p(99)=4.42s    max=9.48s   
+      { kind:api }.................: avg=343.9ms  med=195.1ms  p(90)=217.15ms p(95)=260.43ms p(99)=6.23s    max=9.48s   
+      { kind:page }................: avg=12.63ms  med=5.13ms   p(90)=22.64ms  p(95)=74.67ms  p(99)=124.16ms max=207.41ms
+    http_req_failed................: 0.00%  2 out of 350856
+    http_reqs......................: 350856 610.411516/s
+
+    EXECUTION
+    iteration_duration.............: avg=2.35s    med=2.24s    p(90)=3.06s    p(95)=3.16s    p(99)=8.25s    max=12.19s  
+    iterations.....................: 175427 305.204018/s
+    vus............................: 0      min=0           max=1000
+    vus_max........................: 1000   min=1000        max=1000
+
+    NETWORK
+    data_received..................: 1.7 GB 3.0 MB/s
+    data_sent......................: 22 MB  39 kB/s
+
+
+
+

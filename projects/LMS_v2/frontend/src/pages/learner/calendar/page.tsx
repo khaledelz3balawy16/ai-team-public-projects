@@ -1,0 +1,2294 @@
+import { LoadingSkeleton } from '@/components/feature/LoadingSkeleton';
+import { useState, useMemo, useCallback, useEffect, useRef } from 'react';
+import { useLocation } from 'react-router-dom';
+import { WorkspaceShell } from '@/components/feature/WorkspaceShell';
+import { AppIcon } from '@/components/feature/AppIcon';
+import { CalendarFilterScrollRow } from '@/components/feature/CalendarFilterScrollRow';
+import { roleNavMap } from '@/mocks/navigation';
+import { LEARNER_PROFILE } from '@/mocks/learner-profile';
+import { type CalendarEvent as SharedCalendarEvent } from '@/pages/learner/clubs/data';
+import { downloadICS, downloadAllICS, createPublicFeedBlob, type ICSEvent } from '@/utils/ics-generator';
+import { useLinkedLearner } from '@/hooks/useMyLearner';
+import { invalidateLearnerReads } from '@/api/learnerRead';
+import { useLiveRefresh } from '@/hooks/useRefreshOnReturn';
+import { buildSourceFilters, countBySource, filterBySource, learnerEventSource, learnerSourceMeta, type LearnerSourceFilter } from './reviewTypeFilters';
+import { buildReviewTypeLookup } from '@/lib/reviewTypeFilters';
+import { moveCalendarDate } from './navigation';
+import { RowsSkeleton } from '@/components/feature/Skeletons';
+import { PageHeader } from '@/components/ui/PageHeader';
+import { PageContainer } from '@/components/ui/PageContainer';
+import { Panel } from '@/components/ui/Panel';
+import { SectionHeader } from '@/components/ui/SectionHeader';
+import {
+  fetchLearnerCalendarEvents, bookLearnerCalendarSession, rescheduleLearnerCalendarSession, cancelLearnerCalendarSession, fetchLearnerCoach,
+  fetchLearnerMeetingArtifacts, learnerMeetingArtifactContentUrl, saveLearnerEventReviewAnswers,
+  fetchCalendarConnections, startCalendarOAuth, connectCredentialCalendar,
+  disconnectPersonalCalendar, fetchPersonalCalendarAvailability,
+  fetchReviewSlots, fetchCoachSessionSlots,
+  ukOffsetForDate,
+  type LearnerCalendarEvent, type BookableSessionType, type PersonalCalendarConnection,
+  type PersonalCalendarProvider, type CalendarBusySlot, type BookingCalendarRules,
+} from '@/api/learnerCalendar';
+import { CalendarEventDialog } from '@/components/feature/CalendarEventDialog';
+import { BookingOnlyNotice } from '@/components/feature/BookingOnlyNotice';
+import { CoachMeetingArtifactsPanel } from '@/pages/coach/shared/CoachMeetingArtifactsPanel';
+import { CalendarColorPreferencesDrawer } from '@/pages/coach/timetable/components/CalendarColorPreferencesDrawer';
+import {
+  getMeetingTypeKey,
+  loadCalendarColors,
+  saveCalendarColors,
+  type CalendarColorPreferences,
+  type CalendarStatusKey,
+  type MeetingTypeKey,
+} from '@/pages/coach/timetable/calendarColors';
+import { aptemBookingSnapshot, isAptemReview, meetingBookingWarning } from '../reviews/meetingBooking';
+import { useImportedMeetingBooking } from '../reviews/useImportedMeetingBooking';
+import { LearnerReviewInstanceForm } from '../reviews/LearnerReviewInstanceForm';
+import { useLearnerReviewInstance } from "../reviews/LearnerReviewInstanceForm.helpers";
+import { bookingInstant, firstAvailableBookingDate, parseBookingDay } from '../reviews/bookingDates';
+import CoachSessionTypePicker from './CoachSessionTypePicker';
+import { BUSINESS_TIME_ZONE } from '@/lib/timeZones';
+
+type CalendarEvent = SharedCalendarEvent & Pick<ICSEvent, 'timeZone' | 'startsAt' | 'endsAt'> & { needsInitialReviewBooking?: boolean; isTimeEstimated?: boolean; bookingOnly?: boolean };
+
+function hasCalendarExportTime(event: CalendarEvent): boolean {
+  return !event.timeToBeConfirmed && (!event.isTimeEstimated || Boolean(event.startsAt && event.endsAt));
+}
+
+function calendarICSEvent(event: CalendarEvent): ICSEvent {
+  if (!event.isoDate) throw new Error('The full event date is unavailable. Refresh the calendar and try again.');
+  if (!hasCalendarExportTime(event)) throw new Error('This event time is still to be confirmed.');
+  if (!(event.startsAt && event.endsAt) && !event.timeZone) {
+    throw new Error('The event time zone is unavailable. Refresh the calendar and try again.');
+  }
+  return {
+    title: event.title, description: event.description, date: event.date,
+    time: event.time, location: event.location, isoDate: event.isoDate,
+    timeZone: event.timeZone, startsAt: event.startsAt, endsAt: event.endsAt,
+    durationMinutes: event.durationMinutes,
+  };
+}
+
+/** The header's secondary-actions menu — everything that isn't booking a
+ * coach session (the primary action) moves in here so the toolbar stays a
+ * single row instead of a stack of equally-loud buttons. */
+function CalendarMoreMenu({
+  connectedCount, onConnectCalendar, onShare, onExportAll,
+}: {
+  connectedCount: number;
+  onConnectCalendar: () => void;
+  onShare: () => void;
+  onExportAll: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const handleClick = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('mousedown', handleClick);
+    return () => document.removeEventListener('mousedown', handleClick);
+  }, []);
+
+  const items: { label: string; icon: string; onClick: () => void }[] = [
+    { label: connectedCount > 0 ? `${connectedCount} calendar${connectedCount === 1 ? '' : 's'} connected` : 'Connect Personal Calendar', icon: connectedCount > 0 ? 'ri-calendar-check-line' : 'ri-calendar-2-line', onClick: onConnectCalendar },
+    { label: 'Share Calendar', icon: 'ri-share-line', onClick: onShare },
+    { label: 'Export All Events', icon: 'ri-download-line', onClick: onExportAll },
+  ];
+
+  return (
+    <div className="relative" ref={ref}>
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        className="inline-flex h-[42px] min-w-[84px] items-center justify-center gap-1.5 rounded-xl border border-foreground-200 bg-white px-3.5 text-[13px] font-semibold text-foreground-900 transition-smooth hover:border-foreground-300 hover:bg-background-50 cursor-pointer"
+      >
+        <AppIcon className="ri-more-2-fill text-[16px]"></AppIcon>
+        More
+      </button>
+      {open && (
+        <div role="menu" aria-label="Calendar actions" className="calendar-more-menu absolute right-0 top-full z-50 mt-2 max-h-[min(70vh,14rem)] w-72 max-w-[calc(100vw-2rem)] overflow-y-auto overscroll-contain rounded-2xl border border-foreground-200 bg-white p-1.5 shadow-xl shadow-foreground-900/10 animate-in fade-in slide-in-from-top-1 duration-150">
+          {items.map((item) => (
+            <button
+              key={item.label}
+              type="button"
+              role="menuitem"
+              onClick={() => { item.onClick(); setOpen(false); }}
+              className="flex min-h-11 w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-[13px] font-medium text-foreground-800 transition-smooth hover:bg-primary-50 hover:text-primary-700 cursor-pointer"
+            >
+              <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary-50 text-primary-600">
+                <AppIcon className={`${item.icon} text-[15px]`}></AppIcon>
+              </span>
+              <span className="min-w-0 truncate">{item.label}</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function LearnerCalendarHeroArt() {
+  const today = new Date();
+  const todayMonthLabel = MONTH_NAMES[today.getMonth()].slice(0, 3).toUpperCase();
+  const todayDay = String(today.getDate()).padStart(2, '0');
+
+  return (
+    <div className="calendar-hero-art">
+      <span className="calendar-hero-art__dots" />
+      <span className="calendar-hero-art__sprig" />
+      <span className="calendar-hero-art__back-page" />
+      <div className="calendar-hero-art__calendar">
+        <span className="calendar-hero-art__ring calendar-hero-art__ring--one" />
+        <span className="calendar-hero-art__ring calendar-hero-art__ring--two" />
+        <span className="calendar-hero-art__ring calendar-hero-art__ring--three" />
+        <span className="calendar-hero-art__ring calendar-hero-art__ring--four" />
+        <span className="calendar-hero-art__ring calendar-hero-art__ring--five" />
+        <span className="calendar-hero-art__calendar-top" />
+        <span className="calendar-hero-art__calendar-grid" />
+        <span className="calendar-hero-art__today-month">{todayMonthLabel}</span>
+        <span className="calendar-hero-art__today-day">{todayDay}</span>
+      </div>
+    </div>
+  );
+}
+
+const learnerNav = roleNavMap.learner;
+const p = LEARNER_PROFILE;
+
+const DAYS_OF_WEEK = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+const DAYS_SHORT = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
+const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+const MONTH_SHORT_INDEX: Record<string, number> = { Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5, Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11 };
+const BOOKABLE_COACH_SESSION_TYPES = new Set<BookableSessionType>(['catch-up', 'student-support', 'first-session', 'mcr', 'progress-review', 'review', 'gateway', 'other']);
+const PROGRAMME_CYCLE_SESSION_TYPES = new Set<BookableSessionType>(['mcr', 'progress-review', 'review']);
+
+const CALENDAR_PROVIDERS: Array<{ provider: PersonalCalendarProvider; title: string; subtitle: string; icon: string }> = [
+  { provider: 'google', title: 'Continue with Google', subtitle: 'OAuth access to free/busy availability', icon: 'ri-google-fill' },
+  { provider: 'microsoft', title: 'Continue with Microsoft', subtitle: 'Outlook or Microsoft 365 calendar', icon: 'ri-microsoft-fill' },
+  { provider: 'ics', title: 'Connect ICS Calendar', subtitle: 'Private iCal feed URL', icon: 'ri-links-line' },
+];
+
+/** Resolve an event's calendar day — prefers the exact isoDate carried by DB-backed
+ * events, falls back to parsing the "13 Jun" display date (year unknown → null). */
+function parseEventDate(ev: CalendarEvent): { day: number; month: number; year: number | null } | null {
+  if (ev.isoDate) {
+    const [y, m, d] = ev.isoDate.split('-').map(Number);
+    if (y && m && d) return { day: d, month: m - 1, year: y };
+  }
+  const parts = ev.date.split(' ');
+  const day = parseInt(parts[0]);
+  const month = MONTH_SHORT_INDEX[parts[1]];
+  if (!day || month === undefined) return null;
+  return { day, month, year: null };
+}
+
+/** Map a Coach.coach_calendar_event row (backend JSON) to the page's display shape. */
+function mapCoachEvent(ev: LearnerCalendarEvent): CalendarEvent | null {
+  if (ev.status === 'cancelled') return null;
+  const iso = ev.scheduledDate || ev.date || ev.targetDate;
+  if (!iso) return null;
+  const [y, m, d] = iso.split('-').map(Number);
+  if (!y || !m || !d) return null;
+  const dateObj = new Date(y, m - 1, d);
+  const dayName = DAYS_OF_WEEK[dateObj.getDay() === 0 ? 6 : dateObj.getDay() - 1];
+  // Aptem can supply a planned clock time while the review is Not Scheduled.
+  // Without a local reservation, that time must not block another booking.
+  const unbookedImportedPlan = (ev.reviewSource === 'aptem' || Boolean(ev.importedReview))
+    && ev.status === 'not-scheduled' && !ev.calendarEventKey && !ev.calendarEventId;
+  // An imported Scheduled status is history, not proof of an LMS reservation.
+  // Preserve its displayed date/status, but use first booking until linked.
+  const needsInitialReviewBooking = isAptemReview(ev)
+    && ['not-scheduled', 'scheduled'].includes(ev.status)
+    && !ev.calendarEventKey && !ev.calendarEventId;
+  const scheduledTime = unbookedImportedPlan ? null : ev.scheduledTime;
+  // Sorting helpers expect a time string; timeToBeConfirmed keeps this fallback
+  // out of booking conflict checks and the hourly grid.
+  let time = '09:00–10:00';
+  if (scheduledTime) {
+    const [h, min] = scheduledTime.split(':').map(Number);
+    const end = new Date(y, m - 1, d, h || 0, (min || 0) + (ev.durationMinutes || 60));
+    time = `${scheduledTime}–${String(end.getHours()).padStart(2, '0')}:${String(end.getMinutes()).padStart(2, '0')}`;
+  }
+  const isLiveSession = ev.source === 'live-session';
+  const eventSourceType = ev.reviewTypeName || (BOOKABLE_COACH_SESSION_TYPES.has(ev.source as BookableSessionType)
+    ? sessionTypeLabel(ev.source as BookableSessionType)
+    : ev.type === 'review' ? 'Review' : ev.type === 'welfare' ? 'Student Support' : 'Coaching');
+  const confirmed = (
+    ev.status === 'scheduled' || ev.status === 'in-progress' || ev.status === 'completed'
+  ) && (isLiveSession || ev.invited !== false);
+  return {
+    id: ev.id,
+    title: !isLiveSession && ev.sequence ? `${ev.title} #${ev.sequence}` : ev.title,
+    date: `${d} ${MONTH_NAMES[m - 1].substring(0, 3)}`,
+    dayName,
+    time,
+    club: isLiveSession ? (ev.module || 'Live Session') : 'Coaching',
+    clubId: '',
+    type: isLiveSession ? 'Live Session' : eventSourceType,
+    format: isLiveSession ? 'Live Teams session' : '1:1 Teams',
+    location: ev.meetingLink ? 'Microsoft Teams' : scheduledTime ? 'Online' : 'To be confirmed',
+    host: ev.coachName || (isLiveSession ? 'Your tutor' : 'Your coach'),
+    points: 0,
+    status: confirmed ? 'confirmed' : 'pending',
+    description: ev.notes || (isLiveSession
+      ? `${ev.module || ev.title} live session${ev.group ? ` for ${ev.group}` : ''}.`
+      : `${ev.title} session with your coach.`),
+    isoDate: iso,
+    timeZone: ev.timeZone || (isLiveSession ? undefined : BUSINESS_TIME_ZONE),
+    startsAt: ev.startsAt,
+    endsAt: ev.endsAt,
+    isTimeEstimated: ev.isTimeEstimated,
+    meetingLink: ev.meetingLink || undefined,
+    eventKey: ev.calendarEventKey || ev.eventKey || ev.id,
+    source: ev.source,
+    reviewTemplateId: ev.reviewTemplateId,
+    reviewTypeId: ev.reviewTypeId,
+    reviewTypeCode: ev.reviewTypeCode,
+    reviewTypeName: ev.reviewTypeName,
+    reviewTypeIsSystem: ev.reviewTypeIsSystem,
+    importedReview: ev.importedReview,
+    durationMinutes: ev.durationMinutes || 60,
+    bookingStatus: isAptemReview(ev) && ev.calendarEventKey && ev.scheduledDate && ev.scheduledTime
+      && ev.bookingStatus === 'scheduled' && ['not-scheduled', 'scheduled'].includes(ev.status) ? 'scheduled' : ev.status,
+    meetingOutcome: ev.meetingOutcome ?? null,
+    watchedRecording: Boolean(ev.watchedRecording),
+    bookingOnly: ev.bookingOnly,
+    bookingSessionType: !ev.bookingOnly && BOOKABLE_COACH_SESSION_TYPES.has(ev.source as BookableSessionType)
+      ? ev.source as CalendarEvent['bookingSessionType']
+      : undefined,
+    timeToBeConfirmed: !scheduledTime,
+    syncWarning: needsInitialReviewBooking && ev.status === 'scheduled' && !ev.syncWarning && !ev.syncError
+      ? 'This review has an imported appointment date, but no linked calendar booking.'
+      : meetingBookingWarning(ev),
+    bookingReviewId: ev.reviewId,
+    bookingSnapshot: aptemBookingSnapshot(ev),
+    needsInitialReviewBooking,
+    assignmentMonth: ev.assignmentMonth,
+    changeClosed: Boolean(ev.changeClosed),
+  };
+}
+
+function mapBusySlot(slot: CalendarBusySlot): CalendarEvent | null {
+  const start = new Date(slot.start);
+  const end = new Date(slot.end);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || end <= start) return null;
+  const year = start.getFullYear();
+  const month = start.getMonth();
+  const day = start.getDate();
+  const isoDate = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+  const time = `${String(start.getHours()).padStart(2, '0')}:${String(start.getMinutes()).padStart(2, '0')}–${String(end.getHours()).padStart(2, '0')}:${String(end.getMinutes()).padStart(2, '0')}`;
+  return {
+    id: `personal-busy-${slot.provider}-${slot.start}-${slot.end}`,
+    title: 'Busy',
+    date: `${day} ${MONTH_NAMES[month].slice(0, 3)}`,
+    dayName: DAYS_OF_WEEK[start.getDay() === 0 ? 6 : start.getDay() - 1],
+    time,
+    club: 'Personal',
+    clubId: '',
+    type: 'Busy',
+    format: 'Connected personal calendar',
+    location: 'Private event',
+    host: 'Personal calendar',
+    points: 0,
+    status: 'confirmed',
+    description: 'Busy time from your connected personal calendar. Event details stay private.',
+    isoDate,
+    startsAt: slot.start,
+    endsAt: slot.end,
+  };
+}
+
+const HOURS = Array.from({ length: 15 }, (_, i) => i + 7);
+
+const PERSONAL_EVENT_COLORS = [
+  { name: 'Sky', value: 'sky', bg: 'bg-sky-100', text: 'text-sky-700', border: 'border-l-sky-500', dot: 'bg-sky-500' },
+  { name: 'Rose', value: 'rose', bg: 'bg-rose-100', text: 'text-rose-700', border: 'border-l-rose-500', dot: 'bg-rose-500' },
+  { name: 'Amber', value: 'amber', bg: 'bg-amber-100', text: 'text-amber-700', border: 'border-l-amber-500', dot: 'bg-amber-500' },
+  { name: 'Emerald', value: 'emerald', bg: 'bg-emerald-100', text: 'CHANGE_ME', border: 'border-l-emerald-500', dot: 'bg-emerald-500' },
+  { name: 'Violet', value: 'violet', bg: 'bg-violet-100', text: 'text-violet-700', border: 'border-l-violet-500', dot: 'bg-violet-500' },
+  { name: 'Teal', value: 'teal', bg: 'bg-teal-100', text: 'text-teal-700', border: 'border-l-teal-500', dot: 'bg-teal-500' },
+  { name: 'Orange', value: 'orange', bg: 'bg-orange-100', text: 'text-orange-700', border: 'border-l-orange-500', dot: 'bg-orange-500' },
+  { name: 'Indigo', value: 'indigo', bg: 'bg-indigo-100', text: 'text-indigo-700', border: 'border-l-indigo-500', dot: 'bg-indigo-500' },
+];
+
+function getMonthData(year: number, month: number) {
+  const firstDay = new Date(year, month, 1);
+  const lastDay = new Date(year, month + 1, 0);
+  const startOfWeek = firstDay.getDay();
+  const mondayOffset = startOfWeek === 0 ? 6 : startOfWeek - 1;
+  const totalDays = lastDay.getDate();
+  const cells: (number | null)[] = [];
+  for (let i = 0; i < mondayOffset; i++) cells.push(null);
+  for (let d = 1; d <= totalDays; d++) cells.push(d);
+  return cells;
+}
+
+function getWeekDates(year: number, month: number, CHANGE_MEDay: number) {
+  const date = new Date(year, month, CHANGE_MEDay);
+  const dayOfWeek = date.getDay();
+  const mondayOffset = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
+  const monday = new Date(date);
+  monday.setDate(date.getDate() - mondayOffset);
+  const week: { day: number; month: number; monthName: string; year: number }[] = [];
+  for (let i = 0; i < 7; i++) {
+    const d = new Date(monday);
+    d.setDate(monday.getDate() + i);
+    week.push({ day: d.getDate(), month: d.getMonth(), monthName: MONTH_NAMES[d.getMonth()], year: d.getFullYear() });
+  }
+  return week;
+}
+
+function getEventColorClass(type: string, customColor?: string) {
+  if (customColor) {
+    const color = PERSONAL_EVENT_COLORS.find((c) => c.value === customColor);
+    if (color) return `${color.bg} ${color.text} ${color.border}`;
+  }
+  const map: Record<string, string> = {
+    'Live Session': 'bg-violet-50 text-violet-800 border-l-violet-500',
+    'Monthly Coaching Meeting': 'bg-orange-50 text-orange-800 border-l-orange-500',
+    'Progress Review': 'bg-teal-50 text-teal-800 border-l-teal-500',
+    'Catch-up': 'bg-rose-50 text-rose-800 border-l-rose-500',
+    'Student Support': 'bg-blue-50 text-blue-800 border-l-blue-500',
+    Workshop: 'bg-primary-100 text-primary-700 border-l-primary-500',
+    'Hands-on Lab': 'bg-secondary-100 text-secondary-700 border-l-secondary-500',
+    Masterclass: 'bg-accent-100 text-accent-700 border-l-accent-500',
+    'Panel Discussion': 'bg-amber-100 text-amber-700 border-l-amber-500',
+    'Case Study': 'bg-emerald-100 CHANGE_ME border-l-emerald-500',
+    Showcase: 'bg-rose-100 text-rose-700 border-l-rose-500',
+    'Study Group': 'bg-indigo-100 text-indigo-700 border-l-indigo-500',
+    Coaching: 'bg-teal-100 text-teal-700 border-l-teal-500',
+    Assessment: 'bg-red-100 text-red-700 border-l-red-500',
+    'Networking Event': 'bg-violet-100 text-violet-700 border-l-violet-500',
+    Personal: 'bg-sky-100 text-sky-700 border-l-sky-500',
+    Busy: 'bg-slate-200 text-slate-700 border-l-slate-500',
+  };
+  return map[type] || 'bg-background-100 text-foreground-600 border-l-foreground-300';
+}
+
+function getEventDotColor(type: string, customColor?: string) {
+  if (customColor) {
+    const color = PERSONAL_EVENT_COLORS.find((c) => c.value === customColor);
+    if (color) return color.dot;
+  }
+  const map: Record<string, string> = {
+    'Live Session': 'bg-violet-500', 'Monthly Coaching Meeting': 'bg-orange-500', 'Progress Review': 'bg-teal-500',
+    'Catch-up': 'bg-rose-500', 'Student Support': 'bg-blue-500',
+    Workshop: 'bg-primary-500', 'Hands-on Lab': 'bg-secondary-500', Masterclass: 'bg-accent-500',
+    'Panel Discussion': 'bg-amber-500', 'Case Study': 'bg-emerald-500', Showcase: 'bg-rose-500',
+    'Study Group': 'bg-indigo-500', Coaching: 'bg-teal-500', Assessment: 'bg-red-500',
+    'Networking Event': 'bg-violet-500', Personal: 'bg-sky-500', Busy: 'bg-slate-500',
+  };
+  return map[type] || 'bg-foreground-400';
+}
+
+function getEventTimeRange(time: string): { start: number; end: number } {
+  const parts = time.split('\u2013').map((s) => s.trim());
+  const startStr = parts[0] || '00:00';
+  const endStr = parts[1] || parts[0] || '00:00';
+  const [startH, startM] = startStr.split(':').map(Number);
+  const [endH, endM] = endStr.split(':').map(Number);
+  return { start: (startH || 0) * 60 + (startM || 0), end: (endH || 0) * 60 + (endM || 0) };
+}
+
+function showNotification(title: string, body: string) {
+  if (!('Notification' in window)) return;
+  if (Notification.permission === 'granted') {
+    new Notification(title, { body, icon: '/favicon.ico', badge: '/favicon.ico' });
+  }
+}
+
+function scheduleEventNotification(eventId: string, eventTitle: string, eventDate: string, eventTime: string, reminderMinutes: number) {
+  const monthMap: Record<string, number> = { Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5, Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11 };
+  const parts = eventDate.split(' ');
+  const day = parseInt(parts[0]);
+  const month = monthMap[parts[1]] ?? 5;
+  const year = new Date().getFullYear();
+  const [hour, minute] = eventTime.split(':').map(Number);
+  const eventDateTime = new Date(year, month, day, hour, minute);
+  const reminderTime = new Date(eventDateTime.getTime() - reminderMinutes * 60000);
+  const now = new Date();
+  const delay = reminderTime.getTime() - now.getTime();
+  if (delay > 0 && delay < 86400000 * 365) {
+    const timerId = setTimeout(() => {
+      showNotification('Event Reminder', `"${eventTitle}" starts in ${reminderMinutes} minutes!`);
+      const scheduled = JSON.parse(localStorage.getItem('calendarNotifications') || '[]');
+      const updated = scheduled.filter((n: { id: string }) => n.id !== eventId);
+      localStorage.setItem('calendarNotifications', JSON.stringify(updated));
+    }, delay);
+    const scheduled = JSON.parse(localStorage.getItem('calendarNotifications') || '[]');
+    const existing = scheduled.find((n: { id: string }) => n.id === eventId);
+    if (existing) { if (existing.timerId) clearTimeout(existing.timerId); existing.timerId = timerId; existing.reminderMinutes = reminderMinutes; }
+    else { scheduled.push({ id: eventId, timerId, eventTitle, eventDate, eventTime, reminderMinutes }); }
+    localStorage.setItem('calendarNotifications', JSON.stringify(scheduled.map((n: { id: string; timerId: number; eventTitle: string; eventDate: string; eventTime: string; reminderMinutes: number }) => ({ id: n.id, eventTitle: n.eventTitle, eventDate: n.eventDate, eventTime: n.eventTime, reminderMinutes: n.reminderMinutes }))));
+    return timerId;
+  }
+  return null;
+}
+
+function restoreNotifications() {
+  const scheduled = JSON.parse(localStorage.getItem('calendarNotifications') || '[]');
+  // Personal events are retired; their saved reminders must not be restored.
+  const active = scheduled.filter((n: { id: string }) => !n.id.startsWith('custom-'));
+  if (active.length !== scheduled.length) {
+    localStorage.setItem('calendarNotifications', JSON.stringify(active));
+  }
+  active.forEach((n: { id: string; eventTitle: string; eventDate: string; eventTime: string; reminderMinutes: number }) => {
+    scheduleEventNotification(n.id, n.eventTitle, n.eventDate, n.eventTime, n.reminderMinutes);
+  });
+}
+
+type ViewMode = 'monthly' | 'weekly' | 'daily';
+type LearnerStatusFilter = 'all' | 'needs-schedule' | 'scheduled' | 'pending' | 'in-progress' | 'awaiting-signature' | 'ended' | 'completed';
+
+const LEARNER_STATUS_FILTERS: LearnerStatusFilter[] = ['all', 'needs-schedule', 'scheduled', 'pending', 'in-progress', 'awaiting-signature', 'ended', 'completed'];
+
+const LEARNER_STATUS_META: Record<LearnerStatusFilter, { label: string; dot: string; badge: string }> = {
+  all: { label: 'All', dot: 'bg-foreground-400', badge: 'bg-background-200 text-foreground-700 ring-background-300' },
+  'needs-schedule': { label: 'Not Scheduled', dot: 'bg-rose-500', badge: 'bg-rose-100 text-rose-800 ring-rose-200' },
+  scheduled: { label: 'Scheduled', dot: 'bg-primary-500', badge: 'bg-primary-100 text-primary-800 ring-primary-200' },
+  pending: { label: 'Pending', dot: 'bg-amber-500', badge: 'bg-amber-100 text-amber-800 ring-amber-200' },
+  'in-progress': { label: 'In Progress', dot: 'bg-secondary-500', badge: 'bg-secondary-100 text-secondary-800 ring-secondary-200' },
+  'awaiting-signature': { label: 'Awaiting Signature', dot: 'bg-orange-500', badge: 'bg-orange-100 text-orange-800 ring-orange-200' },
+  ended: { label: 'Ended', dot: 'bg-rose-500', badge: 'bg-rose-100 text-rose-800 ring-rose-200' },
+  completed: { label: 'Completed', dot: 'bg-emerald-500', badge: 'bg-emerald-100 text-emerald-800 ring-emerald-200' },
+};
+
+const LEARNER_STATUS_COLOR_KEYS: Record<LearnerStatusFilter, CalendarStatusKey> = {
+  all: 'all',
+  'needs-schedule': 'not-scheduled',
+  scheduled: 'scheduled',
+  pending: 'pending-due-soon',
+  'in-progress': 'in-progress',
+  'awaiting-signature': 'awaiting-signature',
+  ended: 'missed-overdue',
+  completed: 'completed',
+};
+
+function todayISO(): string {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+/** Monday date for the calendar week containing an ISO day. */
+function calendarWeekKey(isoDate: string): string | null {
+  const [year, month, day] = isoDate.split('-').map(Number);
+  if (!year || !month || !day) return null;
+  const value = new Date(year, month - 1, day);
+  if (
+    value.getFullYear() !== year
+    || value.getMonth() !== month - 1
+    || value.getDate() !== day
+  ) return null;
+  const mondayOffset = value.getDay() === 0 ? -6 : 1 - value.getDay();
+  value.setDate(value.getDate() + mondayOffset);
+  return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}-${String(value.getDate()).padStart(2, '0')}`;
+}
+
+function isProgrammeCycleSessionType(value?: BookableSessionType): boolean {
+  return value ? PROGRAMME_CYCLE_SESSION_TYPES.has(value) : false;
+}
+
+function sessionTypeLabel(value?: CalendarEvent['bookingSessionType'] | BookableSessionType): string {
+  switch (value) {
+    case 'mcr':
+      return 'Monthly Coaching Meeting';
+    case 'progress-review':
+      return 'Progress Review';
+    case 'student-support':
+      return 'Student Support';
+    case 'catch-up':
+      return 'Catch-up';
+    case 'first-session':
+      return 'First Session';
+    case 'other':
+      return 'Other';
+    case 'gateway':
+      return 'Gateway';
+    default:
+      return 'Coach Session';
+  }
+}
+
+function learnerEventStatus(event: CalendarEvent): LearnerStatusFilter {
+  // An elapsed meeting shows Ended, or Completed once Teams shows the learner attended.
+  if (event.meetingOutcome === 'completed') return 'completed';
+  if (event.meetingOutcome === 'ended') return 'ended';
+  if (event.bookingStatus === 'awaiting-signature') return 'awaiting-signature';
+  if (event.bookingStatus === 'completed') return 'completed';
+  if (event.bookingStatus === 'in-progress') return 'in-progress';
+  if (event.timeToBeConfirmed || event.bookingStatus === 'not-scheduled') return 'needs-schedule';
+  if (event.status === 'pending') return 'pending';
+  if (event.bookingStatus === 'scheduled') return 'scheduled';
+  return 'scheduled';
+}
+
+function learnerMeetingTypeColor(event: CalendarEvent, colors: CalendarColorPreferences) {
+  if (!event.source || event.type === 'Busy' || event.type === 'Personal') return null;
+  return colors.meetingTypes[getMeetingTypeKey(event)];
+}
+
+function learnerEventStatusColor(event: CalendarEvent, colors: CalendarColorPreferences) {
+  return colors.statuses[LEARNER_STATUS_COLOR_KEYS[learnerEventStatus(event)]];
+}
+
+function shouldShowMeetingArtifacts(event: CalendarEvent): boolean {
+  if (event.bookingOnly) return false;
+  return Boolean(
+    event.eventKey
+    && event.meetingLink
+    && ['mcr', 'catch-up', 'progress-review', 'student-support'].includes(event.source || '')
+    && ['completed', 'awaiting-signature'].includes(event.bookingStatus || '')
+  );
+}
+
+export default function LearnerCalendarPage() {
+  return (
+    <WorkspaceShell
+      role="learner" roleLabel={learnerNav.label} navItems={learnerNav.items} workspaceLabel={learnerNav.workspaceLabel}
+      pageTitle="Calendar" pageSubtitle="Your schedule, coaching sessions, club events — all in one professional view"
+      userName={p.fullName} userRole={`${p.programme} Apprentice`}
+    >
+      <LearnerCalendarContent />
+    </WorkspaceShell>
+  );
+}
+
+/** Calendar body without the page shell — reusable as an embedded section (e.g. on the learner overview page). */
+export function LearnerCalendarContent() {
+  const learner = useLinkedLearner();
+  // A staff View link can switch learners without unmounting the route.
+  // Bookings, coach details and open dialogs must belong to the new identity.
+  return <LearnerCalendarBody key={`${learner.kind}:${learner.id}`} />;
+}
+
+function LearnerCalendarBody() {
+  const location = useLocation();
+  const myLearner = useLinkedLearner();
+  const calendarColorOwner = `learner:${myLearner.kind}:${myLearner.id}`;
+  const loadArtifacts = useCallback((eventKey: string, signal?: AbortSignal) => fetchLearnerMeetingArtifacts(myLearner.kind, myLearner.id, eventKey, signal), [myLearner.id, myLearner.kind]);
+  const artifactContentUrl = useCallback((eventKey: string, artifactType: string, artifactId: string, options: { preview?: boolean } = {}) => learnerMeetingArtifactContentUrl(myLearner.kind, myLearner.id, eventKey, artifactType, artifactId, options), [myLearner.id, myLearner.kind]);
+  const [viewMode, setViewMode] = useState<ViewMode>('monthly');
+  const [viewYear, setViewYear] = useState(() => new Date().getFullYear());
+  const [viewMonth, setViewMonth] = useState(() => new Date().getMonth());
+  const [CHANGE_MEDay, setSelectedDay] = useState(() => new Date().getDate());
+  useEffect(() => {
+    const date = new URLSearchParams(location.search).get('date');
+    if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) return;
+    const [year, month, day] = date.split('-').map(Number);
+    const parsed = new Date(year, month - 1, day, 12);
+    if (parsed.getFullYear() !== year || parsed.getMonth() !== month - 1 || parsed.getDate() !== day) return;
+    setViewYear(year);
+    setViewMonth(month - 1);
+    setSelectedDay(day);
+  }, [location.search]);
+  const [searchTerm, setSearchTerm] = useState('');
+  const [filterSource, setFilterSource] = useState<LearnerSourceFilter>('all');
+  const [filterStatus, setFilterStatus] = useState<LearnerStatusFilter>('all');
+  const [calendarColors, setCalendarColors] = useState<CalendarColorPreferences>(() => loadCalendarColors(calendarColorOwner));
+  const [colorPreferencesOpen, setColorPreferencesOpen] = useState(false);
+  const [myEvents, setMyEvents] = useState<CalendarEvent[]>([]);
+  const [calendarLoading, setCalendarLoading] = useState(true);
+  const [calendarError, setCalendarError] = useState<string | null>(null);
+  const [calendarRevision, setCalendarRevision] = useState(0);
+  const importedBooking = useImportedMeetingBooking(myLearner, location.search);
+  const [schedulingError, setSchedulingError] = useState('');
+  const calendarWriteVersionRef = useRef(0);
+  const refreshCalendar = useCallback(() => setCalendarRevision(value => value + 1), []);
+  useLiveRefresh(refreshCalendar);
+  const [addToCalendarToast, setAddToCalendarToast] = useState<string | null>(null);
+  const [cancelBusy, setCancelBusy] = useState(false);
+  const [cancelError, setCancelError] = useState('');
+  const [showEventDetails, setShowEventDetails] = useState<CalendarEvent | null>(null);
+  const CHANGE_MEReview = useLearnerReviewInstance(myLearner.kind, myLearner.id,
+    !showEventDetails?.bookingOnly && showEventDetails?.reviewTemplateId && showEventDetails.source !== 'live-session'
+      ? showEventDetails.eventKey || showEventDetails.id
+      : '');
+  const [showDayDrawer, setShowDayDrawer] = useState(false);
+  const [showShareCalendar, setShowShareCalendar] = useState(false);
+  const [publicFeedUrl, setPublicFeedUrl] = useState<string | null>(null);
+  const [feedCopied, setFeedCopied] = useState(false);
+  const [showBookModal, setShowBookModal] = useState(false);
+  const [rescheduleEvent, setRescheduleEvent] = useState<CalendarEvent | null>(null);
+  const [bookingSourceEvent, setBookingSourceEvent] = useState<CalendarEvent | null>(null);
+  const [bookType, setBookType] = useState<BookableSessionType>('catch-up');
+  const [bookDate, setBookDate] = useState(() => todayISO());
+  const [bookTime, setBookTime] = useState('10:00');
+  const [bookDuration, setBookDuration] = useState('60');
+  const [bookNotes, setBookNotes] = useState('');
+  const [otherSessionType, setOtherSessionType] = useState('');
+  const [bookSubmitting, setBookSubmitting] = useState(false);
+  const [bookError, setBookError] = useState<string | null>(null);
+  const [bookingCalendar, setBookingCalendar] = useState<BookingCalendarRules | null>(null);
+  const [coach, setCoach] = useState<{ name: string; email: string } | null>(null);
+  const [showCalendarConnect, setShowCalendarConnect] = useState(false);
+  const [calendarConnections, setCalendarConnections] = useState<PersonalCalendarConnection[]>([]);
+  const [connectionProvider, setConnectionProvider] = useState<'icloud' | 'caldav' | 'ics' | null>(null);
+  const [connectionUrl, setConnectionUrl] = useState('');
+  const [connectionUsername, setConnectionUsername] = useState('');
+  const [connectionPassword, setConnectionPassword] = useState('');
+  const [connectionError, setConnectionError] = useState<string | null>(null);
+  const [connectionSubmitting, setConnectionSubmitting] = useState(false);
+  const [busySlots, setBusySlots] = useState<CalendarBusySlot[]>([]);
+  const [visibleBusySlots, setVisibleBusySlots] = useState<CalendarBusySlot[]>([]);
+  const [availabilityLoading, setAvailabilityLoading] = useState(false);
+  const [availabilityUnconfirmed, setAvailabilityUnconfirmed] = useState(false);
+  const [reviewCoachSlots, setReviewCoachSlots] = useState<string[]>([]);
+  const [reviewCoachAvailabilityLoading, setReviewCoachAvailabilityLoading] = useState(false);
+  const [reviewCoachAvailabilityError, setReviewCoachAvailabilityError] = useState('');
+  const [reviewCoachAvailabilityRevision, setReviewCoachAvailabilityRevision] = useState(0);
+  const aptemBooking = Boolean(rescheduleEvent?.bookingReviewId || rescheduleEvent?.importedReview
+    || bookingSourceEvent?.bookingReviewId || bookingSourceEvent?.importedReview);
+  const choosingProgrammeSession = !rescheduleEvent && !bookingSourceEvent && isProgrammeCycleSessionType(bookType);
+  const reviewSlotBooking = !choosingProgrammeSession && ['mcr', 'progress-review', 'review'].includes(bookType);
+  const coachSlotBooking = !choosingProgrammeSession && (reviewSlotBooking || ['catch-up', 'student-support', 'gateway', 'other'].includes(bookType));
+  const handledFocusEventRef = useRef<string | null>(null);
+
+  const today = new Date();
+  const todayDay = today.getDate();
+  const todayMonth = today.getMonth();
+  const todayYear = today.getFullYear();
+  const isToday = useCallback((day: number, month: number, year: number) => {
+    return day === todayDay && month === todayMonth && year === todayYear;
+  }, [todayDay, todayMonth, todayYear]);
+
+  const reloadCalendarConnections = useCallback(() => {
+    return fetchCalendarConnections(myLearner.kind, myLearner.id)
+      .then((result) => setCalendarConnections(result.connections));
+  }, [myLearner.kind, myLearner.id]);
+
+  const personalBusyEvents = useMemo(() => {
+    const unique = new Map<string, CalendarBusySlot>();
+    visibleBusySlots.forEach((slot) => unique.set(`${slot.start}-${slot.end}`, slot));
+    return Array.from(unique.values()).map(mapBusySlot).filter((event): event is CalendarEvent => event !== null);
+  }, [visibleBusySlots]);
+  const displayedEvents = useMemo(() => [...myEvents, ...personalBusyEvents], [myEvents, personalBusyEvents]);
+  const activeMeetingTypeKeys = useMemo<MeetingTypeKey[]>(() => (
+    Array.from(new Set(displayedEvents.filter(event => event.source).map(event => getMeetingTypeKey(event))))
+  ), [displayedEvents]);
+  useEffect(() => {
+    setCalendarColors(loadCalendarColors(calendarColorOwner));
+  }, [calendarColorOwner]);
+  const handleCalendarColorsSave = useCallback((nextColors: CalendarColorPreferences) => {
+    setCalendarColors(nextColors);
+    saveCalendarColors(calendarColorOwner, nextColors);
+    setColorPreferencesOpen(false);
+  }, [calendarColorOwner]);
+  const handleCloseColorPreferences = useCallback(() => setColorPreferencesOpen(false), []);
+  const focusedEventKey = useMemo(() => new URLSearchParams(location.search).get('event') || '', [location.search]);
+
+  useEffect(() => {
+    const params = new URLSearchParams(location.search);
+    if (params.get('book') === 'student-support') {
+      setRescheduleEvent(null);
+      setBookingSourceEvent(null);
+      setBookType('student-support');
+      setBookNotes((params.get('notes') || '').slice(0, 500));
+      setBookError(null);
+      setShowBookModal(true);
+    }
+  }, [location.search]);
+  useEffect(() => {
+    if (!focusedEventKey || handledFocusEventRef.current === focusedEventKey) return;
+    const focusEvent = displayedEvents.find((event) => event.eventKey === focusedEventKey || event.id === focusedEventKey);
+    const focusDate = focusEvent ? parseEventDate(focusEvent) : null;
+    if (!focusEvent || !focusDate) return;
+    handledFocusEventRef.current = focusedEventKey;
+    setViewMode('monthly');
+    setViewYear(focusDate.year ?? viewYear);
+    setViewMonth(focusDate.month);
+    setSelectedDay(focusDate.day);
+    const params = new URLSearchParams(location.search);
+    if (!['schedule', 'reschedule'].includes(params.get('action') || '') && !params.get('reviewId')) setShowEventDetails(focusEvent);
+  }, [displayedEvents, focusedEventKey, viewYear, location.search]);
+  const reviewTypeLookup = useMemo(() => buildReviewTypeLookup(displayedEvents), [displayedEvents]);
+  const visibleRangeEvents = useMemo(() => (
+    displayedEvents.filter((event) => {
+      const eventDate = parseEventDate(event);
+      if (!eventDate) return false;
+      const eventYear = eventDate.year ?? viewYear;
+      if (viewMode === 'daily') {
+        return eventDate.day === CHANGE_MEDay && eventDate.month === viewMonth && eventYear === viewYear;
+      }
+      if (viewMode === 'weekly') {
+        const CHANGE_ME = new Date(viewYear, viewMonth, CHANGE_MEDay, 12, 0, 0);
+        const CHANGE_MEDayOfWeek = CHANGE_ME.getDay();
+        const mondayOffset = CHANGE_MEDayOfWeek === 0 ? -6 : 1 - CHANGE_MEDayOfWeek;
+        const weekStart = new Date(CHANGE_ME);
+        weekStart.setDate(CHANGE_ME.getDate() + mondayOffset);
+        const weekEnd = new Date(weekStart);
+        weekEnd.setDate(weekStart.getDate() + 7);
+        const eventValue = new Date(eventYear, eventDate.month, eventDate.day, 12, 0, 0);
+        return eventValue >= weekStart && eventValue < weekEnd;
+      }
+      return eventDate.month === viewMonth && eventYear === viewYear;
+    })
+  ), [displayedEvents, CHANGE_MEDay, viewMode, viewMonth, viewYear]);
+  const searchedVisibleRangeEvents = useMemo(() => {
+    const term = searchTerm.trim().toLowerCase();
+    if (!term) return visibleRangeEvents;
+    return visibleRangeEvents.filter((event) => [
+      event.title,
+      learnerSourceMeta(event, reviewTypeLookup).label,
+      event.description,
+      event.club,
+      event.host,
+      event.location,
+      event.format,
+      sessionTypeLabel(event.bookingSessionType),
+    ].some((value) => value.toLowerCase().includes(term)));
+  }, [searchTerm, visibleRangeEvents, reviewTypeLookup]);
+  const sourceFilters = useMemo(() => buildSourceFilters(displayedEvents), [displayedEvents]);
+  const sourceFilterCounts = useMemo(() => countBySource(searchedVisibleRangeEvents, sourceFilters, reviewTypeLookup), [searchedVisibleRangeEvents, sourceFilters, reviewTypeLookup]);
+  const sourceFilteredVisibleRangeEvents = useMemo(() => filterBySource(searchedVisibleRangeEvents, filterSource, reviewTypeLookup), [filterSource, searchedVisibleRangeEvents, reviewTypeLookup]);
+  useEffect(() => {
+    if (!sourceFilters.some(option => option.key === filterSource)) setFilterSource('all');
+  }, [sourceFilters, filterSource]);
+  const statusFilterCounts = useMemo(() => {
+    const counts = Object.fromEntries(LEARNER_STATUS_FILTERS.map((status) => [status, 0])) as Record<LearnerStatusFilter, number>;
+    sourceFilteredVisibleRangeEvents.forEach((event) => {
+      counts.all += 1;
+      counts[learnerEventStatus(event)] += 1;
+    });
+    return counts;
+  }, [sourceFilteredVisibleRangeEvents]);
+  const filteredEvents = useMemo(() => (
+    sourceFilteredVisibleRangeEvents.filter((event) => (
+      filterStatus === 'all' || learnerEventStatus(event) === filterStatus
+    ))
+  ), [filterStatus, sourceFilteredVisibleRangeEvents]);
+  const untimedEvents = filteredEvents.filter(event => event.timeToBeConfirmed);
+  const timelineHours = useMemo(() => {
+    const scheduledHours = filteredEvents.filter(event => !event.timeToBeConfirmed)
+      .map(event => Number.parseInt(event.time.split(':')[0], 10))
+      .filter(hour => Number.isInteger(hour) && hour >= 0 && hour <= 23);
+    const first = Math.min(HOURS[0], ...scheduledHours);
+    const last = Math.max(HOURS[HOURS.length - 1], ...scheduledHours);
+    return Array.from({ length: last - first + 1 }, (_, index) => first + index);
+  }, [filteredEvents]);
+  const upcomingEvents = useMemo(() => {
+    const todayDate = new Date(todayYear, todayMonth, todayDay);
+    const sevenDaysFromToday = new Date(todayYear, todayMonth, todayDay + 7);
+    const term = searchTerm.trim().toLowerCase();
+    return displayedEvents
+      .filter((event) => {
+        const eventDate = parseEventDate(event);
+        if (!eventDate) return false;
+        const eventDay = new Date(eventDate.year ?? viewYear, eventDate.month, eventDate.day);
+        if (eventDay < todayDate || eventDay > sevenDaysFromToday) return false;
+        if (filterSource !== 'all' && learnerEventSource(event, reviewTypeLookup) !== filterSource) return false;
+        if (filterStatus !== 'all' && learnerEventStatus(event) !== filterStatus) return false;
+        if (!term) return true;
+        return [
+          event.title,
+          event.description,
+          event.club,
+          event.host,
+          event.location,
+          event.format,
+          sessionTypeLabel(event.bookingSessionType),
+        ].some((value) => value.toLowerCase().includes(term));
+      })
+      .sort((a, b) => {
+        const dateA = parseEventDate(a);
+        const dateB = parseEventDate(b);
+        const timeA = dateA ? new Date(dateA.year ?? viewYear, dateA.month, dateA.day).getTime() + getEventTimeRange(a.time).start * 60_000 : 0;
+        const timeB = dateB ? new Date(dateB.year ?? viewYear, dateB.month, dateB.day).getTime() + getEventTimeRange(b.time).start * 60_000 : 0;
+        return timeA - timeB;
+      });
+  }, [displayedEvents, filterSource, filterStatus, searchTerm, todayDay, todayMonth, todayYear, viewYear, reviewTypeLookup]);
+
+  const getEventsForDay = useCallback((day: number, month: number, year = viewYear): CalendarEvent[] => {
+    return filteredEvents.filter((ev) => {
+      const evDate = parseEventDate(ev);
+      if (!evDate) return false;
+      return evDate.day === day && evDate.month === month && (evDate.year === null || evDate.year === year);
+    });
+  }, [filteredEvents, viewYear]);
+
+  const monthCells = useMemo(() => getMonthData(viewYear, viewMonth), [viewYear, viewMonth]);
+  const weekDates = useMemo(() => getWeekDates(viewYear, viewMonth, CHANGE_MEDay), [viewYear, viewMonth, CHANGE_MEDay]);
+  const CHANGE_MEDayEvents = useMemo(() => getEventsForDay(CHANGE_MEDay, viewMonth), [CHANGE_MEDay, viewMonth, getEventsForDay]);
+  const CHANGE_MEDaySorted = useMemo(
+    () => [...CHANGE_MEDayEvents].sort((a, b) => getEventTimeRange(a.time).start - getEventTimeRange(b.time).start),
+    [CHANGE_MEDayEvents],
+  );
+  const CHANGE_MEDayLabel = useMemo(() => {
+    const dayDate = new Date(viewYear, viewMonth, CHANGE_MEDay);
+    const dayName = DAYS_OF_WEEK[dayDate.getDay() === 0 ? 6 : dayDate.getDay() - 1];
+    return `${dayName}, ${CHANGE_MEDay} ${MONTH_NAMES[viewMonth]}`;
+  }, [CHANGE_MEDay, viewMonth, viewYear]);
+  useEffect(() => {
+    setShowEventDetails(current => current ? displayedEvents.find(event => event.id === current.id) || null : null);
+  }, [displayedEvents]);
+  const CHANGE_MEIso = useMemo(
+    () => `${viewYear}-${String(viewMonth + 1).padStart(2, '0')}-${String(CHANGE_MEDay).padStart(2, '0')}`,
+    [viewYear, viewMonth, CHANGE_MEDay],
+  );
+  const bankHolidayByDate = useMemo(
+    () => new Map((bookingCalendar?.bankHolidays || []).map((holiday) => [holiday.date, holiday.title])),
+    [bookingCalendar],
+  );
+  const bookingToday = bookingCalendar?.today || todayISO();
+  const bookingDateRestriction = useCallback((isoDate: string): string | null => {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(isoDate)) return 'Choose a valid booking date.';
+    const [year, month, day] = isoDate.split('-').map(Number);
+    const localDate = new Date(year, month - 1, day, 12, 0, 0);
+    if (
+      Number.isNaN(localDate.getTime())
+      || localDate.getFullYear() !== year
+      || localDate.getMonth() !== month - 1
+      || localDate.getDate() !== day
+    ) return 'Choose a valid booking date.';
+    if (isoDate < bookingToday) {
+      return 'Sessions cannot be booked on a date that has already passed.';
+    }
+    if (localDate.getDay() === 0 || localDate.getDay() === 6) {
+      return 'Sessions cannot be booked on Saturdays or Sundays.';
+    }
+    const bankHoliday = bankHolidayByDate.get(isoDate);
+    if (bankHoliday) return `Sessions cannot be booked on UK bank holidays (${bankHoliday}).`;
+    if (bookingCalendar && !bookingCalendar.coveredYears.includes(year)) {
+      return 'Sessions cannot be booked because the UK bank-holiday calendar is not available for this year.';
+    }
+    return null;
+  }, [bankHolidayByDate, bookingCalendar, bookingToday]);
+  const CHANGE_MEDateRestriction = bookingDateRestriction(CHANGE_MEIso);
+  const bookDateRestriction = bookingDateRestriction(bookDate);
+  const programmeSessions = useMemo(() => myEvents.filter(event => event.source === bookType).sort((a, b) => {
+    const aUpcoming = Boolean(a.isoDate && a.isoDate >= bookingToday);
+    const bUpcoming = Boolean(b.isoDate && b.isoDate >= bookingToday);
+    return Number(bUpcoming) - Number(aUpcoming) || (aUpcoming
+      ? (a.isoDate || '').localeCompare(b.isoDate || '')
+      : (b.isoDate || '').localeCompare(a.isoDate || ''));
+  }), [myEvents, bookType, bookingToday]);
+  const openBookSession = useCallback((date?: string, sourceEvent?: CalendarEvent | null) => {
+    setRescheduleEvent(null);
+    setBookingSourceEvent(sourceEvent || null);
+    setBookType(sourceEvent?.bookingSessionType || 'catch-up');
+    setBookDate(firstAvailableBookingDate(date || bookingToday, bookingCalendar));
+    setBookTime('09:00');
+    setBookDuration(['mcr', 'progress-review', 'review'].includes(sourceEvent?.bookingSessionType || '') ? '60' : String(sourceEvent?.durationMinutes || 60));
+    setBookNotes('');
+    setOtherSessionType('');
+    setBookError(null);
+    setShowDayDrawer(false);
+    setShowEventDetails(null);
+    setShowBookModal(true);
+  }, [bookingToday, bookingCalendar]);
+  const openRescheduleSession = useCallback((event: CalendarEvent) => {
+    if (event.needsInitialReviewBooking) {
+      openBookSession(event.isoDate, event);
+      return;
+    }
+    if (!event.bookingSessionType || !event.isoDate || event.timeToBeConfirmed) return;
+    const range = getEventTimeRange(event.time);
+    const calculatedDuration = range.end <= range.start
+      ? range.end + 1440 - range.start
+      : range.end - range.start;
+    setRescheduleEvent(event);
+    setBookingSourceEvent(null);
+    setBookType(event.bookingSessionType);
+    setBookDate(event.isoDate);
+    setBookTime(event.time.split('\u2013')[0].trim());
+    setBookDuration(String(event.durationMinutes || calculatedDuration || 60));
+    setBookNotes(event.bookingSnapshot?.notes || '');
+    setOtherSessionType('');
+    setBookError(null);
+    setShowDayDrawer(false);
+    setShowEventDetails(null);
+    setShowBookModal(true);
+  }, [openBookSession]);
+  const handledScheduleRef = useRef('');
+  useEffect(() => {
+    const params = new URLSearchParams(location.search);
+    const action = params.get('action');
+    const reviewId = params.get('reviewId');
+    if (!['schedule', 'reschedule'].includes(action || '') && !reviewId) {
+      handledScheduleRef.current = '';
+      setSchedulingError('');
+      return;
+    }
+    const requestKey = location.search;
+    if (handledScheduleRef.current === requestKey || calendarLoading || calendarError) return;
+    let event: CalendarEvent | undefined;
+    if (reviewId) {
+      if (!importedBooking.target) return;
+      const { review, eventKey } = importedBooking.target;
+      if (eventKey) {
+        event = myEvents.find(item => item.eventKey === eventKey);
+        if (!event) {
+          setSchedulingError('The saved appointment could not be loaded. Refresh the calendar and try again.');
+          return;
+        }
+      } else if (['completed', 'cancelled', 'awaiting-signature', 'in-progress'].includes(review.status)) {
+        setSchedulingError('This review is no longer available for scheduling.');
+        return;
+      } else {
+        event = myEvents.find(item => item.bookingReviewId === review.id || item.importedReview?.id === review.id);
+      }
+      if (event) event = { ...event, title: review.name || event.title, bookingReviewId: review.id, assignmentMonth: review.plannedDate?.slice(0, 7) };
+    } else {
+      const eventKey = params.get('event');
+      // Older source/date links are accepted only when they identify one slot.
+      const matches = myEvents.filter(item => eventKey ? item.eventKey === eventKey || item.id === eventKey
+        : item.source === params.get('source') && item.isoDate === params.get('date') && item.timeToBeConfirmed);
+      if (matches.length === 1) event = matches[0];
+    }
+    if (!event || !event.bookingSessionType) {
+      setSchedulingError('This meeting is no longer available. Return to your meetings and refresh the list.');
+      return;
+    }
+    handledScheduleRef.current = requestKey;
+    setSchedulingError('');
+    if (event.needsInitialReviewBooking) {
+      openBookSession(event.isoDate, event);
+    } else if (action === 'reschedule' && event.bookingStatus === 'scheduled' && !event.timeToBeConfirmed) {
+      openRescheduleSession(event);
+    } else if (['schedule', 'reschedule'].includes(action || '') && event.bookingStatus === 'not-scheduled') {
+      openBookSession(event.isoDate, event);
+    } else {
+      setShowEventDetails(event);
+    }
+  }, [location.search, myEvents, calendarLoading, calendarError, importedBooking.target, openBookSession, openRescheduleSession]);
+  useEffect(() => {
+    if ('Notification' in window) restoreNotifications();
+  }, []);
+
+  useEffect(() => { if (viewMode !== 'monthly') setShowDayDrawer(false); }, [viewMode]);
+
+  useEffect(() => {
+    reloadCalendarConnections().catch(() => setCalendarConnections([]));
+    const params = new URLSearchParams(window.location.search);
+    const connected = params.get('calendar_connected');
+    const oauthError = params.get('calendar_error');
+    if (params.get('connect') === 'calendar') {
+      setShowCalendarConnect(true);
+    } else if (connected) {
+      setAddToCalendarToast(`${connected === 'google' ? 'Google' : 'Microsoft'} Calendar connected successfully.`);
+      setShowCalendarConnect(true);
+      window.history.replaceState({}, '', window.location.pathname);
+    } else if (oauthError) {
+      setConnectionError(oauthError);
+      setShowCalendarConnect(true);
+      window.history.replaceState({}, '', window.location.pathname);
+    }
+  }, [reloadCalendarConnections]);
+
+  useEffect(() => {
+    if (calendarConnections.length === 0) {
+      setVisibleBusySlots([]);
+      return;
+    }
+    const start = new Date(viewYear, viewMonth, 1).toISOString();
+    const end = new Date(viewYear, viewMonth + 1, 1).toISOString();
+    let cancelled = false;
+    fetchPersonalCalendarAvailability(myLearner.kind, myLearner.id, start, end)
+      .then((result) => { if (!cancelled) setVisibleBusySlots(result.busy); })
+      .catch(() => { if (!cancelled) setVisibleBusySlots([]); });
+    return () => { cancelled = true; };
+  }, [calendarConnections.length, viewYear, viewMonth, myLearner.kind, myLearner.id]);
+
+  useEffect(() => {
+    // An unparseable day has no instant (toISOString would throw and take the
+    // page down); bookDateRestriction already asks for a valid date.
+    const day = parseBookingDay(bookDate);
+    if (!showBookModal || choosingProgrammeSession || calendarConnections.length === 0 || !day) {
+      setBusySlots([]);
+      setAvailabilityLoading(false);
+      setAvailabilityUnconfirmed(false);
+      return;
+    }
+    const nextDay = new Date(Date.parse(`${bookDate}T00:00:00Z`) + 86_400_000).toISOString().slice(0, 10);
+    const start = new Date(bookingInstant(bookDate, '00:00')).toISOString();
+    const end = new Date(bookingInstant(nextDay, '00:00')).toISOString();
+    let cancelled = false;
+    setAvailabilityLoading(true);
+    setAvailabilityUnconfirmed(false);
+    fetchPersonalCalendarAvailability(myLearner.kind, myLearner.id, start, end)
+      .then((result) => { if (!cancelled) {
+        setBusySlots(Array.isArray(result?.busy) ? result.busy : []);
+        setAvailabilityUnconfirmed(!Array.isArray(result?.busy) || Boolean(result.errors?.length));
+      } })
+      .catch(() => { if (!cancelled) { setBusySlots([]); setAvailabilityUnconfirmed(true); } })
+      .finally(() => { if (!cancelled) setAvailabilityLoading(false); });
+    return () => { cancelled = true; };
+  }, [showBookModal, choosingProgrammeSession, calendarConnections.length, bookDate, myLearner.kind, myLearner.id, aptemBooking]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setReviewCoachSlots([]);
+    setReviewCoachAvailabilityError('');
+    if (!showBookModal || !coachSlotBooking || !parseBookingDay(bookDate) || bookDateRestriction) {
+      setReviewCoachAvailabilityLoading(false);
+      return;
+    }
+    const controller = new AbortController();
+    // mapCoachEvent carries the persisted calendar key on eventKey.
+    const currentEventKey = rescheduleEvent?.eventKey;
+    setReviewCoachAvailabilityLoading(true);
+    const options = {
+      excludeEventKey: currentEventKey,
+      signal: controller.signal,
+    };
+    const slots = reviewSlotBooking
+      ? fetchReviewSlots(myLearner.kind, myLearner.id, bookDate, Number(bookDuration), options)
+      : fetchCoachSessionSlots(myLearner.kind, myLearner.id, bookDate, Number(bookDuration), { ...options, sessionType: bookType });
+    void slots.then(times => {
+      if (cancelled) return;
+      setReviewCoachSlots(times);
+      setBookTime(current => times.includes(current) ? current : '');
+    }).catch(error => {
+      if (cancelled) return;
+      setReviewCoachAvailabilityError(error instanceof Error
+        ? error.message : 'Coach availability could not be confirmed. Retry before booking.');
+      setBookTime('');
+    }).finally(() => {
+      if (!cancelled) setReviewCoachAvailabilityLoading(false);
+    });
+    return () => { cancelled = true; controller.abort(); };
+  }, [showBookModal, coachSlotBooking, reviewSlotBooking, bookType, bookDate, bookDuration, bookDateRestriction,
+    myLearner.kind, myLearner.id, rescheduleEvent?.eventKey,
+    reviewCoachAvailabilityRevision]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const writeVersion = calendarWriteVersionRef.current;
+    fetchLearnerCalendarEvents(myLearner.kind, myLearner.id, { revalidate: true })
+      .then((res) => {
+        if (cancelled || writeVersion !== calendarWriteVersionRef.current) return;
+        const events = res.events.map(mapCoachEvent).filter((event): event is CalendarEvent => event !== null);
+        setMyEvents(events);
+        setCalendarLoading(false);
+        setBookingCalendar(res.bookingCalendar || null);
+        setCalendarError(null);
+      })
+      .catch((err: Error) => {
+        if (!cancelled && writeVersion === calendarWriteVersionRef.current) setCalendarError(err.message);
+      })
+      .finally(() => { if (!cancelled) setCalendarLoading(false); });
+    // The assigned coach (Active_users mirror) — powers the "Book a session" panel.
+    fetchLearnerCoach(myLearner.id)
+      .then((res) => { if (!cancelled) setCoach(res.coachEmail ? { name: res.coachName || 'Your coach', email: res.coachEmail } : null); })
+      .catch(() => { /* no mirror row / no coach assigned — booking panel shows a hint */ });
+    return () => { cancelled = true; };
+  }, [myLearner.kind, myLearner.id, calendarRevision]);
+
+  const CHANGE_MESlotConflicts = useMemo(() => {
+    if (!bookDate || !bookTime) return false;
+    const start = bookingInstant(bookDate, bookTime);
+    const end = start + parseInt(bookDuration || '60') * 60_000;
+    const rescheduledStart = rescheduleEvent?.isoDate && !rescheduleEvent.timeToBeConfirmed
+      ? bookingInstant(rescheduleEvent.isoDate, rescheduleEvent.time.split('\u2013')[0].trim())
+      : null;
+    const rescheduledEnd = rescheduledStart === null
+      ? null
+      : rescheduledStart + (rescheduleEvent?.durationMinutes || 60) * 60_000;
+    return busySlots.some((slot) => {
+      const slotStart = new Date(slot.start).getTime();
+      const slotEnd = new Date(slot.end).getTime();
+      if (slotStart === rescheduledStart && slotEnd === rescheduledEnd) return false;
+      return start < slotEnd && end > slotStart;
+    });
+  }, [bookDate, bookTime, bookDuration, busySlots, rescheduleEvent]);
+
+  const availableReviewTimes = useMemo(() => reviewCoachSlots.filter(slot => {
+    const start = bookingInstant(bookDate, slot);
+    const end = start + Number(bookDuration) * 60_000;
+    const ownStart = rescheduleEvent?.isoDate && !rescheduleEvent.timeToBeConfirmed
+      ? bookingInstant(rescheduleEvent.isoDate, rescheduleEvent.time.split('–')[0].trim()) : null;
+    const ownEnd = ownStart === null ? null
+      : ownStart + (rescheduleEvent?.durationMinutes || 60) * 60_000;
+    const personalConflict = busySlots.some(other => {
+      const otherStart = Date.parse(other.start), otherEnd = Date.parse(other.end);
+      if (ownStart === otherStart && ownEnd === otherEnd) return false;
+      return Number.isFinite(otherStart) && Number.isFinite(otherEnd) && start < otherEnd && end > otherStart;
+    });
+    const lmsConflict = myEvents.some(event => {
+      if (!event.isoDate || event.timeToBeConfirmed || event.needsInitialReviewBooking || event.id === rescheduleEvent?.id
+          || event.id === bookingSourceEvent?.id || event.bookingStatus === 'cancelled'
+          || !event.bookingSessionType) return false;
+      const range = getEventTimeRange(event.time);
+      const eventStart = bookingInstant(event.isoDate, `${String(Math.floor(range.start / 60)).padStart(2, '0')}:${String(range.start % 60).padStart(2, '0')}`);
+      const eventEnd = eventStart + (event.durationMinutes || Math.max(range.end - range.start, 60)) * 60_000;
+      return start < eventEnd && end > eventStart;
+    });
+    return !personalConflict && !lmsConflict;
+  }), [reviewCoachSlots, bookDate, bookDuration, rescheduleEvent, busySlots, myEvents, bookingSourceEvent?.id]);
+
+  const CHANGE_MELmsConflict = useMemo(() => {
+    if (!bookDate || !bookTime) return null;
+    const requestedStart = bookingInstant(bookDate, bookTime);
+    const requestedEnd = requestedStart + parseInt(bookDuration || '60') * 60_000;
+    return myEvents.find((event) => {
+      if (!event.isoDate || event.timeToBeConfirmed || event.needsInitialReviewBooking || event.id === rescheduleEvent?.id || event.id === bookingSourceEvent?.id) return false;
+      const range = getEventTimeRange(event.time);
+      const existingStart = bookingInstant(event.isoDate, `${String(Math.floor(range.start / 60)).padStart(2, '0')}:${String(range.start % 60).padStart(2, '0')}`);
+      const existingEnd = existingStart + (event.durationMinutes || Math.max(range.end - range.start, 60)) * 60_000;
+      return requestedStart < existingEnd && requestedEnd > existingStart;
+    }) || null;
+  }, [bookDate, bookTime, bookDuration, bookingSourceEvent?.id, myEvents, rescheduleEvent?.id]);
+
+  const sameWeekSession = useMemo(() => {
+    if (rescheduleEvent?.reviewTemplateId || bookingSourceEvent?.reviewTemplateId) return null;
+    const requestedWeek = calendarWeekKey(bookDate);
+    if (!requestedWeek) return null;
+    return myEvents.find((event) => (
+      event.id !== rescheduleEvent?.id
+      && event.id !== bookingSourceEvent?.id
+      && !event.timeToBeConfirmed
+      && !event.needsInitialReviewBooking
+      && (event.bookingStatus === 'scheduled' || event.bookingStatus === 'not-scheduled')
+      && event.bookingSessionType === bookType
+      && Boolean(event.isoDate)
+      && calendarWeekKey(event.isoDate!) === requestedWeek
+    )) || null;
+  }, [bookDate, bookType, bookingSourceEvent?.id, bookingSourceEvent?.reviewTemplateId, myEvents, rescheduleEvent?.id, rescheduleEvent?.reviewTemplateId]);
+
+  const canRescheduleTimeConflict = Boolean(
+    !rescheduleEvent
+    && !bookingSourceEvent
+    && CHANGE_MELmsConflict?.bookingStatus === 'scheduled'
+    && CHANGE_MELmsConflict.bookingSessionType
+    && !isProgrammeCycleSessionType(CHANGE_MELmsConflict.bookingSessionType)
+  );
+
+  const handleCredentialConnect = async () => {
+    if (!connectionProvider || connectionSubmitting) return;
+    setConnectionSubmitting(true);
+    setConnectionError(null);
+    try {
+      await connectCredentialCalendar(myLearner.kind, myLearner.id, connectionProvider, {
+        url: connectionUrl.trim(), username: connectionUsername.trim(), password: connectionPassword,
+      });
+      await reloadCalendarConnections();
+      setConnectionProvider(null); setConnectionUrl(''); setConnectionUsername(''); setConnectionPassword('');
+      setAddToCalendarToast('Personal calendar connected successfully.');
+    } catch (error) {
+      setConnectionError(error instanceof Error ? error.message : 'Calendar connection failed.');
+    } finally {
+      setConnectionSubmitting(false);
+    }
+  };
+
+  const handleDisconnectCalendar = async (provider: PersonalCalendarProvider) => {
+    try {
+      await disconnectPersonalCalendar(myLearner.kind, myLearner.id, provider);
+      await reloadCalendarConnections();
+    } catch (error) {
+      setConnectionError(error instanceof Error ? error.message : 'Could not disconnect calendar.');
+    }
+  };
+
+  const handleBookSession = async () => {
+    if (bookSubmitting || choosingProgrammeSession) return;
+    if (coachSlotBooking && (reviewCoachAvailabilityLoading || reviewCoachAvailabilityError
+      || !availableReviewTimes.includes(bookTime)
+      || (calendarConnections.length > 0 && (availabilityLoading || availabilityUnconfirmed)))) {
+      setBookError(reviewCoachAvailabilityError || (availabilityUnconfirmed
+        ? 'Personal calendar availability could not be confirmed. Retry before booking.'
+        : 'Choose a currently available UK time.'));
+      return;
+    }
+    const restrictedDate = bookDateRestriction;
+    if (restrictedDate) {
+      setBookError(restrictedDate);
+      return;
+    }
+    if (sameWeekSession) {
+      setBookError(rescheduleEvent
+        ? `Another ${sessionTypeLabel(bookType)} is already booked in this week. The same session type can only be booked once per week.`
+        : `You already have a ${sessionTypeLabel(bookType)} booked in this week. Would you like to reschedule it instead?`);
+      return;
+    }
+    if (CHANGE_MELmsConflict) {
+      const cycleConflictHint = isProgrammeCycleSessionType(CHANGE_MELmsConflict.bookingSessionType)
+        ? ' Official Monthly Coaching Meeting and Progress Review sessions are scheduled from their own calendar cards.'
+        : '';
+      setBookError(canRescheduleTimeConflict
+        ? 'That time is already occupied by one of your coach-session bookings. Would you like to reschedule it instead?'
+        : `That time is unavailable because it overlaps another calendar event. Please choose another time.${cycleConflictHint}`);
+      return;
+    }
+    if (CHANGE_MESlotConflicts) {
+      setBookError('This time overlaps an event in your connected personal calendar. Please choose another time.');
+      return;
+    }
+    if (!rescheduleEvent && !bookingSourceEvent && bookType === 'other' && !otherSessionType.trim()) {
+      setBookError('Please enter the type of session you need.');
+      return;
+    }
+    setBookSubmitting(true);
+    setBookError(null);
+    try {
+      const sourceEvent = rescheduleEvent || bookingSourceEvent;
+      const importedReview = sourceEvent?.importedReview;
+      const importedReviewId = importedReview?.id || sourceEvent?.bookingReviewId;
+      const importedReviewDate = sourceEvent?.isoDate || importedReview?.plannedDate || importedReview?.completedDate || bookDate;
+      const importedReviewBooking = Boolean(importedReviewId);
+      const requestNotes = [
+        bookType === 'other' ? `Requested session type: ${otherSessionType.trim()}` : '',
+        bookNotes.trim(),
+      ].filter(Boolean).join('\n');
+      const res = rescheduleEvent
+        ? await rescheduleLearnerCalendarSession(myLearner.kind, myLearner.id, {
+            eventKey: rescheduleEvent.eventKey || rescheduleEvent.id,
+            reviewId: importedReviewId,
+            scheduledDate: bookDate,
+            scheduledTime: bookTime,
+            durationMinutes: parseInt(bookDuration),
+            timezoneOffsetMinutes: ukOffsetForDate(bookDate),
+            ...(rescheduleEvent.bookingSnapshot ? {
+              expectedBooking: rescheduleEvent.bookingSnapshot,
+              notes: bookNotes.trim(),
+            } : {}),
+          })
+        : await bookLearnerCalendarSession(myLearner.kind, myLearner.id, {
+            assignmentMonth: importedReviewBooking ? importedReviewDate.slice(0, 7) : undefined,
+            reviewId: importedReviewId,
+            sessionType: bookType,
+            // An imported Aptem key identifies the history row, not the
+            // CoachCalendarEvent row created by the booking.
+            eventKey: importedReviewBooking ? undefined : bookingSourceEvent?.eventKey,
+            scheduledDate: bookDate,
+            scheduledTime: bookTime,
+            durationMinutes: parseInt(bookDuration),
+            notes: requestNotes || undefined,
+            timezoneOffsetMinutes: ukOffsetForDate(bookDate),
+          });
+      // A read started before this save must not restore the old appointment.
+      calendarWriteVersionRef.current += 1;
+      const mapped = mapCoachEvent(res.event);
+      if (mapped) {
+        const updatedEvent = importedReview
+          ? { ...mapped, id: sourceEvent?.id || mapped.id, importedReview, bookingReviewId: importedReview.id }
+          : {
+              ...mapped,
+              bookingReviewId: sourceEvent?.bookingReviewId,
+              assignmentMonth: sourceEvent?.assignmentMonth,
+            };
+        setMyEvents((prev) => [...prev.filter((ev) => ev.id !== mapped.id && ev.id !== sourceEvent?.id), updatedEvent]);
+        const date = parseEventDate(updatedEvent);
+        if (date) {
+          setViewYear(date.year ?? viewYear);
+          setViewMonth(date.month);
+          setSelectedDay(date.day);
+        }
+        setShowEventDetails(updatedEvent);
+      }
+      setShowBookModal(false);
+      setBookNotes('');
+      setOtherSessionType('');
+      setRescheduleEvent(null);
+      setBookingSourceEvent(null);
+      setAddToCalendarToast(res.warning
+        ? `Session ${rescheduleEvent ? 'rescheduled' : 'booked'}! (${res.warning})`
+        : rescheduleEvent
+          ? `"${mapped?.title || 'Session'}" rescheduled successfully!`
+          : `"${mapped?.title || 'Session'}" booked with ${coach?.name || 'your coach'}!`);
+      setTimeout(() => setAddToCalendarToast(null), 4000);
+    } catch (err) {
+      setBookError(err instanceof Error ? err.message : 'Booking failed.');
+    } finally {
+      setBookSubmitting(false);
+    }
+  };
+
+  const refreshAptemBooking = async () => {
+    if (!rescheduleEvent?.bookingReviewId || bookSubmitting) return;
+    setBookSubmitting(true);
+    try {
+      const result = await fetchLearnerCalendarEvents(myLearner.kind, myLearner.id, { revalidate: true });
+      const fresh = result.events.find(event => String(event.reviewId) === String(rescheduleEvent.bookingReviewId));
+      const mapped = fresh && mapCoachEvent(fresh);
+      if (!mapped?.bookingSnapshot || mapped.bookingStatus !== 'scheduled') {
+        throw new Error('This review can no longer be rescheduled. Close this window and refresh the page.');
+      }
+      // Refresh the original slot used for conflict detection without losing the draft.
+      setRescheduleEvent(mapped);
+      setMyEvents(previous => [...previous.filter(event => event.id !== rescheduleEvent.id && event.id !== mapped.id), mapped]);
+      setBookError(null);
+    } catch (error) {
+      setBookError(error instanceof Error ? error.message : 'Could not refresh this booking.');
+    } finally {
+      setBookSubmitting(false);
+    }
+  };
+
+  const movePeriod = (direction: -1 | 1) => {
+    setShowDayDrawer(false);
+    const next = moveCalendarDate(new Date(viewYear, viewMonth, CHANGE_MEDay, 12), viewMode, direction);
+    setViewYear(next.getFullYear()); setViewMonth(next.getMonth()); setSelectedDay(next.getDate());
+  };
+  const handlePrev = () => movePeriod(-1);
+  const handleNext = () => movePeriod(1);
+  const handleToday = () => { setShowDayDrawer(false); setViewYear(today.getFullYear()); setViewMonth(today.getMonth()); setSelectedDay(today.getDate()); };
+
+  // A learner cancels their own catch-up; Outlook emails the cancellation to them and their coach.
+  const cancelCatchup = async (ev: CalendarEvent) => {
+    if (cancelBusy || !window.confirm('Cancel this catch-up session? Your coach will be notified.')) return;
+    setCancelBusy(true); setCancelError('');
+    try {
+      const res = await cancelLearnerCalendarSession(myLearner.kind, myLearner.id, ev.eventKey || ev.id);
+      calendarWriteVersionRef.current += 1;
+      setMyEvents(prev => prev.filter(item => item.id !== ev.id));
+      setShowEventDetails(null);
+      // The lecture this catch-up was making up needs a new recovery.
+      invalidateLearnerReads();
+      setAddToCalendarToast(res.warning ? `Catch-up cancelled. (${res.warning})` : 'Catch-up cancelled. Your coach has been notified.');
+      setTimeout(() => setAddToCalendarToast(null), 4000);
+    } catch (err) {
+      setCancelError(err instanceof Error ? err.message : 'Could not cancel the catch-up.');
+    } finally {
+      setCancelBusy(false);
+    }
+  };
+
+  const handleExportICS = (ev: CalendarEvent) => {
+    try {
+      downloadICS(calendarICSEvent(ev));
+      setAddToCalendarToast(`"${ev.title}" exported!`);
+    } catch (error) {
+      setAddToCalendarToast(`Could not export event: ${error instanceof Error ? error.message : 'Please try again.'}`);
+    }
+    setTimeout(() => setAddToCalendarToast(null), 2500);
+  };
+
+  const handleExportAllICS = () => {
+    const confirmedEvents = myEvents.filter((ev) => ev.status === 'confirmed' && hasCalendarExportTime(ev));
+    if (confirmedEvents.length === 0) { setAddToCalendarToast('No confirmed events to export'); setTimeout(() => setAddToCalendarToast(null), 2500); return; }
+    try {
+      downloadAllICS(confirmedEvents.map(calendarICSEvent));
+      setAddToCalendarToast(`${confirmedEvents.length} events exported!`);
+    } catch (error) {
+      setAddToCalendarToast(`Could not export calendar: ${error instanceof Error ? error.message : 'Please try again.'}`);
+    }
+    setTimeout(() => setAddToCalendarToast(null), 2500);
+  };
+
+  const handleGeneratePublicFeed = () => {
+    try {
+      const confirmedEvents = myEvents.filter(ev => ev.status === 'confirmed' && hasCalendarExportTime(ev));
+      setPublicFeedUrl(createPublicFeedBlob(confirmedEvents.map(calendarICSEvent)));
+    } catch (error) {
+      setAddToCalendarToast(`Could not generate feed: ${error instanceof Error ? error.message : 'Please try again.'}`);
+      setTimeout(() => setAddToCalendarToast(null), 4000);
+    }
+  };
+  const handleCopyFeedUrl = () => { if (publicFeedUrl) { navigator.clipboard.writeText(publicFeedUrl); setFeedCopied(true); setTimeout(() => setFeedCopied(false), 2000); } };
+
+  const statusConfig: Record<string, { label: string; cls: string }> = { confirmed: { label: 'Confirmed', cls: 'bg-emerald-100 CHANGE_ME' }, pending: { label: 'Pending', cls: 'bg-amber-100 text-amber-700' } };
+  const now = today;
+  const currentHour = now.getHours();
+
+  return (
+    <>
+      {/* Toast */}
+      {addToCalendarToast && !showEventDetails && (
+        <div className="fixed top-20 right-6 z-50 bg-background-50 rounded-xl border border-emerald-200/60 shadow-lg px-4 py-3 flex items-center gap-3 animate-in slide-in-from-right-4 duration-300">
+          <span className="w-8 h-8 rounded-full bg-emerald-100 text-emerald-600 flex items-center justify-center"><AppIcon className="ri-calendar-check-line"></AppIcon></span>
+          <p className="text-sm font-semibold text-foreground-900">{addToCalendarToast}</p>
+        </div>
+      )}
+
+      {/* ═══════════ BOOK COACH SESSION MODAL ═══════════ */}
+      {showCalendarConnect && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 p-4 backdrop-blur-sm" onClick={() => setShowCalendarConnect(false)}>
+          <div className="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-2xl bg-background-50 p-6 shadow-xl animate-in zoom-in-95 duration-200" onClick={(event) => event.stopPropagation()}>
+            <div className="mb-5 flex items-start justify-between gap-4">
+              <div>
+                <p className="text-[10px] font-bold uppercase tracking-widest text-primary-600">Calendar source</p>
+                <h3 className="mt-1 text-xl font-heading font-bold text-foreground-900">Connect personal calendar</h3>
+                <p className="mt-1 text-xs text-foreground-400">We only read free/busy times to prevent booking conflicts.</p>
+              </div>
+              <button type="button" onClick={() => setShowCalendarConnect(false)} className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-foreground-400 hover:bg-background-100"><AppIcon className="ri-close-line" /></button>
+            </div>
+            <div className="space-y-2.5">
+              {CALENDAR_PROVIDERS.map((item) => {
+                const connected = calendarConnections.find((connection) => connection.provider === item.provider);
+                return (
+                  <div key={item.provider} className={`rounded-xl border p-1 transition ${connected ? 'border-emerald-200 bg-emerald-50/30' : 'border-background-300'}`}>
+                    <div className="flex items-center gap-3 px-3 py-2.5">
+                      <span className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg ${connected ? 'bg-emerald-100 text-emerald-600' : 'bg-primary-50 text-primary-600'}`}><AppIcon className={connected ? 'ri-check-line' : item.icon} /></span>
+                      <button type="button" disabled={Boolean(connected)} onClick={async () => {
+                        setConnectionError(null);
+                        if (item.provider === 'google' || item.provider === 'microsoft') {
+                          try { await startCalendarOAuth(myLearner.kind, myLearner.id, item.provider); }
+                          catch (error) { setConnectionError(error instanceof Error ? error.message : 'Could not start calendar connection.'); }
+                        } else {
+                          setConnectionProvider(item.provider);
+                          setConnectionUrl(item.provider === 'icloud' ? 'https://caldav.icloud.com' : '');
+                        }
+                      }} className="min-w-0 flex-1 text-left disabled:cursor-default">
+                        <p className="text-sm font-semibold text-foreground-900">{connected ? `${item.title.replace('Continue with ', '').replace('Connect ', '')} connected` : item.title}</p>
+                        <p className="truncate text-xs text-foreground-400">{connected?.accountEmail || item.subtitle}</p>
+                      </button>
+                      {connected && <button type="button" onClick={() => handleDisconnectCalendar(item.provider)} className="rounded-lg px-2.5 py-1.5 text-[10px] font-semibold text-red-600 hover:bg-red-50">Disconnect</button>}
+                    </div>
+                    {connectionProvider === item.provider && !connected && (
+                      <div className="space-y-3 border-t border-background-200 px-3 pb-3 pt-3">
+                        <div><label className="mb-1 block text-[10px] font-semibold text-foreground-500">{item.provider === 'ics' ? 'Private ICS feed URL' : 'Calendar server URL'}</label><input type="url" value={connectionUrl} onChange={(event) => setConnectionUrl(event.target.value)} placeholder="https://..." className="w-full rounded-lg border border-background-300 bg-white px-3 py-2 text-sm outline-none focus:border-primary-400" /></div>
+                        {item.provider !== 'ics' && <div className="grid grid-cols-1 gap-3 sm:grid-cols-2"><div><label className="mb-1 block text-[10px] font-semibold text-foreground-500">Calendar username</label><input value={connectionUsername} onChange={(event) => setConnectionUsername(event.target.value)} autoComplete="username" className="w-full rounded-lg border border-background-300 bg-white px-3 py-2 text-sm outline-none focus:border-primary-400" /></div><div><label className="mb-1 block text-[10px] font-semibold text-foreground-500">App-specific password</label><input type="password" value={connectionPassword} onChange={(event) => setConnectionPassword(event.target.value)} autoComplete="new-password" className="w-full rounded-lg border border-background-300 bg-white px-3 py-2 text-sm outline-none focus:border-primary-400" /></div></div>}
+                        <div className="flex gap-2"><button type="button" onClick={() => setConnectionProvider(null)} className="flex-1 rounded-lg border border-background-300 px-3 py-2 text-xs font-semibold text-foreground-600">Cancel</button><button type="button" onClick={handleCredentialConnect} disabled={connectionSubmitting || !connectionUrl || (item.provider !== 'ics' && (!connectionUsername || !connectionPassword))} className="flex-1 rounded-lg bg-primary-500 px-3 py-2 text-xs font-semibold text-white disabled:opacity-50">{connectionSubmitting ? 'Connecting…' : 'Connect'}</button></div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+            {connectionError && <div className="mt-4 flex items-start gap-2 rounded-xl border border-red-200 bg-red-50 px-3 py-2.5 text-xs text-red-700"><AppIcon className="ri-error-warning-line mt-0.5" /><span>{connectionError}</span></div>}
+            <p className="mt-4 flex items-start gap-2 text-[10px] leading-relaxed text-foreground-400"><AppIcon className="ri-shield-keyhole-line mt-0.5 text-emerald-500" />OAuth tokens and calendar passwords are encrypted on the server and are never sent back to the browser.</p>
+          </div>
+        </div>
+      )}
+
+      {showBookModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm" onClick={() => setShowBookModal(false)}>
+          <div role="dialog" aria-modal="true" aria-labelledby="calendar-booking-title" className="bg-background-50 rounded-2xl p-6 max-w-lg w-full mx-4 shadow-xl animate-in zoom-in-95 duration-200 max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between mb-2">
+              <h3 id="calendar-booking-title" className="text-lg font-heading font-bold text-foreground-900 flex items-center gap-2"><AppIcon className={`${rescheduleEvent || bookingSourceEvent || choosingProgrammeSession ? 'ri-calendar-schedule-line' : 'ri-user-star-line'} text-primary-500`}></AppIcon>{rescheduleEvent ? 'Reschedule Session' : bookingSourceEvent ? `Schedule ${sessionTypeLabel(bookingSourceEvent.bookingSessionType)}` : choosingProgrammeSession ? `Your ${sessionTypeLabel(bookType)} sessions` : 'Book a Coach Session'}</h3>
+              <button aria-label="Close booking dialog" onClick={() => setShowBookModal(false)} className="w-8 h-8 rounded-lg flex items-center justify-center text-foreground-400 hover:bg-background-100 transition-smooth cursor-pointer"><AppIcon className="ri-close-line"></AppIcon></button>
+            </div>
+            <p className="text-sm text-foreground-500 mb-5">
+              {rescheduleEvent
+                ? <>Choose a new date and time for <strong className="text-foreground-700">{rescheduleEvent.title}</strong>. The existing Teams meeting will be updated.</>
+                : bookingSourceEvent
+                  ? <>Choose a date and time for <strong className="text-foreground-700">{bookingSourceEvent.title}</strong>. This will book the official {sessionTypeLabel(bookingSourceEvent.bookingSessionType)} session for you and your coach.</>
+                : choosingProgrammeSession
+                  ? 'Choose an existing session below to view its details, schedule it, or change its time.'
+                : coach
+                  ? <>Choose an available time with <strong className="text-foreground-700">{coach.name}</strong>. Sessions are booked directly without coach approval. Choose MCM or PR to manage your existing programme sessions.</>
+                  : 'No coach has been assigned to you yet — please contact your programme team.'}
+            </p>
+            <div className="space-y-4">
+              {bookingSourceEvent?.needsInitialReviewBooking && bookingSourceEvent.bookingStatus === 'scheduled' && (
+                <p role="note" className="rounded-xl border border-primary-200 bg-primary-50 px-3 py-2.5 text-sm text-primary-800">
+                  This review has an imported appointment date, but no linked calendar booking. If you already have a meeting invitation, check with your coach before booking here. An existing invitation will not be changed.
+                </p>
+              )}
+              {bookingSourceEvent && (
+                <div className="rounded-xl border border-primary-200 bg-primary-50 px-3 py-2.5 text-primary-800">
+                  <p className="text-[10px] font-bold uppercase tracking-[0.12em] text-primary-500">Selected programme slot</p>
+                  <p className="mt-1 text-sm font-bold text-primary-900">{bookingSourceEvent.title}</p>
+                  <p className="mt-0.5 text-xs text-primary-700">Target date: {bookingSourceEvent.date}</p>
+                </div>
+              )}
+              {!rescheduleEvent && !bookingSourceEvent && <div>
+                <label className="text-xs font-semibold text-foreground-500 mb-1.5 block">Session Type <span className="text-red-400">*</span></label>
+                <CoachSessionTypePicker
+                  value={bookType}
+                  compact={choosingProgrammeSession}
+                  onChange={(value) => {
+                    setBookType(value);
+                    setBookTime('');
+                    setBookError(null);
+                  }}
+                />
+                {bookType === 'other' && <div className="mt-3"><label htmlFor="other-session-type" className="text-xs font-semibold text-foreground-500">Other <span className="text-red-400">*</span></label><input id="other-session-type" type="text" value={otherSessionType} onChange={(e) => { setOtherSessionType(e.target.value); setBookError(null); }} maxLength={100} placeholder="Write the session type you need" className="mt-1.5 w-full bg-background-100 border border-background-300 rounded-lg px-3 py-2 text-sm text-foreground-800 placeholder:text-foreground-400 focus:outline-none focus:ring-1 focus:ring-primary-400/40 focus:border-primary-300/50 transition-all" /></div>}
+              </div>}
+              {choosingProgrammeSession ? (
+                <section aria-label="Existing programme sessions" className="space-y-3">
+                  {calendarLoading ? <p  className="text-sm text-foreground-500"><LoadingSkeleton label={"Loading your sessions…"} /></p>
+                    : calendarError ? <p role="alert" className="text-sm text-red-700">{calendarError}</p>
+                    : programmeSessions.length ? programmeSessions.map(event => {
+                      const status = LEARNER_STATUS_META[learnerEventStatus(event)];
+                      return <button key={event.id} type="button" onClick={() => {
+                        setShowBookModal(false);
+                        setShowEventDetails(event);
+                        setCancelError('');
+                      }} className="flex w-full items-center gap-3 rounded-xl border border-background-300 bg-white p-4 text-left transition-smooth hover:border-primary-400 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary-500">
+                        <span className="min-w-0 flex-1">
+                          <span className="block text-sm font-semibold text-foreground-900">{event.title}</span>
+                          <span className="mt-1 block text-xs text-foreground-500">{event.date} {event.isoDate?.slice(0, 4)} · {event.timeToBeConfirmed ? 'Time to be confirmed' : `${event.time} UK time`}</span>
+                          <span className={`mt-2 inline-flex rounded-full px-2 py-0.5 text-[10px] font-semibold ring-1 ring-inset ${status.badge}`}>{status.label}</span>
+                        </span>
+                        <span className="flex shrink-0 items-center gap-1 text-xs font-semibold text-primary-700">View session<AppIcon className="ri-arrow-right-line" /></span>
+                      </button>;
+                    }) : <p className="text-sm text-foreground-500">No {sessionTypeLabel(bookType)} sessions are available. Please contact your coach or programme team.</p>}
+                  {!calendarLoading && (calendarError || !programmeSessions.length) && <button type="button" onClick={() => {
+                    setCalendarLoading(true);
+                    refreshCalendar();
+                  }} className="text-sm font-semibold text-primary-700 underline">Refresh sessions</button>}
+                </section>
+              ) : <>
+              <div className="grid grid-cols-2 gap-3">
+                <div><label className="text-xs font-semibold text-foreground-500 mb-1.5 block">Date <span className="text-red-400">*</span></label><input aria-label="Date" type="date" value={bookDate} min={bookingToday} onChange={(e) => { setBookDate(e.target.value); if (coachSlotBooking) setBookTime(''); }} className="w-full bg-background-100 border border-background-300 rounded-lg px-3 py-2 text-sm text-foreground-800 focus:outline-none focus:ring-1 focus:ring-primary-400/40 focus:border-primary-300/50 transition-all" /></div>
+                <div><label className="text-xs font-semibold text-foreground-500 mb-1.5 block">{coachSlotBooking ? 'Time (UK time · Europe/London)' : 'Time'} <span className="text-red-400">*</span></label>{coachSlotBooking ? (
+                  <select aria-label="Time (UK time, Europe/London)" value={bookTime}
+                    disabled={reviewCoachAvailabilityLoading || Boolean(reviewCoachAvailabilityError)
+                      || (calendarConnections.length > 0 && (availabilityLoading || availabilityUnconfirmed))
+                      || !availableReviewTimes.length}
+                    onChange={event => setBookTime(event.target.value)}
+                    className="w-full bg-background-100 border border-background-300 rounded-lg px-3 py-2 text-sm text-foreground-800 focus:outline-none focus:ring-1 focus:ring-primary-400/40 focus:border-primary-300/50 transition-all">
+                    <option value="">{reviewCoachAvailabilityLoading ? 'Checking available UK times…' : 'Select an available time'}</option>
+                    {availableReviewTimes.map(time => <option key={time} value={time}>{time}</option>)}
+                  </select>
+                ) : <input aria-label="Time" type="time" value={bookTime} onChange={(e) => setBookTime(e.target.value)} className="w-full bg-background-100 border border-background-300 rounded-lg px-3 py-2 text-sm text-foreground-800 focus:outline-none focus:ring-1 focus:ring-primary-400/40 focus:border-primary-300/50 transition-all" />}</div>
+              </div>
+              {coachSlotBooking && reviewCoachAvailabilityLoading && <p role="status" className="text-xs text-foreground-500">Checking coach availability for this date and duration…</p>}
+              {coachSlotBooking && reviewCoachAvailabilityError && <p role="alert" className="text-xs text-red-700">{reviewCoachAvailabilityError} <button type="button" className="font-semibold underline" onClick={() => setReviewCoachAvailabilityRevision(value => value + 1)}>Retry availability</button></p>}
+              {coachSlotBooking && !reviewCoachAvailabilityLoading && !reviewCoachAvailabilityError && !bookDateRestriction && !availableReviewTimes.length && <p role="status" className="text-xs text-foreground-500">No available {reviewSlotBooking ? 'Review ' : ''}times for this date and duration.</p>}
+              {bookDateRestriction && (
+                <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5 text-amber-800">
+                  <AppIcon className="ri-calendar-close-line mt-0.5 shrink-0" />
+                  <p className="text-xs font-semibold">{bookDateRestriction}</p>
+                </div>
+              )}
+              {sameWeekSession && (
+                <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-3 text-amber-800">
+                  <div className="flex items-start gap-2">
+                    <AppIcon className="ri-calendar-schedule-line mt-0.5 shrink-0" />
+                    <div className="min-w-0 flex-1">
+                      <p className="text-xs font-semibold">
+                        {rescheduleEvent
+                          ? <>Another {sessionTypeLabel(bookType)} is already booked in this week. The same session type can only be booked once per week, so choose a different week.</>
+                          : <>You already have a {sessionTypeLabel(bookType)} booked in this week. Would you like to reschedule it?</>}
+                      </p>
+                      {!rescheduleEvent && (
+                        <div className="mt-2 flex flex-wrap gap-2">
+                          <button type="button" onClick={() => openRescheduleSession(sameWeekSession)} className="inline-flex items-center gap-1.5 rounded-lg bg-amber-100 px-3 py-1.5 text-xs font-bold text-amber-900 transition-smooth hover:bg-amber-200 cursor-pointer">
+                            <AppIcon className="ri-calendar-schedule-line" />
+                            Yes, reschedule
+                          </button>
+                          <button type="button" onClick={() => setShowBookModal(false)} className="inline-flex items-center rounded-lg border border-amber-200 bg-white px-3 py-1.5 text-xs font-bold text-amber-800 transition-smooth hover:bg-amber-50 cursor-pointer">
+                            No, keep current booking
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
+              {CHANGE_MELmsConflict && CHANGE_MELmsConflict.id !== sameWeekSession?.id && (
+                <div className={`rounded-xl border px-3 py-3 ${canRescheduleTimeConflict ? 'border-amber-200 bg-amber-50 text-amber-800' : 'border-red-200 bg-red-50 text-red-700'}`}>
+                  <div className="flex items-start gap-2">
+                    <AppIcon className={`${canRescheduleTimeConflict ? 'ri-calendar-schedule-line' : 'ri-calendar-close-line'} mt-0.5 shrink-0`} />
+                    <div className="min-w-0 flex-1">
+                      <p className="text-xs font-semibold leading-relaxed">
+                        {canRescheduleTimeConflict
+                          ? 'That time is already occupied by one of your coach-session bookings. Would you like to reschedule it?'
+                          : 'That time is unavailable because it overlaps another calendar event. Choose another time.'}
+                        {!canRescheduleTimeConflict && isProgrammeCycleSessionType(CHANGE_MELmsConflict.bookingSessionType) ? ' Official Monthly Coaching Meeting and Progress Review sessions are scheduled from their own calendar cards.' : ''}
+                      </p>
+                      {canRescheduleTimeConflict && (
+                        <div className="mt-2 flex flex-wrap gap-2">
+                          <button type="button" onClick={() => openRescheduleSession(CHANGE_MELmsConflict)} className="inline-flex items-center gap-1.5 rounded-lg bg-amber-100 px-3 py-1.5 text-xs font-bold text-amber-900 transition-smooth hover:bg-amber-200 cursor-pointer">
+                            <AppIcon className="ri-calendar-schedule-line" />
+                            Yes, reschedule
+                          </button>
+                          <button type="button" onClick={() => setShowBookModal(false)} className="inline-flex items-center rounded-lg border border-amber-200 bg-white px-3 py-1.5 text-xs font-bold text-amber-800 transition-smooth hover:bg-amber-50 cursor-pointer">
+                            No, keep current booking
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
+              {calendarConnections.length > 0 ? (
+                <div className={`flex items-start gap-2 rounded-xl border px-3 py-2.5 ${CHANGE_MESlotConflicts ? 'border-red-200 bg-red-50 text-red-700' : availabilityUnconfirmed ? 'border-amber-200 bg-amber-50 text-amber-800' : 'border-emerald-200 bg-emerald-50 CHANGE_ME'}`}>
+                  <AppIcon className={`${availabilityLoading ? 'ri-loader-4-line animate-spin' : CHANGE_MESlotConflicts ? 'ri-calendar-close-line' : availabilityUnconfirmed ? 'ri-error-warning-line' : 'ri-calendar-check-line'} mt-0.5`} />
+                  <div><p className="text-xs font-semibold">{availabilityLoading ? 'Checking your personal calendar…' : CHANGE_MESlotConflicts ? 'This time is busy' : availabilityUnconfirmed ? 'Personal calendar availability could not be confirmed.' : 'This time is available'}</p><p className="mt-0.5 text-[10px] opacity-75">{availabilityUnconfirmed ? 'Retry the calendar check before booking.' : `Checked against ${calendarConnections.length} connected calendar${calendarConnections.length === 1 ? '' : 's'}.`}</p></div>
+                </div>
+              ) : (
+                <button type="button" onClick={() => { setShowBookModal(false); setShowCalendarConnect(true); }} className="flex w-full items-center gap-2 rounded-xl border border-primary-200 bg-primary-50 px-3 py-2.5 text-left text-xs font-semibold text-primary-700"><AppIcon className="ri-calendar-2-line" />Connect your personal calendar to prevent booking conflicts</button>
+              )}
+              <div>
+                <label className="text-xs font-semibold text-foreground-500 mb-1.5 block">Duration</label>
+                <select aria-label="Duration" value={bookDuration} disabled={bookSubmitting} onChange={(e) => { setBookDuration(e.target.value); if (coachSlotBooking) setBookTime(''); }} className="w-full bg-background-100 border border-background-300 rounded-lg px-3 py-2 text-sm text-foreground-800 focus:outline-none focus:ring-1 focus:ring-primary-400/40 focus:border-primary-300/50 transition-all cursor-pointer">
+                  {!(reviewSlotBooking ? [30, 45, 60, 90, 120] : [30, 45, 60]).includes(Number(bookDuration)) && <option value={bookDuration}>{bookDuration} minutes</option>}
+                  <option value="30">30 minutes</option>
+                  <option value="45">45 minutes</option>
+                  <option value="60">1 hour</option>
+                  {reviewSlotBooking && <><option value="90">1.5 hours</option><option value="120">2 hours</option></>}
+                </select>
+              </div>
+              {(!rescheduleEvent || rescheduleEvent.bookingSnapshot) && <div>
+                <label className="text-xs font-semibold text-foreground-500 mb-1.5 block">What would you like to cover? (optional)</label>
+                <textarea value={bookNotes} onChange={(e) => setBookNotes(e.target.value)} placeholder="Add CHANGE_ME your coach should know before the session..." maxLength={500} rows={3} className="w-full bg-background-100 border border-background-300 rounded-lg px-3 py-2 text-sm text-foreground-800 placeholder:text-foreground-400 focus:outline-none focus:ring-1 focus:ring-primary-400/40 focus:border-primary-300/50 transition-all resize-none" />
+                <span className="text-[10px] text-foreground-400 mt-0.5 block">{bookNotes.length}/500</span>
+              </div>}
+              {bookError && (
+                <div className="rounded-xl border border-red-200 bg-red-50 px-3 py-2.5 flex items-center gap-2">
+                  <AppIcon className="ri-error-warning-line text-red-500"></AppIcon>
+                  <p className="text-xs text-red-700">{bookError}</p>
+                  {rescheduleEvent?.bookingReviewId && /refresh/i.test(bookError) && <button type="button"
+                    disabled={bookSubmitting} onClick={refreshAptemBooking}
+                    className="shrink-0 rounded-lg border border-red-200 px-2 py-1 text-xs font-semibold text-red-700">
+                    Refresh booking
+                  </button>}
+                </div>
+              )}
+              </>}
+            </div>
+            <div className="flex gap-2 mt-5">
+              <button onClick={() => setShowBookModal(false)} className="flex-1 px-4 py-2.5 rounded-xl border border-background-300 text-sm font-semibold text-foreground-600 hover:bg-background-100 transition-smooth cursor-pointer whitespace-nowrap">Cancel</button>
+              {!choosingProgrammeSession && <button onClick={handleBookSession} disabled={bookSubmitting || availabilityLoading || CHANGE_MESlotConflicts || Boolean(sameWeekSession) || Boolean(CHANGE_MELmsConflict) || Boolean(bookDateRestriction) || !bookDate || !bookTime || (coachSlotBooking && (reviewCoachAvailabilityLoading || Boolean(reviewCoachAvailabilityError) || !availableReviewTimes.includes(bookTime) || (calendarConnections.length > 0 && availabilityUnconfirmed)))} className="flex-1 px-4 py-2.5 rounded-xl bg-primary-500 text-white text-sm font-semibold hover:bg-primary-600 transition-smooth cursor-pointer whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed">
+                {bookSubmitting ? <><AppIcon className="ri-loader-4-line animate-spin mr-1"></AppIcon>{rescheduleEvent ? 'Rescheduling...' : 'Booking...'}</> : <><AppIcon className={rescheduleEvent || bookingSourceEvent ? 'ri-calendar-check-line mr-1' : 'ri-check-line mr-1'}></AppIcon>{rescheduleEvent ? 'Save New Time' : 'Book Session'}</>}
+              </button>}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ═══════════ EVENT DETAILS MODAL ═══════════ */}
+      {showEventDetails && (
+        <CalendarEventDialog
+          title={showEventDetails.title}
+          onClose={() => { setShowEventDetails(null); setCancelError(''); }}
+          badges={<>
+            <span className="rounded-full bg-primary-100 px-2.5 py-1 text-primary-700">{learnerSourceMeta(showEventDetails, reviewTypeLookup).label}</span>
+            <span className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 ring-1 ring-inset ${LEARNER_STATUS_META[learnerEventStatus(showEventDetails)].badge}`}>
+              <span className={`h-1.5 w-1.5 rounded-full ${LEARNER_STATUS_META[learnerEventStatus(showEventDetails)].dot}`}></span>
+              {LEARNER_STATUS_META[learnerEventStatus(showEventDetails)].label}
+            </span>
+            {showEventDetails.watchedRecording && <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-50 px-2.5 py-1 text-emerald-800 ring-1 ring-inset ring-emerald-200">
+              <AppIcon className="ri-play-circle-line" />Watched the full recording</span>}
+          </>}
+          actions={<>
+
+              {(showEventDetails.timeToBeConfirmed || showEventDetails.needsInitialReviewBooking
+                || (showEventDetails.bookingStatus === 'not-scheduled' && ['student-support', 'gateway', 'other'].includes(showEventDetails.source || '')))
+                && (!isProgrammeCycleSessionType(showEventDetails.bookingSessionType)
+                  || ['not-scheduled', 'scheduled'].includes(showEventDetails.bookingStatus || ''))
+                && showEventDetails.bookingSessionType && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    const event = showEventDetails;
+                    setShowEventDetails(null);
+                    if (!event.timeToBeConfirmed && !event.needsInitialReviewBooking
+                        && event.bookingStatus === 'not-scheduled') openRescheduleSession(event);
+                    else openBookSession(event.isoDate && event.isoDate >= bookingToday ? event.isoDate : bookingToday, event);
+                  }}
+                  className="inline-flex flex-1 items-center justify-center gap-2 rounded-xl bg-primary-500 px-4 py-2.5 text-center text-sm font-semibold text-white transition-smooth hover:bg-primary-600 cursor-pointer whitespace-nowrap"
+                >
+                  <AppIcon className="ri-calendar-check-line h-4 w-4 shrink-0" />
+                  <span>Schedule {sessionTypeLabel(showEventDetails.bookingSessionType)}</span>
+                </button>
+              )}
+              {showEventDetails.meetingLink && showEventDetails.meetingOutcome && (
+                <button type="button" disabled title="This meeting has ended." className="meeting-join-action inline-flex flex-1 items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-sm font-semibold whitespace-nowrap text-center cursor-not-allowed opacity-60"><AppIcon className="ri-video-chat-line h-4 w-4 shrink-0"></AppIcon><span>Meeting ended</span></button>
+              )}
+              {showEventDetails.meetingLink && !showEventDetails.meetingOutcome && (
+                <a href={showEventDetails.meetingLink} target="_blank" rel="noreferrer" className="meeting-join-action inline-flex flex-1 items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-sm font-semibold transition-smooth cursor-pointer whitespace-nowrap text-center"><AppIcon className="ri-video-chat-line h-4 w-4 shrink-0"></AppIcon><span>Join Meeting</span></a>
+              )}
+              {showEventDetails.bookingStatus === 'scheduled' && !showEventDetails.needsInitialReviewBooking && showEventDetails.bookingSessionType && (
+                <button type="button" disabled={showEventDetails.changeClosed} title={showEventDetails.changeClosed ? 'Catch-ups can be changed up to 12 hours before they start.' : undefined} onClick={() => openRescheduleSession(showEventDetails)} className="inline-flex flex-1 items-center justify-center gap-2 rounded-xl border border-primary-200 bg-primary-50 px-4 py-2.5 text-sm font-semibold text-primary-700 transition-smooth hover:bg-primary-100 cursor-pointer whitespace-nowrap disabled:cursor-not-allowed disabled:opacity-60"><AppIcon className="ri-calendar-schedule-line h-4 w-4 shrink-0" /><span>Reschedule</span></button>
+              )}
+              {showEventDetails.bookingStatus === 'scheduled' && showEventDetails.source === 'catch-up' && (
+                <button type="button" disabled={showEventDetails.changeClosed || cancelBusy} title={showEventDetails.changeClosed ? 'Catch-ups can be cancelled up to 12 hours before they start.' : undefined} onClick={() => void cancelCatchup(showEventDetails)} className="inline-flex flex-1 items-center justify-center gap-2 rounded-xl border border-red-200 px-4 py-2.5 text-sm font-semibold text-red-600 transition-smooth hover:bg-red-50 cursor-pointer whitespace-nowrap disabled:cursor-not-allowed disabled:opacity-60"><AppIcon className="ri-calendar-close-line h-4 w-4 shrink-0" /><span>{cancelBusy ? 'Cancelling…' : 'Cancel catch-up'}</span></button>
+              )}
+              {hasCalendarExportTime(showEventDetails) && <button onClick={() => handleExportICS(showEventDetails)} className="inline-flex flex-1 items-center justify-center gap-2 px-4 py-2.5 rounded-xl border border-background-300 text-sm font-semibold text-foreground-600 hover:bg-background-100 transition-smooth cursor-pointer whitespace-nowrap"><AppIcon className="ri-download-line h-4 w-4 shrink-0"></AppIcon><span>Export .ics</span></button>}
+
+          </>}
+        >
+          {addToCalendarToast && <p role="status" className="mb-4 rounded-xl border border-primary-200 bg-primary-50 px-3 py-2.5 text-sm text-primary-800">{addToCalendarToast}</p>}
+          {showEventDetails.bookingOnly && <BookingOnlyNotice />}
+          {cancelError && <p role="alert" className="mb-4 rounded-xl border border-red-200 bg-red-50 px-3 py-2.5 text-sm text-red-700">{cancelError}</p>}
+          {showEventDetails.source === 'catch-up' && showEventDetails.bookingStatus === 'scheduled' && showEventDetails.changeClosed && <p role="status" className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5 text-sm text-amber-800">This catch-up starts in less than 12 hours, so it can no longer be changed or cancelled here. Please contact your coach.</p>}
+          <dl className="mb-5 grid grid-cols-1 gap-4 text-sm sm:grid-cols-2">
+            <div><dt className="mb-1 flex items-center gap-2 text-xs text-foreground-500"><AppIcon className="ri-calendar-line" />Date</dt><dd className="font-semibold">{showEventDetails.isoDate ? new Date(`${showEventDetails.isoDate}T12:00:00`).toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' }) : `${showEventDetails.dayName}, ${showEventDetails.date}`}</dd></div>
+            <div><dt className="mb-1 flex items-center gap-2 text-xs text-foreground-500"><AppIcon className="ri-time-line" />Time</dt><dd className="font-semibold">{showEventDetails.timeToBeConfirmed ? 'Time to be confirmed' : showEventDetails.time}</dd>{showEventDetails.durationMinutes && <dd className="mt-1 text-xs text-foreground-500">{showEventDetails.durationMinutes} minutes</dd>}</div>
+            <div><dt className="mb-1 flex items-center gap-2 text-xs text-foreground-500"><AppIcon className="ri-user-line" />Host</dt><dd className="font-semibold">{showEventDetails.host}</dd><dd className="mt-1 text-xs text-foreground-500">{showEventDetails.club}</dd></div>
+            <div><dt className="mb-1 flex items-center gap-2 text-xs text-foreground-500"><AppIcon className="ri-map-pin-line" />Location</dt><dd className="font-semibold">{showEventDetails.location}</dd><dd className="mt-1 text-xs text-foreground-500">{showEventDetails.format}</dd></div>
+          </dl>
+          {showEventDetails.description && <div className="mb-5 border-t border-foreground-100 pt-4"><h3 className="mb-2 text-xs font-semibold text-foreground-500">About this event</h3><p className="whitespace-pre-wrap break-words text-sm leading-relaxed text-foreground-700">{showEventDetails.description}</p></div>}
+            {showEventDetails.syncWarning && <p role="status" className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs leading-relaxed text-amber-800">{showEventDetails.syncWarning}</p>}
+            {CHANGE_MEReview.loading ? <RowsSkeleton rows={3} /> : CHANGE_MEReview.error ? <p role="alert" className="mb-4 text-sm text-red-600">{CHANGE_MEReview.error}</p> : CHANGE_MEReview.definition ? <LearnerReviewInstanceForm definition={CHANGE_MEReview.definition} onSaveAnswers={answers => saveLearnerEventReviewAnswers(myLearner.kind, myLearner.id, showEventDetails.eventKey || showEventDetails.id, answers)} /> : null}
+            {shouldShowMeetingArtifacts(showEventDetails) ? (
+              <CoachMeetingArtifactsPanel event={{ id: showEventDetails.id, eventKey: showEventDetails.eventKey, source: showEventDetails.source, meetingLink: showEventDetails.meetingLink }} storedOnly={Boolean(showEventDetails.importedReview)} fetchArtifacts={loadArtifacts} contentUrl={artifactContentUrl} showAttendance={false} visibleArtifactTypes={['recording']} className="mb-5 border-primary-100 bg-primary-50/30" />
+            ) : null}
+            {showEventDetails.timeToBeConfirmed && showEventDetails.bookingSessionType && (
+              <div className="mb-4 flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5 text-amber-800">
+                <AppIcon className="ri-information-line mt-0.5 shrink-0" />
+                <p className="text-xs font-semibold">This is your official {sessionTypeLabel(showEventDetails.bookingSessionType)} session. Choose a date and time here, and the Microsoft Teams meeting link will be created when it is confirmed.</p>
+              </div>
+            )}
+            {!showEventDetails.timeToBeConfirmed && !showEventDetails.meetingLink && !showEventDetails.syncWarning && showEventDetails.club !== 'Personal' && (
+              <div className="mb-4 flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5 text-amber-800">
+                <AppIcon className="ri-error-warning-line mt-0.5 shrink-0" />
+                <p className="text-xs font-semibold">{showEventDetails.bookingStatus === 'not-scheduled'
+                  ? showEventDetails.source === 'catch-up'
+                    ? 'Choose a date and time to schedule this catch-up.'
+                    : 'This session has not been scheduled. Choose an available time to confirm the booking.'
+                  : 'The meeting time is scheduled, but the Teams link is not available yet. Please contact your coach.'}</p>
+              </div>
+            )}
+        </CalendarEventDialog>
+      )}
+
+      {/* ═══════════ SHARE CALENDAR MODAL ═══════════ */}
+      {showShareCalendar && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm" onClick={() => setShowShareCalendar(false)}>
+          <div className="bg-background-50 rounded-2xl p-6 max-w-md w-full mx-4 shadow-xl animate-in zoom-in-95 duration-200" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between mb-5"><h3 className="text-lg font-heading font-bold text-foreground-900 flex items-center gap-2"><AppIcon className="ri-share-line text-primary-500"></AppIcon>Share Calendar</h3><button onClick={() => setShowShareCalendar(false)} className="w-8 h-8 rounded-lg flex items-center justify-center text-foreground-400 hover:bg-background-100 transition-smooth cursor-pointer"><AppIcon className="ri-close-line"></AppIcon></button></div>
+            <p className="text-sm text-foreground-500 mb-4 leading-relaxed">Generate a public, read-only iCal feed URL for Google Calendar, Apple Calendar, or Outlook.</p>
+            {!publicFeedUrl ? (<div className="text-center py-4"><button onClick={handleGeneratePublicFeed} className="px-5 py-2.5 bg-primary-500 text-white rounded-xl text-sm font-semibold hover:bg-primary-600 transition-smooth cursor-pointer whitespace-nowrap"><AppIcon className="ri-link-m mr-1"></AppIcon>Generate Public Feed</button></div>) : (
+              <div className="space-y-3"><div className="bg-background-100 rounded-xl p-3 break-all"><p className="text-xs text-foreground-400 mb-1">Public Feed URL</p><p className="text-xs font-mono text-foreground-600">{publicFeedUrl}</p></div><div className="flex gap-2"><button onClick={handleCopyFeedUrl} className="flex-1 px-4 py-2.5 rounded-xl bg-primary-500 text-white text-sm font-semibold hover:bg-primary-600 transition-smooth cursor-pointer whitespace-nowrap"><AppIcon className={`${feedCopied ? 'ri-check-line' : 'ri-clipboard-line'} mr-1`}></AppIcon>{feedCopied ? 'Copied!' : 'Copy Link'}</button></div></div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ═══════════ SELECTED DAY DRAWER ═══════════ */}
+      {showDayDrawer && (
+        <>
+    <div className="calendar-day-drawer-backdrop fixed inset-0 z-[90] bg-black/30 backdrop-blur-[1px] animate-in fade-in duration-150" onClick={() => setShowDayDrawer(false)} />
+    <div className="calendar-day-drawer fixed inset-y-0 right-0 z-[100] flex w-full max-w-sm flex-col border-l-2 border-background-300 bg-white shadow-2xl animate-in slide-in-from-right duration-200">
+            <div className="flex items-center justify-between gap-3 border-b border-background-200 px-5 py-4">
+              <div className="min-w-0">
+                <p className="text-[10px] font-bold uppercase tracking-widest text-primary-600">
+                  {isToday(CHANGE_MEDay, viewMonth, viewYear) ? 'Today' : DAYS_OF_WEEK[new Date(viewYear, viewMonth, CHANGE_MEDay).getDay() === 0 ? 6 : new Date(viewYear, viewMonth, CHANGE_MEDay).getDay() - 1]}
+                </p>
+                <h3 className="mt-0.5 truncate text-base font-heading font-bold text-foreground-900">{MONTH_NAMES[viewMonth]} {CHANGE_MEDay}, {viewYear}</h3>
+              </div>
+              <button type="button" onClick={() => setShowDayDrawer(false)} className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-foreground-400 transition-smooth hover:bg-background-100 cursor-pointer"><AppIcon className="ri-close-line"></AppIcon></button>
+            </div>
+            <div className="flex-1 overflow-y-auto px-5 py-4">
+              {CHANGE_MEDaySorted.length === 0 ? (
+                <div className="flex flex-col items-center justify-center gap-3 py-10 text-center">
+                  <span className="flex h-11 w-11 items-center justify-center rounded-2xl bg-background-100"><AppIcon className={`${CHANGE_MEDateRestriction ? 'ri-calendar-close-line text-amber-500' : 'ri-calendar-2-line text-foreground-300'} text-lg`}></AppIcon></span>
+                  <p className={`text-sm ${CHANGE_MEDateRestriction ? 'max-w-xs font-semibold text-amber-800' : 'text-foreground-500'}`}>
+                    {CHANGE_MEDateRestriction || 'No events scheduled'}
+                  </p>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {CHANGE_MEDaySorted.map((ev) => {
+                    const [startTime, endTime] = ev.time.split('–');
+                    const meetingColor = learnerMeetingTypeColor(ev, calendarColors);
+                    const statusColor = learnerEventStatusColor(ev, calendarColors);
+                    return (
+                      <button
+                        key={ev.id}
+                        type="button"
+                        onClick={() => { setShowEventDetails(ev); setShowDayDrawer(false); }}
+                        className="group flex w-full items-start gap-3 rounded-xl border border-background-200 bg-background-50 p-3 text-left transition-smooth hover:border-primary-200 hover:bg-primary-50/20 cursor-pointer"
+                        style={meetingColor ? { backgroundColor: meetingColor.background, borderColor: `${meetingColor.accent}55` } : undefined}
+                      >
+                        <div className="w-12 shrink-0 pt-0.5">
+                          <p className="text-[11px] font-bold leading-tight text-foreground-700">{startTime}</p>
+                          {endTime && <p className="text-[10px] leading-tight text-foreground-400">{endTime}</p>}
+                        </div>
+                        <span className={`mt-1 h-2 w-2 shrink-0 rounded-full ${meetingColor ? '' : getEventDotColor(ev.type, ev.color)}`} style={meetingColor ? { backgroundColor: meetingColor.accent } : undefined}></span>
+                        <div className="min-w-0 flex-1">
+                          <p className="truncate text-sm font-semibold text-foreground-900 transition-colors group-hover:text-primary-700">{ev.title}</p>
+                          <div className="mt-0.5 flex items-center gap-2">
+                            <span className="text-[10px] font-semibold uppercase tracking-wide text-foreground-400">{ev.type}</span>
+                            <span className="rounded-full px-1.5 py-0.5 text-[10px] font-semibold" style={{ backgroundColor: statusColor.background, color: statusColor.accent }}>{statusConfig[ev.status].label}</span>
+                          </div>
+                        </div>
+                        <AppIcon className="ri-arrow-right-s-line mt-1 shrink-0 text-foreground-300 transition-colors group-hover:text-primary-500"></AppIcon>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+        </>
+      )}
+
+      <PageContainer className="learner-calendar-page">
+
+        {(schedulingError || importedBooking.error) && <p role="alert" className="mb-4 rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-700">{schedulingError || importedBooking.error}</p>}
+        {calendarError && (
+          <div className="rounded-xl border border-red-200/70 bg-red-50 px-4 py-3 flex items-center gap-3 shadow-sm">
+            <AppIcon className="ri-error-warning-line text-red-500"></AppIcon>
+            <p className="text-sm text-red-700">Could not load your coaching sessions: {calendarError}</p>
+            <button type="button" onClick={refreshCalendar} className="shrink-0 text-sm font-semibold text-red-700 underline">Retry calendar</button>
+          </div>
+        )}
+        {calendarLoading && !calendarError && (
+          <div className="rounded-xl border border-foreground-200/70 bg-background-50 p-4 shadow-sm">
+            <RowsSkeleton rows={3} avatar={false} />
+          </div>
+        )}
+
+        {/* ═══════════ COMPACT HEADER ═══════════ */}
+        <PageHeader
+          icon="ri-calendar-2-line"
+          title="My Calendar"
+          description="Sessions, coaching and club events — all in one place"
+          className="calendar-page-header"
+          decoration={<LearnerCalendarHeroArt />}
+          actions={
+            <>
+              <button
+                onClick={() => openBookSession()}
+                className="inline-flex h-[42px] min-w-[181px] cursor-pointer items-center justify-center gap-2 rounded-xl bg-primary-600 px-4 text-[13px] font-semibold text-white transition-smooth hover:bg-primary-700"
+              >
+                <AppIcon className="ri-user-star-line text-[15px]"></AppIcon>
+                Book Coach Session
+              </button>
+              <CalendarMoreMenu
+                connectedCount={calendarConnections.length}
+                onConnectCalendar={() => { setConnectionError(null); setShowCalendarConnect(true); }}
+                onShare={() => setShowShareCalendar(true)}
+                onExportAll={handleExportAllICS}
+              />
+            </>
+          }
+        />
+
+        {/* ═══════════ TOP BAR: VIEW TOGGLE + NAV ═══════════ */}
+        <Panel padding="sm" className="border border-foreground-200/70 shadow-sm">
+          <div className="flex flex-col items-start justify-between gap-3 sm:flex-row sm:items-center sm:gap-4">
+          <div className="grid w-full grid-cols-3 items-center gap-1 rounded-xl bg-background-100 p-1 sm:flex sm:w-auto">
+            {([{ key: 'monthly' as ViewMode, label: 'Month', icon: 'ri-calendar-2-line' },{ key: 'weekly' as ViewMode, label: 'Week', icon: 'ri-calendar-view' },{ key: 'daily' as ViewMode, label: 'Day', icon: 'ri-calendar-line' }]).map((v) => (
+              <button key={v.key} onClick={() => setViewMode(v.key)} className={`flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold transition-smooth whitespace-nowrap cursor-pointer sm:px-4 ${viewMode === v.key ? 'bg-background-50 text-foreground-900 shadow-sm' : 'text-foreground-500 hover:text-foreground-700'}`}><AppIcon className={`${v.icon} text-sm`}></AppIcon>{v.label}</button>
+            ))}
+          </div>
+          <div className="flex items-center gap-2 w-full sm:w-auto justify-between sm:justify-end">
+            <button onClick={handleToday} className="px-3 py-1.5 text-xs font-semibold text-primary-600 bg-primary-100 rounded-lg hover:bg-primary-200 transition-smooth cursor-pointer whitespace-nowrap">Today</button>
+            <div className="flex items-center gap-1">
+              <button aria-label={`Previous ${viewMode === 'monthly' ? 'month' : viewMode === 'weekly' ? 'week' : 'day'}`} onClick={handlePrev} className="w-8 h-8 rounded-lg flex items-center justify-center text-foreground-400 hover:bg-background-100 transition-smooth cursor-pointer"><AppIcon className="ri-arrow-left-s-line"></AppIcon></button>
+              <span className="text-sm font-heading font-bold text-foreground-900 min-w-[130px] text-center whitespace-nowrap">{viewMode === 'daily' ? `${DAYS_OF_WEEK[new Date(viewYear, viewMonth, CHANGE_MEDay).getDay() === 0 ? 6 : new Date(viewYear, viewMonth, CHANGE_MEDay).getDay() - 1]}, ${CHANGE_MEDay} ${MONTH_NAMES[viewMonth]} ${viewYear}` : `${MONTH_NAMES[viewMonth]} ${viewYear}`}</span>
+              <button aria-label={`Next ${viewMode === 'monthly' ? 'month' : viewMode === 'weekly' ? 'week' : 'day'}`} onClick={handleNext} className="w-8 h-8 rounded-lg flex items-center justify-center text-foreground-400 hover:bg-background-100 transition-smooth cursor-pointer"><AppIcon className="ri-arrow-right-s-line"></AppIcon></button>
+            </div>
+          </div>
+          </div>
+        </Panel>
+
+        <Panel padding="sm" className="calendar-filter-host min-w-0 border border-[#E8DDF3] shadow-[0_4px_18px_rgba(79,45,127,0.06)]">
+          <div className="flex flex-col gap-3">
+            <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+              <div className="relative w-full xl:max-w-md">
+                <AppIcon className="ri-search-line pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-sm text-foreground-400"></AppIcon>
+                <input
+                  value={searchTerm}
+                  onChange={(event) => setSearchTerm(event.target.value)}
+                  placeholder="Search events, session types or coach..."
+                  className="h-10 w-full rounded-xl border border-foreground-200 bg-white pl-9 pr-3 text-sm font-medium text-foreground-800 outline-none transition-smooth placeholder:text-foreground-400 focus:border-primary-300 focus:ring-2 focus:ring-primary-100"
+                />
+              </div>
+              {(searchTerm || filterSource !== 'all' || filterStatus !== 'all') && (
+                <button
+                  type="button"
+                  onClick={() => { setSearchTerm(''); setFilterSource('all'); setFilterStatus('all'); }}
+                  className="inline-flex h-10 items-center justify-center gap-2 rounded-xl border border-foreground-200 bg-white px-3 text-xs font-bold text-foreground-600 transition-smooth hover:bg-background-100 cursor-pointer"
+                >
+                  <AppIcon className="ri-filter-off-line"></AppIcon>
+                  Clear filters
+                </button>
+              )}
+              <button type="button" onClick={() => setColorPreferencesOpen(true)}
+                className="inline-flex h-9 shrink-0 items-center justify-center gap-1.5 rounded-lg border-0 bg-[#F1ECF8] px-2.5 text-[11px] font-bold text-[#4F2D7F] shadow-sm transition hover:bg-[#E8DDF3] focus:outline-none focus:ring-2 focus:ring-[#4F2D7F]/25">
+                <AppIcon className="ri-palette-fill text-[13px]" />
+                Customise colours
+              </button>
+            </div>
+            <div className="calendar-filter-layout mt-3 min-w-0">
+              <section className="calendar-filter-card flex min-w-0 flex-col overflow-hidden rounded-2xl border border-[#E8DDF3] bg-white shadow-[0_4px_18px_rgba(79,45,127,0.06)]" aria-labelledby="learner-calendar-source-filters-title">
+                <div>
+                  <h3 id="learner-calendar-source-filters-title" className="text-sm font-heading font-bold text-slate-900">Filter by source</h3>
+                  <p className="mt-0.5 text-[11px] text-slate-500">View events by source.</p>
+                </div>
+                <CalendarFilterScrollRow ariaLabel="Calendar source filters">
+                  {sourceFilters.map((option) => {
+                    const source = option.key;
+                    const isActive = filterSource === source;
+                    const matchingEvent = displayedEvents.find(event => learnerEventSource(event, reviewTypeLookup) === source && event.source);
+                    const fallbackMeetingType: MeetingTypeKey = source === 'live-session' ? 'live-session'
+                      : source === 'catch-up' ? 'catch-up'
+                        : source === 'student-support' ? 'support'
+                          : 'other';
+                    const sourceColor = source === 'all'
+                      ? calendarColors.statuses.all
+                      : calendarColors.meetingTypes[matchingEvent ? getMeetingTypeKey(matchingEvent) : fallbackMeetingType];
+                    return (
+                      <button key={source} type="button" onClick={() => setFilterSource(source)} title={`${option.longLabel} (${sourceFilterCounts[source]})`} aria-pressed={isActive}
+                        className={`calendar-filter-pill inline-flex items-center gap-2 rounded-xl border text-[11px] font-semibold transition focus:outline-none focus:ring-2 focus:ring-[#4F2D7F]/20 ${isActive ? 'border-[#C9B9DD] bg-[#F7F3FB] text-[#4F2D7F] shadow-sm' : 'border-slate-200 bg-white text-slate-700 hover:border-[#D8CCE8] hover:bg-slate-50'}`}>
+                        <span className="h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: isActive ? '#4F2D7F' : sourceColor.accent }} />
+                        <span>{option.label}</span>
+                        <span className={`rounded-full px-1.5 py-0.5 text-[10px] font-bold ${isActive ? 'bg-[#E8DDF3] text-[#4F2D7F]' : 'bg-slate-100 text-slate-500'}`}>{sourceFilterCounts[source]}</span>
+                      </button>
+                    );
+                  })}
+                </CalendarFilterScrollRow>
+              </section>
+              <section className="calendar-filter-card flex min-w-0 flex-col overflow-hidden rounded-2xl border border-[#E8DDF3] bg-white shadow-[0_4px_18px_rgba(79,45,127,0.06)]" aria-labelledby="learner-calendar-status-filters-title">
+                <div>
+                  <h3 id="learner-calendar-status-filters-title" className="text-sm font-heading font-bold text-slate-900">Status colours</h3>
+                  <p className="mt-0.5 text-[11px] text-slate-500">Track your sessions at a glance.</p>
+                </div>
+                <CalendarFilterScrollRow ariaLabel="Calendar status filters">
+                  {LEARNER_STATUS_FILTERS.map((status) => {
+                    const meta = LEARNER_STATUS_META[status];
+                    const color = calendarColors.statuses[LEARNER_STATUS_COLOR_KEYS[status]];
+                    const isActive = filterStatus === status;
+                    return (
+                      <button key={status} type="button" onClick={() => setFilterStatus(status)} title={`${meta.label} (${statusFilterCounts[status]})`} aria-pressed={isActive}
+                        className="calendar-filter-pill inline-flex items-center gap-2 rounded-xl text-[11px] font-bold shadow-sm transition hover:brightness-[0.98] focus:outline-none focus:ring-2 focus:ring-[#4F2D7F]/20"
+                        style={{ backgroundColor: isActive ? '#4F2D7F' : color.background, color: isActive ? '#FFFFFF' : color.accent, border: `1px solid ${isActive ? '#4F2D7F' : color.accent}40` }}>
+                        <span className="h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: isActive ? '#FFFFFF' : color.accent }} />
+                        <span>{meta.label}</span>
+                        <span className={`rounded-full px-1.5 py-0.5 text-[10px] font-bold ${isActive ? 'bg-white/20 text-white' : 'bg-white/70'}`}>{statusFilterCounts[status]}</span>
+                      </button>
+                    );
+                  })}
+                </CalendarFilterScrollRow>
+              </section>
+            </div>
+          </div>
+        </Panel>
+
+        {/* ═══════════ MAIN CONTENT ═══════════ */}
+        <div className="grid grid-cols-1 items-start gap-4">
+
+          {/* Calendar */}
+          <div className="space-y-4">
+
+            {viewMode !== 'monthly' && untimedEvents.length > 0 && (
+              <section aria-label="Sessions awaiting a time" className="rounded-2xl border border-foreground-200 bg-background-50 p-4">
+                <h3 className="mb-3 text-sm font-semibold text-foreground-900">Time to be confirmed</h3>
+                <div className="flex flex-wrap gap-2">
+                  {untimedEvents.map(event => (
+                    <button key={event.id} type="button" aria-haspopup="dialog" onClick={() => setShowEventDetails(event)}
+                      className="rounded-xl border border-primary-200 bg-primary-50 px-3 py-2 text-left text-sm text-primary-800">
+                      <span className="block font-semibold">{event.title}</span>
+                      <span className="text-xs">{event.date}</span>
+                    </button>
+                  ))}
+                </div>
+              </section>
+            )}
+
+            {/* MONTHLY VIEW */}
+            {viewMode === 'monthly' && (
+              <div className="overflow-hidden rounded-2xl border border-foreground-200/70 bg-background-50 shadow-sm">
+                {/* Day headers */}
+                <div className="grid grid-cols-7 border-b border-foreground-100">
+                  {DAYS_OF_WEEK.map((day, i) => (
+                    <div key={day} className={`px-1 py-3 text-center sm:px-2 ${i >= 5 ? 'bg-background-100/60' : 'bg-background-100/30'}`}>
+                      <span className="text-[10px] font-semibold uppercase tracking-wide text-foreground-500 sm:text-xs sm:tracking-wider">{day}</span>
+                    </div>
+                  ))}
+                </div>
+                {/* Day cells */}
+                <div className="grid grid-cols-7">
+                  {monthCells.map((day, idx) => {
+                    if (day === null) return <div key={`empty-${idx}`} className="min-h-[11.5rem] border-b border-r border-foreground-100 bg-background-50/40" />;
+                    const eventsForDay = getEventsForDay(day, viewMonth);
+                    const isSel = day === CHANGE_MEDay && viewMode === 'monthly';
+                    const isTdy = isToday(day, viewMonth, viewYear);
+                    const isoDate = `${viewYear}-${String(viewMonth + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+                    const dateRestriction = bookingDateRestriction(isoDate);
+                    const isPastDate = isoDate < bookingToday;
+                    const isClosedDate = Boolean(dateRestriction && !isPastDate);
+                    const cellDate = new Date(viewYear, viewMonth, day, 12, 0, 0);
+                    const isWeekend = cellDate.getDay() === 0 || cellDate.getDay() === 6;
+                    const isBankHoliday = bankHolidayByDate.has(isoDate);
+                    const missingHolidayCoverage = Boolean(bookingCalendar && !bookingCalendar.coveredYears.includes(viewYear));
+                    const showClosedBadge = Boolean(dateRestriction && (!isPastDate || isWeekend || isBankHoliday || missingHolidayCoverage));
+                    const visibleEvents = eventsForDay.slice(0, 3);
+                    const extraCount = eventsForDay.length - visibleEvents.length;
+                    return (
+                      <div
+                        key={`d-${day}`}
+                        onClick={() => { setSelectedDay(day); setShowDayDrawer(false); }}
+                        title={dateRestriction || undefined}
+                        className={`relative flex min-h-[11.5rem] cursor-pointer flex-col border-b border-r border-foreground-100 p-1 text-left transition-all duration-150 hover:z-10 sm:p-1.5 ${isClosedDate ? 'bg-background-100/80' : 'bg-background-50 hover:bg-primary-50/20'} ${isSel ? 'z-10 border-primary-300 bg-primary-50/60 ring-1 ring-primary-300 ring-inset' : isTdy ? 'bg-primary-50/15' : ''}`}
+                      >
+                        <button type="button" aria-label={`Select ${day} ${MONTH_NAMES[viewMonth]} ${viewYear}`} className={`mb-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[11px] font-semibold sm:mb-1 sm:h-6 sm:w-6 sm:text-xs ${isSel ? 'bg-primary-100 text-primary-800' : isTdy ? 'bg-primary-500 text-white' : 'text-foreground-500'}`}>{day}</button>
+                        {showClosedBadge && (
+                          <span className="absolute right-1 top-1 inline-flex items-center gap-0.5 rounded-full bg-primary-50 px-1.5 py-0.5 text-[8px] font-bold uppercase text-primary-700 ring-1 ring-primary-100 sm:text-[9px]">
+                            <AppIcon className="ri-lock-line" />Closed
+                          </span>
+                        )}
+                        <div className="flex-1 w-full overflow-hidden space-y-1 min-w-0">
+                          {visibleEvents.map((ev) => {
+                            if (ev.type === 'Busy') {
+                              return (
+                                <div key={ev.id} className="flex w-full items-center gap-1 rounded bg-slate-200 px-1.5 py-0.5 text-slate-700" title={`Busy · ${ev.time}`}>
+                                  <AppIcon className="ri-lock-line shrink-0 text-[9px]" />
+                                  <span className="truncate text-[10px] font-semibold leading-tight">Busy · {ev.time.split('–')[0]}</span>
+                                </div>
+                              );
+                            }
+                            const sourceMeta = learnerSourceMeta(ev, reviewTypeLookup);
+                            const statusMeta = LEARNER_STATUS_META[learnerEventStatus(ev)];
+                            const meetingColor = learnerMeetingTypeColor(ev, calendarColors);
+                            const statusColor = learnerEventStatusColor(ev, calendarColors);
+                            return (
+                              <button
+                                type="button"
+                                aria-haspopup="dialog"
+                                key={ev.id}
+                                onClick={(event) => { event.stopPropagation(); setShowEventDetails(ev); }}
+                                className={`w-full rounded-lg border px-2 py-1 text-left shadow-sm transition-all duration-150 hover:-translate-y-0.5 hover:brightness-95 ${getEventColorClass(ev.type, ev.color).replace('border-l-', 'border-')}`}
+                                style={meetingColor ? { backgroundColor: meetingColor.background, borderColor: `${meetingColor.accent}55`, color: meetingColor.accent } : undefined}
+                                title={`${learnerSourceMeta(ev, reviewTypeLookup).label} · ${ev.title}`}
+                              >
+                                <div className="flex min-w-0 items-center gap-1.5">
+                                  <span className={`h-2 w-2 shrink-0 rounded-full ${sourceMeta.dot}`}></span>
+                                  <span className="shrink-0 text-[11px] font-bold leading-tight tabular-nums">{ev.timeToBeConfirmed ? 'TBC' : ev.time.split('–')[0]}</span>
+                                  <span className="truncate text-[11px] font-bold leading-tight">{ev.title}</span>
+                                </div>
+                                <div className="mt-1 flex min-w-0 items-center justify-between gap-1.5">
+                                  {(ev.host || ev.club) && <span className="min-w-0 truncate text-[10px] font-medium opacity-75">{ev.host || ev.club}</span>}
+                                  <span
+                                    aria-label={`${statusMeta.label} status`}
+                                    className="ml-auto inline-flex shrink-0 items-center gap-1 rounded-full px-1.5 py-0.5 text-[8px] font-extrabold leading-none ring-1 ring-inset sm:text-[9px]"
+                                    style={{ backgroundColor: statusColor.background, color: statusColor.accent, borderColor: `${statusColor.accent}40` }}
+                                  >
+                                    <span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ backgroundColor: statusColor.accent }}></span>
+                                    {statusMeta.label}
+                                  </span>
+                                </div>
+                              </button>
+                            );
+                          })}
+                          {extraCount > 0 && <button type="button" onClick={event => { event.stopPropagation(); setSelectedDay(day); setShowDayDrawer(true); }} className="block w-full rounded-md bg-white/80 px-2 py-0.5 text-[10px] font-bold text-primary-700 ring-1 ring-primary-100">+{extraCount} more</button>}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {viewMode === 'monthly' && (
+              <Panel className="border border-foreground-200/70 shadow-sm">
+                <div className="mb-4 flex items-center justify-between gap-3">
+                  <div>
+                    <h3 className="text-sm font-heading font-bold text-foreground-950">{CHANGE_MEDayLabel}</h3>
+                    <p className="text-xs text-foreground-400">
+                      {CHANGE_MEDayEvents.length} event{CHANGE_MEDayEvents.length === 1 ? '' : 's'} match your current filters
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setViewMode('daily')}
+                    className="inline-flex items-center gap-1.5 rounded-xl px-3 py-2 text-xs font-bold text-primary-700 transition-smooth hover:bg-primary-50 cursor-pointer"
+                  >
+                    Day view
+                    <AppIcon className="ri-arrow-right-line"></AppIcon>
+                  </button>
+                </div>
+                {CHANGE_MEDaySorted.length > 0 ? (
+                  <div className="space-y-2">
+                    {CHANGE_MEDaySorted.map((ev) => {
+                      const eventSource = ev.source;
+                      const sourceMeta = learnerSourceMeta(ev, reviewTypeLookup);
+                      const statusMeta = LEARNER_STATUS_META[learnerEventStatus(ev)];
+                      const meetingColor = learnerMeetingTypeColor(ev, calendarColors);
+                      const statusColor = learnerEventStatusColor(ev, calendarColors);
+                      return (
+                        <button
+                          key={ev.id}
+                          type="button"
+                          onClick={() => setShowEventDetails(ev)}
+                          className={`group flex w-full items-center gap-3 rounded-xl border px-3 py-3 text-left transition-all duration-150 hover:-translate-y-0.5 hover:shadow-sm cursor-pointer ${getEventColorClass(ev.type, ev.color).replace('border-l-', 'border-')}`}
+                          style={meetingColor ? { backgroundColor: meetingColor.background, borderColor: `${meetingColor.accent}55`, color: meetingColor.accent } : undefined}
+                        >
+                          <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-white/75 shadow-sm">
+                            <AppIcon className={`${eventSource === 'live-session' ? 'ri-video-chat-line' : ev.reviewTemplateId ? 'ri-file-list-3-line' : eventSource === 'student-support' ? 'ri-heart-2-line' : eventSource === 'other' ? 'ri-more-line' : ev.type === 'Busy' ? 'ri-lock-line' : 'ri-chat-3-line'} text-primary-600`}></AppIcon>
+                          </span>
+                          <div className="min-w-0 flex-1">
+                            <div className="mb-1 flex min-w-0 items-center gap-1.5">
+                              <span className={`h-2 w-2 shrink-0 rounded-full ${meetingColor ? '' : sourceMeta.dot}`} style={meetingColor ? { backgroundColor: meetingColor.accent } : undefined}></span>
+                              <p className="truncate text-sm font-heading font-bold text-foreground-950">{ev.title}</p>
+                            </div>
+                            <p className="truncate text-xs font-medium text-foreground-500">
+                              {ev.timeToBeConfirmed ? 'Time to be confirmed' : ev.time} · {ev.club}
+                            </p>
+                          </div>
+                          <span aria-label={`${statusMeta.label} status`} className="inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-bold ring-1 ring-inset" style={{ backgroundColor: statusColor.background, color: statusColor.accent, borderColor: `${statusColor.accent}40` }}>
+                            <span className="h-1.5 w-1.5 rounded-full" style={{ backgroundColor: statusColor.accent }}></span>
+                            {statusMeta.label}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-3 rounded-xl border border-dashed border-background-300 bg-background-50 px-4 py-5">
+                    <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-background-100 text-foreground-400">
+                      <AppIcon className="ri-calendar-event-line"></AppIcon>
+                    </span>
+                    <div>
+                      <p className="text-sm font-bold text-foreground-900">No events on this day</p>
+                      <p className="text-xs text-foreground-500">Try another date or clear your filters.</p>
+                    </div>
+                  </div>
+                )}
+              </Panel>
+            )}
+
+            {/* WEEKLY VIEW */}
+            {viewMode === 'weekly' && (
+              <div className="overflow-x-auto rounded-2xl border border-foreground-200/70 bg-background-50 shadow-sm">
+                {/* Week day headers */}
+                <div className="grid min-w-[760px] grid-cols-8 border-b border-foreground-100">
+                  <div className="px-2 py-3 bg-background-100/30"></div>
+                  {weekDates.map((wd, idx) => {
+                    const isTdy = isToday(wd.day, wd.month, wd.year);
+                    const isSel = wd.day === CHANGE_MEDay && wd.month === viewMonth;
+                    return (
+                      <button key={`wh-${wd.day}-${wd.month}`} aria-label={`Select ${wd.day} ${wd.monthName} ${wd.year}`} onClick={() => { setSelectedDay(wd.day); setViewMonth(wd.month); setViewYear(wd.year); }}
+                        className={`px-2 py-3 text-center cursor-pointer transition-smooth ${isSel ? 'bg-primary-50/60' : 'hover:bg-background-100/50'} ${idx >= 5 ? 'bg-background-100/20' : ''}`}>
+                        <span className="text-[10px] font-semibold text-foreground-400 uppercase block">{DAYS_SHORT[idx]}</span>
+                        <span className={`text-sm font-bold inline-flex items-center justify-center w-7 h-7 rounded-full mt-1 ${isSel ? 'bg-primary-100 text-primary-800 ring-1 ring-primary-300' : isTdy ? 'bg-primary-500 text-white' : 'text-foreground-700'}`}>{wd.day}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+                {/* Time grid */}
+                <div className="overflow-y-auto max-h-[600px]">
+                  {timelineHours.map((hour) => {
+                    const isCurrentHourRow = viewMode === 'weekly' && currentHour === hour;
+                    return (
+                      <div key={`h-${hour}`} className={`grid min-w-[760px] grid-cols-8 border-b border-foreground-100 ${isCurrentHourRow ? 'bg-primary-50/15' : ''}`}>
+                        <div className="px-3 py-3 text-right border-r border-foreground-100">
+                          <span className="text-xs font-semibold text-foreground-400">{hour.toString().padStart(2, '0')}:00</span>
+                        </div>
+                        {weekDates.map((wd, wdi) => {
+                          const eventsInSlot = getEventsForDay(wd.day, wd.month, wd.year).filter((ev) => {
+                            if (ev.timeToBeConfirmed) return false;
+                            const startHour = parseInt(ev.time.split(':')[0]);
+                            return startHour === hour;
+                          });
+                          const isSel = wd.day === CHANGE_MEDay && wd.month === viewMonth;
+                          return (
+                            <div key={`ws-${wd.day}-${wd.month}-${hour}`}
+                              className={`min-h-[48px] p-0.5 relative cursor-pointer transition-smooth hover:bg-primary-50/15 ${isSel ? 'bg-primary-50/60' : ''} ${wdi >= 5 ? 'bg-background-100/10' : ''}`}
+                              onClick={() => { setSelectedDay(wd.day); setViewMonth(wd.month); setViewYear(wd.year); }}>
+                              {eventsInSlot.map((ev) => {
+                                const typeColor = getEventColorClass(ev.type, ev.color);
+                                return (
+                                  <button type="button" aria-haspopup="dialog" key={ev.id} className={`w-full text-left text-[10px] font-semibold px-1.5 py-1 rounded-md mb-0.5 truncate cursor-pointer border-l-2 hover:brightness-95 transition-all ${typeColor}`}
+                                    onClick={(e) => { e.stopPropagation(); setShowEventDetails(ev); }} title={`${ev.title} (${ev.time})`}>
+                                    <span className="text-[9px] text-foreground-400 block truncate">{ev.time.split('\u2013')[0]}</span>
+                                    {ev.title}
+                                  </button>
+                                );
+                              })}
+                              {isCurrentHourRow && eventsInSlot.length === 0 && (
+                                <div className="absolute inset-0 border-l-2 border-primary-400 opacity-40 rounded-full" />
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* DAILY VIEW */}
+            {viewMode === 'daily' && (
+              <div className="overflow-hidden rounded-2xl border border-foreground-200/70 bg-background-50 shadow-sm">
+                {/* Day header */}
+                <div className="flex items-center gap-4 border-b border-foreground-100 bg-background-100/30 px-5 py-4">
+                  <span className={`w-12 h-12 rounded-2xl flex items-center justify-center text-base font-bold ${isToday(CHANGE_MEDay, viewMonth, viewYear) ? 'bg-primary-500 text-white' : 'bg-background-100 text-foreground-700'}`}>{CHANGE_MEDay}</span>
+                  <div>
+                    <p className="text-sm font-heading font-bold text-foreground-900">{DAYS_OF_WEEK[new Date(viewYear, viewMonth, CHANGE_MEDay).getDay() === 0 ? 6 : new Date(viewYear, viewMonth, CHANGE_MEDay).getDay() - 1]}, {MONTH_NAMES[viewMonth]} {CHANGE_MEDay}, {viewYear}</p>
+                    <p className="text-xs text-foreground-400">{CHANGE_MEDayEvents.length} event{CHANGE_MEDayEvents.length !== 1 ? 's' : ''}</p>
+                  </div>
+                </div>
+                {/* Day timeline */}
+                <div className="overflow-y-auto max-h-[600px]">
+                  {timelineHours.map((hour) => {
+                    const eventsInSlot = CHANGE_MEDayEvents.filter((ev) => {
+                      if (ev.timeToBeConfirmed) return false;
+                      const startHour = parseInt(ev.time.split(':')[0]);
+                      return startHour === hour;
+                    });
+                    const isCurrentHourRow = currentHour === hour && isToday(CHANGE_MEDay, viewMonth, viewYear);
+                    return (
+                      <div key={`dh-${hour}`} className={`flex min-h-[64px] items-start border-b border-foreground-100 ${isCurrentHourRow ? 'bg-primary-50/15' : ''}`}>
+                        <div className="w-[72px] shrink-0 border-r border-foreground-100 px-4 py-3 text-right">
+                          <span className="text-xs font-semibold text-foreground-400">{hour.toString().padStart(2, '0')}:00</span>
+                        </div>
+                        <div className="flex-1 py-1.5 px-3 relative min-h-[64px]">
+                          {isCurrentHourRow && <div className="absolute left-0 top-2 bottom-2 w-0.5 bg-primary-400 rounded-full" />}
+                          <div className="space-y-1">
+                            {eventsInSlot.map((ev) => {
+                              const typeColor = getEventColorClass(ev.type, ev.color);
+                              const meetingColor = learnerMeetingTypeColor(ev, calendarColors);
+                              const statusColor = learnerEventStatusColor(ev, calendarColors);
+                              return (
+                                <button type="button" aria-haspopup="dialog" key={ev.id} className={`w-full text-left p-3 rounded-xl cursor-pointer hover:shadow-sm hover:brightness-95 transition-all duration-200 border-l-[3px] ${typeColor}`}
+                                  style={meetingColor ? { backgroundColor: meetingColor.background, borderColor: `${meetingColor.accent}55`, borderLeftColor: meetingColor.accent } : undefined}
+                                  onClick={() => setShowEventDetails(ev)}>
+                                  <div className="flex items-center justify-between mb-1">
+                                    <span className="text-sm font-semibold text-foreground-900">{ev.title}</span>
+                                    <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full" style={{ backgroundColor: statusColor.background, color: statusColor.accent }}>{statusConfig[ev.status].label}</span>
+                                  </div>
+                                  <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-foreground-500">
+                                    <span className="flex items-center gap-1"><AppIcon className="ri-time-line text-foreground-400 text-xs"></AppIcon>{ev.time}</span>
+                                    <span className="flex items-center gap-1"><AppIcon className="ri-map-pin-line text-foreground-400 text-xs"></AppIcon>{ev.location}</span>
+                                    {ev.club !== 'Personal' && <span className="flex items-center gap-1"><AppIcon className="ri-team-line text-foreground-400 text-xs"></AppIcon>{ev.club}</span>}
+                                  </div>
+                                </button>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+          </div>
+
+          {/* Upcoming events */}
+          <div className="space-y-4">
+
+            {/* Upcoming Events */}
+            <Panel>
+              <SectionHeader title="Next 7 days" icon="ri-calendar-todo-line" />
+              <div className="mt-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
+                {upcomingEvents.slice(0, 8).map((ev) => {
+                  const sourceMeta = learnerSourceMeta(ev, reviewTypeLookup);
+                  const statusMeta = LEARNER_STATUS_META[learnerEventStatus(ev)];
+                  return (
+                  <button type="button" aria-haspopup="dialog" key={ev.id} className="w-full text-left flex items-start gap-3 rounded-xl border border-background-200 bg-background-50 p-2.5 transition-smooth hover:border-primary-200 hover:bg-primary-50/20 cursor-pointer group" onClick={() => setShowEventDetails(ev)}>
+                    <div className="w-11 shrink-0 rounded-lg bg-background-100 px-2 py-2 text-center">
+                      <p className="text-[10px] font-bold text-foreground-500 leading-tight">{ev.date.split(' ')[0]}</p>
+                      <p className="text-[9px] font-semibold text-foreground-400 leading-tight">{ev.date.split(' ')[1]}</p>
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="mb-1 flex flex-wrap items-center gap-1">
+                        <span className={`h-1.5 w-1.5 rounded-full ${sourceMeta.dot}`}></span>
+                        <span className="rounded-full bg-primary-50 px-1.5 py-0.5 text-[9px] font-bold text-primary-700">{sourceMeta.short}</span>
+                        <span className="rounded-full bg-background-100 px-1.5 py-0.5 text-[9px] font-bold text-foreground-500">{statusMeta.label}</span>
+                      </div>
+                      <p className="text-sm font-semibold text-foreground-900 group-hover:text-primary-700 transition-colors leading-tight truncate">{ev.title}</p>
+                      <div className="flex items-center gap-2 mt-0.5">
+                        <span className="text-xs text-foreground-400">{ev.timeToBeConfirmed ? 'Time to be confirmed' : ev.time}</span>
+                      </div>
+                    </div>
+                  </button>
+                  );
+                })}
+                {upcomingEvents.length === 0 && (
+                  <div className="flex items-center gap-2 rounded-xl bg-background-100/60 px-3 py-2.5">
+                    <AppIcon className="ri-calendar-2-line text-sm text-foreground-300"></AppIcon>
+                    <p className="text-xs text-foreground-400">No events in the next 7 days match these filters</p>
+                  </div>
+                )}
+              </div>
+            </Panel>
+          </div>
+
+        </div>
+      </PageContainer>
+      <CalendarColorPreferencesDrawer
+        open={colorPreferencesOpen}
+        value={calendarColors}
+        onClose={handleCloseColorPreferences}
+        onSave={handleCalendarColorsSave}
+        activeMeetingTypeKeys={activeMeetingTypeKeys}
+      />
+    </>
+  );
+}

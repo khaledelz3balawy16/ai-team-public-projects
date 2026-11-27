@@ -1,0 +1,2257 @@
+import { useState, useRef, useEffect, useMemo, useCallback } from 'react';
+import { createPortal } from 'react-dom';
+import { Link, useNavigate } from 'react-router-dom';
+import { AppIcon } from '@/components/feature/AppIcon';
+import { WorkspaceShell } from '@/components/feature/WorkspaceShell';
+import { WorkspaceHeroBanner } from '@/components/feature/WorkspaceHeroBanner';
+import { fetchSharedJsonGet } from '@/lib/sharedGetJson';
+import { setCoachViewAs, withCoachViewAs } from '@/lib/coachViewAs';
+import { useAuth } from '@/hooks/useAuth';
+import { useCoachIdentity } from '@/hooks/useCoachIdentity';
+import { roleNavMap } from '@/mocks/navigation';
+import { CoachDirectoryPicker } from './CoachDirectoryPicker';
+import { AllCoachesCalendar } from './AllCoachesCalendar';
+import type { DirectoryCoach } from '@/api/coachDirectory';
+import { cn } from '@/lib/cn';
+import { ATTENDANCE_EXPECTED_RATE, ATTENDANCE_MINIMUM_RATE, formatHoursMinutes } from '@/lib/format';
+import { toneStyle, type StatusTone } from '@/lib/statusTone';
+import { WorkspaceDashboardLayout } from '@/components/feature/WorkspaceDashboardLayout';
+import { SectionHeader, SectionLabel } from '@/components/ui/SectionHeader';
+import { MetricCard, CompactMetric, MetricRow } from '@/components/ui/MetricCard';
+import { StatusBadge } from '@/components/ui/StatusBadge';
+import { EmptyState } from '@/components/ui/EmptyState';
+import { ActionRow } from '@/components/ui/ActionRow';
+import { Panel } from '@/components/ui/Panel';
+import { PageTabs, type PageTabItem } from '@/components/ui/PageTabs';
+import { FilterChip } from '@/components/ui/FilterToolbar';
+import type { ImportedReview } from '@/api/reviewHistory';
+import { LearnerAvatar, ReasonLine } from '@/pages/coach/shared/LearnerIdentity';
+import {
+  type CoachCalendarEvent,
+  eventDisplayDate,
+  eventTargetDate,
+  eventPeriodLabel,
+  formatDateLabel,
+  formatTimeLabel,
+  isAtRiskEvent,
+  currentWeekRange,
+  isCompletedEvent,
+  isEventThisWeek,
+  needsScheduling,
+  parseLocalDate,
+  sortEvents,
+  startOfDay,
+} from '../../coach/shared/calendarEvents';
+
+const coachNav = roleNavMap.coach;
+
+type DashboardKpi = 'caseload' | 'active' | 'on-break' | 'on-track' | 'at-risk' | 'need-attention' | 'completed' | 'epa' | 'evidence' | 'reviews';
+type OtjhStatusKey = 'at-risk' | 'need-attention' | 'on-track' | 'unknown';
+type PerformanceStatus = 'on-track' | 'at-risk' | 'high' | 'new-starter';
+type ScheduleStatus = 'upcoming' | 'overdue' | 'needs-schedule' | 'none';
+
+const EMPTY_VALUE = '--';
+const AT_RISK_SCROLL_THRESHOLD = 8;
+const COACHING_CALENDAR_WINDOW_DAYS = 7;
+
+function coachDashboardEndpoint() {
+  return '/coach_api/coach/dashboard';
+}
+
+function toIsoDate(value: Date) {
+  const year = value.getFullYear();
+  const month = String(value.getMonth() + 1).padStart(2, '0');
+  const day = String(value.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+interface CoachLearner {
+  id: string;
+  name: string;
+  initials: string;
+  /** 'commercial' | 'apprenticeship' — which learner_detail table this id resolves against. */
+  learnerType?: 'commercial' | 'apprenticeship';
+  aptemId?: string | null;
+  /** enrolment."Created_users".id -- a different, disjoint pk space from `id`
+   *  above. /learner-detail/ needs this one, not the LearnerProfile id. */
+  enrolmentId?: string | null;
+  /** Which module/week otjhTarget's cumulative-to-date figure currently falls in. */
+  currentModule?: string | null;
+  currentWeek?: string | null;
+  componentsTargetToDate?: number | null;
+  programme: string;
+  cohortName?: string | null;
+  group: string;
+  employer: string;
+  avatar: string;
+  status: PerformanceStatus;
+  riskFlags: string[];
+  overallProgress: number;
+  overallProgressAvailable?: boolean;
+  attendanceRate: number;
+  attendanceRateAvailable?: boolean;
+  otjhCompleted: number;
+  otjhTarget: number;
+  otjhStatus?: string | null;
+  ksbProgress: number;
+  ksbProgressAvailable?: boolean;
+  /** Distinct KSB codes evidenced in the audit mapping. A count, not a
+   *  percentage -- the mapping spans several standards, so it carries no
+   *  per-learner denominator. Matches the learner's own workspace. */
+  ksbEvidencedCount?: number | null;
+  evidenceCount: number;
+  evidenceCountAvailable?: boolean;
+  evidenceCompletedCount: number;
+  nextCoaching: string;
+  nextCoachingStatus?: ScheduleStatus;
+  nextReview: string;
+  nextReviewStatus?: ScheduleStatus;
+  lastContact: string;
+  recentFlag: string | null;
+  email?: string | null;
+  rawProgramStatus?: string | null;
+  mcmReviews: ImportedReview[];
+  reviews: ImportedReview[];
+}
+
+interface CaseloadApiLearner extends Partial<CoachLearner> {
+  cohortName?: string | null;
+}
+
+interface CaseloadApiResponse {
+  owner?: {
+    name?: string;
+    email?: string;
+  };
+  learners?: CaseloadApiLearner[];
+}
+
+interface CoachAssignedGroup {
+  id: string;
+  name: string;
+  programmeId?: string;
+  programme: string;
+  cohortId?: string;
+  cohort: string;
+  coach: string;
+  status: string;
+  schedule: string;
+  startDate?: string;
+  endDate?: string;
+}
+
+interface CoachDashboardApiResponse extends CaseloadApiResponse {
+  attendance?: AttendanceApiResponse;
+  reviewHistory?: {
+    learners?: ReviewHistoryApiLearner[];
+  };
+  timetable?: {
+    events?: CoachCalendarEvent[];
+  };
+  evidence?: MarkingQueueResponse;
+  assignedGroups?: CoachAssignedGroup[];
+  errors?: Record<string, string>;
+}
+
+interface AttendanceApiLearner {
+  id: string;
+  learner: string;
+  email?: string | null;
+  attendance: number | null;
+  hasAttendance?: boolean;
+}
+
+interface AttendanceApiResponse {
+  learners?: AttendanceApiLearner[];
+}
+
+interface ReviewHistoryApiLearner {
+  id: string;
+  aptemId?: string | null;
+  mcm?: ImportedReview[];
+  reviews?: ImportedReview[];
+}
+
+function displayValue(value?: string | number | null): string {
+  if (value === null || value === undefined) return EMPTY_VALUE;
+  const text = String(value).trim();
+  if (!text || text === EMPTY_VALUE || text === '—') return EMPTY_VALUE;
+  return text;
+}
+
+function optionalDisplayValue(value?: string | number | null): string | undefined {
+  const text = displayValue(value);
+  return text === EMPTY_VALUE ? undefined : text;
+}
+
+function normalizeIdentity(value?: string | number | null): string {
+  return displayValue(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '');
+}
+
+function assignmentValuesMatch(left?: string | number | null, right?: string | number | null): boolean {
+  const leftKey = normalizeIdentity(left);
+  const rightKey = normalizeIdentity(right);
+  return Boolean(leftKey && rightKey && leftKey === rightKey);
+}
+
+function learnerBelongsToAssignedGroup(learner: CoachLearner, group: CoachAssignedGroup): boolean {
+  if (!assignmentValuesMatch(learner.group, group.name)) return false;
+  const groupCohort = displayValue(group.cohort);
+  const groupProgramme = displayValue(group.programme);
+  const cohortMatches = groupCohort === EMPTY_VALUE || assignmentValuesMatch(learner.cohortName, group.cohort);
+  const programmeMatches = groupProgramme === EMPTY_VALUE || assignmentValuesMatch(learner.programme, group.programme);
+  return cohortMatches && programmeMatches;
+}
+
+function toNumber(value?: number | string | null): number {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
+  if (typeof value === 'string') {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+  return 0;
+}
+
+function clampPercent(value?: number | string | null): number {
+  return Math.max(0, Math.min(100, Math.round(toNumber(value))));
+}
+
+function statusFromApi(value?: string | null): PerformanceStatus {
+  if (value === 'at-risk' || value === 'high' || value === 'new-starter') return value;
+  return 'on-track';
+}
+
+function isVisibleRiskFlag(value?: string | null) {
+  const normalized = displayValue(value).toLowerCase();
+  return normalized !== EMPTY_VALUE
+    && !normalized.startsWith('variance')
+    && normalized !== 'otjh at risk';
+}
+
+function normalizeOtjhStatus(value?: string | null): OtjhStatusKey {
+  const normalized = displayValue(value).toLowerCase().replace(/[\s_-]+/g, '');
+  if (normalized === 'atrisk') return 'at-risk';
+  if (normalized === 'needattention' || normalized === 'needsattention') return 'need-attention';
+  if (normalized === 'ontrack') return 'on-track';
+  return 'unknown';
+}
+
+interface EvidenceQueueLearner {
+  id: string;
+  learnerId: string;
+  learner: string;
+  initials: string;
+  email?: string | null;
+  programme: string;
+  group: string;
+  pendingEvidence: number;
+  acceptedEvidence: number;
+  referredEvidence: number;
+  totalEvidence: number;
+  lastSubmission: string;
+  lastSubmissionIso?: string | null;
+  isOverdue: boolean;
+}
+
+interface MarkingQueueResponse {
+  items?: Partial<EvidenceQueueLearner>[];
+}
+
+function isActiveLearner(learner: CoachLearner): boolean {
+  return displayValue(learner.rawProgramStatus).toLowerCase().replace(/\s+/g, '') === 'active';
+}
+
+function normalizedProgramStatus(learner: CoachLearner): string {
+  return displayValue(learner.rawProgramStatus).toLowerCase().replace(/[\s_-]+/g, '');
+}
+
+function isOnBreakLearner(learner: CoachLearner): boolean {
+  return normalizedProgramStatus(learner).includes('break');
+}
+
+// Finished the programme. Matched on the canonical "Completed" status from
+// learner_api.constants, the value enrolment actually writes -- unlike the
+// gateway stage this replaced, which was never a programme status the platform
+// set, so that card could only ever read zero.
+function isCompletedLearner(learner: CoachLearner): boolean {
+  return normalizedProgramStatus(learner) === 'completed';
+}
+
+function isEpaLearner(learner: CoachLearner): boolean {
+  return normalizedProgramStatus(learner) === 'epa';
+}
+
+const OTJH_STATUS_META: Record<OtjhStatusKey, { label: string; sub: string; tone: StatusTone }> = {
+  'at-risk': { label: 'OTJH at risk', sub: 'OTJH at risk', tone: 'critical' },
+  'need-attention': { label: 'Need Attention', sub: 'Needs support', tone: 'caution' },
+  'on-track': { label: 'On Track', sub: 'On target', tone: 'positive' },
+  unknown: { label: EMPTY_VALUE, sub: 'No OTJH status', tone: 'neutral' },
+};
+
+function normalizeLearner(learner: CaseloadApiLearner, index: number): CoachLearner {
+  const name = displayValue(learner.name);
+  const fallbackName = name === EMPTY_VALUE ? `Learner ${index + 1}` : name;
+  const initials = displayValue(learner.initials);
+  const id = displayValue(learner.id);
+  const programme = displayValue(learner.programme) === EMPTY_VALUE ? displayValue(learner.cohortName) : displayValue(learner.programme);
+  const cohortName = displayValue(learner.cohortName);
+  const riskFlags = Array.isArray(learner.riskFlags) ? learner.riskFlags.filter(isVisibleRiskFlag) : [];
+  const recentFlag = isVisibleRiskFlag(learner.recentFlag) && !riskFlags.includes(String(learner.recentFlag))
+    ? String(learner.recentFlag)
+    : null;
+
+  return {
+    id: id === EMPTY_VALUE ? `learner-${index}` : id,
+    name: fallbackName,
+    initials: initials === EMPTY_VALUE ? fallbackName.slice(0, 2).toUpperCase() : initials,
+    learnerType: learner.learnerType,
+    enrolmentId: learner.enrolmentId,
+    currentModule: learner.currentModule,
+    currentWeek: learner.currentWeek,
+    componentsTargetToDate: learner.componentsTargetToDate,
+    programme,
+    cohortName: cohortName === EMPTY_VALUE ? null : cohortName,
+    group: displayValue(learner.group),
+    employer: displayValue(learner.employer),
+    avatar: displayValue(learner.avatar),
+    status: statusFromApi(learner.status),
+    riskFlags,
+    overallProgress: clampPercent(learner.overallProgress),
+    overallProgressAvailable: learner.overallProgressAvailable,
+    attendanceRate: 0,
+    attendanceRateAvailable: false,
+    otjhCompleted: toNumber(learner.otjhCompleted),
+    otjhTarget: Math.max(toNumber(learner.otjhTarget), 0),
+    otjhStatus: displayValue(learner.otjhStatus),
+    ksbProgress: clampPercent(learner.ksbProgress),
+    ksbProgressAvailable: learner.ksbProgressAvailable,
+    ksbEvidencedCount: learner.ksbEvidencedCount ?? null,
+    evidenceCount: toNumber(learner.evidenceCount),
+    evidenceCountAvailable: learner.evidenceCountAvailable,
+    evidenceCompletedCount: toNumber(learner.evidenceCompletedCount),
+    nextCoaching: displayValue(learner.nextCoaching),
+    nextCoachingStatus: 'none',
+    nextReview: displayValue(learner.nextReview),
+    nextReviewStatus: 'none',
+    lastContact: displayValue(learner.lastContact),
+    recentFlag,
+    email: learner.email || null,
+    rawProgramStatus: learner.rawProgramStatus || null,
+    mcmReviews: [],
+    reviews: [],
+  };
+}
+
+/** KSB as the learner's own workspace shows it: the number of distinct codes
+ *  evidenced. Falls back to the curriculum percentage for learners with no
+ *  audit mapping, and to "--" when neither figure exists. */
+function ksbCellValue(learner: CoachLearner): string {
+  if (learner.ksbEvidencedCount != null) return `${learner.ksbEvidencedCount}`;
+  return learner.ksbProgressAvailable ? `${learner.ksbProgress}%` : EMPTY_VALUE;
+}
+
+
+function findAttendanceRecord(learner: CoachLearner, attendanceLearners: AttendanceApiLearner[]) {
+  const learnerId = normalizeIdentity(learner.id);
+  const learnerEmail = normalizeIdentity(learner.email);
+  const learnerName = normalizeIdentity(learner.name);
+
+  return attendanceLearners.find((attendance) => {
+    const attendanceId = normalizeIdentity(attendance.id);
+    const attendanceEmail = normalizeIdentity(attendance.email);
+    const attendanceName = normalizeIdentity(attendance.learner);
+
+    return Boolean(
+      (learnerId && attendanceId && learnerId === attendanceId)
+      || (learnerEmail && attendanceEmail && learnerEmail === attendanceEmail)
+      || (learnerName && attendanceName && learnerName === attendanceName),
+    );
+  });
+}
+
+function mergeAttendanceRates(learners: CoachLearner[], attendanceLearners: AttendanceApiLearner[]): CoachLearner[] {
+  return learners.map((learner): CoachLearner => {
+    const attendance = findAttendanceRecord(learner, attendanceLearners);
+    const hasAttendance = Boolean(
+      attendance
+      && attendance.attendance !== null
+      && attendance.attendance !== undefined
+      && attendance.hasAttendance !== false,
+    );
+
+    return {
+      ...learner,
+      attendanceRate: hasAttendance ? clampPercent(attendance?.attendance) : 0,
+      attendanceRateAvailable: hasAttendance,
+    };
+  });
+}
+
+function mergeReviewHistory(learners: CoachLearner[], historyLearners: ReviewHistoryApiLearner[]): CoachLearner[] {
+  const byId = new Map(
+    historyLearners
+      .map((item) => [normalizeIdentity(item.id), item] as const)
+      .filter(([id]) => Boolean(id)),
+  );
+
+  return learners.map((learner) => {
+    const history = byId.get(normalizeIdentity(learner.id));
+    if (!history) return learner;
+    return {
+      ...learner,
+      aptemId: history.aptemId || null,
+      mcmReviews: Array.isArray(history.mcm) ? history.mcm : [],
+      reviews: Array.isArray(history.reviews) ? history.reviews : [],
+    };
+  });
+}
+
+function mergeEvidenceQueueIntoLearners(learners: CoachLearner[], queue: EvidenceQueueLearner[]): CoachLearner[] {
+  const byId = new Map<string, EvidenceQueueLearner>();
+  const byEmail = new Map<string, EvidenceQueueLearner>();
+  const byName = new Map<string, EvidenceQueueLearner>();
+
+  queue.forEach((item) => {
+    const learnerId = normalizeIdentity(item.learnerId || item.id);
+    const learnerEmail = normalizeIdentity(item.email);
+    const learnerName = normalizeIdentity(item.learner);
+    if (learnerId) byId.set(learnerId, item);
+    if (learnerEmail) byEmail.set(learnerEmail, item);
+    if (learnerName) byName.set(learnerName, item);
+  });
+
+  return learners.map((learner) => {
+    const match = byId.get(normalizeIdentity(learner.id))
+      || byEmail.get(normalizeIdentity(learner.email))
+      || byName.get(normalizeIdentity(learner.name));
+    if (!match) return learner;
+    return {
+      ...learner,
+      evidenceCount: toNumber(match.pendingEvidence),
+      evidenceCountAvailable: true,
+      evidenceCompletedCount: toNumber(match.acceptedEvidence),
+    };
+  });
+}
+
+function normalizeEvidenceQueueLearner(item: Partial<EvidenceQueueLearner>, index: number): EvidenceQueueLearner {
+  const learnerName = displayValue(item.learner);
+  const fallbackName = learnerName === EMPTY_VALUE ? `Learner ${index + 1}` : learnerName;
+  const learnerId = displayValue(item.learnerId || item.id);
+
+  return {
+    id: learnerId === EMPTY_VALUE ? `evidence-${index}` : learnerId,
+    learnerId: learnerId === EMPTY_VALUE ? `evidence-${index}` : learnerId,
+    learner: fallbackName,
+    initials: displayValue(item.initials) === EMPTY_VALUE ? fallbackName.slice(0, 2).toUpperCase() : displayValue(item.initials),
+    email: item.email || null,
+    programme: displayValue(item.programme),
+    group: displayValue(item.group),
+    pendingEvidence: toNumber(item.pendingEvidence),
+    acceptedEvidence: toNumber(item.acceptedEvidence),
+    referredEvidence: toNumber(item.referredEvidence),
+    totalEvidence: toNumber(item.totalEvidence),
+    lastSubmission: displayValue(item.lastSubmission),
+    lastSubmissionIso: item.lastSubmissionIso || null,
+    isOverdue: Boolean(item.isOverdue),
+  };
+}
+
+function eventMatchesLearner(event: CoachCalendarEvent, learner: CoachLearner) {
+  const eventLearnerId = displayValue(event.learnerId);
+  const learnerId = displayValue(learner.id);
+  if (eventLearnerId !== EMPTY_VALUE && eventLearnerId === learnerId) return true;
+
+  const eventEmail = displayValue(event.email).toLowerCase();
+  const learnerEmail = displayValue(learner.email).toLowerCase();
+  if (eventEmail !== EMPTY_VALUE && learnerEmail !== EMPTY_VALUE && eventEmail === learnerEmail) return true;
+
+  return displayValue(event.learner).toLowerCase() === learner.name.toLowerCase();
+}
+
+function learnerIdentityIndex(learners: CoachLearner[]) {
+  const learnerIds = new Set<string>();
+  const learnerEmails = new Set<string>();
+  const learnerNames = new Set<string>();
+
+  learners.forEach((learner) => {
+    const learnerId = displayValue(learner.id);
+    const learnerEmail = displayValue(learner.email).toLowerCase();
+    const learnerName = displayValue(learner.name).toLowerCase();
+    if (learnerId !== EMPTY_VALUE) learnerIds.add(learnerId);
+    if (learnerEmail !== EMPTY_VALUE) learnerEmails.add(learnerEmail);
+    if (learnerName !== EMPTY_VALUE) learnerNames.add(learnerName);
+  });
+
+  return { learnerIds, learnerEmails, learnerNames };
+}
+
+function eventMatchesLearnerIndex(
+  event: CoachCalendarEvent,
+  index: ReturnType<typeof learnerIdentityIndex>,
+) {
+  const eventLearnerId = displayValue(event.learnerId);
+  if (eventLearnerId !== EMPTY_VALUE && index.learnerIds.has(eventLearnerId)) return true;
+
+  const eventEmail = displayValue(event.email).toLowerCase();
+  if (eventEmail !== EMPTY_VALUE && index.learnerEmails.has(eventEmail)) return true;
+
+  const learnerName = displayValue(event.learner).toLowerCase();
+  return learnerName !== EMPTY_VALUE && index.learnerNames.has(learnerName);
+}
+
+function scheduleDateForEvent(event: CoachCalendarEvent): { value: string; status: Exclude<ScheduleStatus, 'none'>; time: number } | null {
+  const displayValue = eventDisplayDate(event);
+  const targetValue = eventTargetDate(event);
+  const displayDate = parseLocalDate(displayValue);
+  const targetDate = parseLocalDate(targetValue);
+  const eventDate = event.status === 'not-scheduled'
+    ? targetDate || displayDate
+    : displayDate || targetDate;
+  const eventValue = event.status === 'not-scheduled'
+    ? targetValue || displayValue
+    : displayValue || targetValue;
+  const today = new Date();
+  const start = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+
+  if (event.status === 'not-scheduled') {
+    return eventDate && eventValue
+      ? { value: eventValue, status: 'needs-schedule', time: eventDate.getTime() }
+      : null;
+  }
+
+  if (displayDate && displayDate.getTime() >= start.getTime()) {
+    return { value: displayValue, status: 'upcoming', time: displayDate.getTime() };
+  }
+
+  if (targetDate && targetDate.getTime() >= start.getTime()) {
+    return { value: targetValue, status: 'upcoming', time: targetDate.getTime() };
+  }
+
+  const fallbackDate = displayDate || targetDate;
+  const fallbackValue = displayDate ? displayValue : targetValue;
+  if (!fallbackDate || !fallbackValue) {
+    return null;
+  }
+
+  return { value: fallbackValue, status: 'overdue', time: fallbackDate.getTime() };
+}
+
+function nextEventSummaryForLearner(
+  events: CoachCalendarEvent[],
+  learner: CoachLearner,
+  source: string,
+): { label: string; status: ScheduleStatus } {
+  const matches = events
+    .filter(event => (
+      event.source === source &&
+      eventMatchesLearner(event, learner) &&
+      !isCompletedEvent(event) &&
+      event.status !== 'cancelled'
+    ))
+    .map(event => ({ event, schedule: scheduleDateForEvent(event) }))
+    .filter((entry): entry is { event: CoachCalendarEvent; schedule: Exclude<ReturnType<typeof scheduleDateForEvent>, null> } => Boolean(entry.schedule))
+    .sort((left, right) => {
+      if (left.schedule.status !== right.schedule.status) {
+        return left.schedule.status === 'upcoming' ? -1 : 1;
+      }
+      return left.schedule.status === 'upcoming'
+        ? left.schedule.time - right.schedule.time
+        : right.schedule.time - left.schedule.time;
+    });
+
+  const match = matches[0]?.schedule;
+  return {
+    label: match ? formatDateLabel(match.value) : EMPTY_VALUE,
+    status: match?.status || 'none',
+  };
+}
+
+function enrichLearnerSchedule(learners: CoachLearner[], events: CoachCalendarEvent[]): CoachLearner[] {
+  return learners.map((learner): CoachLearner => {
+    const nextMonthlyCoaching = nextEventSummaryForLearner(events, learner, 'mcr');
+    const nextProgressReview = nextEventSummaryForLearner(events, learner, 'progress-review');
+    return {
+      ...learner,
+      nextCoaching: nextMonthlyCoaching.label,
+      nextCoachingStatus: nextMonthlyCoaching.status,
+      nextReview: nextProgressReview.label,
+      nextReviewStatus: nextProgressReview.status,
+    };
+  });
+}
+
+function isWithinNextDays(event: CoachCalendarEvent, daysAhead: number) {
+  const date = parseLocalDate(eventDisplayDate(event));
+  if (!date || isCompletedEvent(event)) return false;
+  const today = new Date();
+  const start = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+  const end = new Date(start);
+  end.setDate(start.getDate() + daysAhead);
+  return date.getTime() >= start.getTime() && date.getTime() <= end.getTime();
+}
+
+function isFutureCalendarEvent(event: CoachCalendarEvent) {
+  const date = parseLocalDate(eventDisplayDate(event));
+  if (!date) return false;
+  const today = new Date();
+  const start = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+  return date.getTime() >= start.getTime();
+}
+
+function isWithinCalendarPreviewWindow(event: CoachCalendarEvent) {
+  return isWithinNextDays(event, COACHING_CALENDAR_WINDOW_DAYS - 1);
+}
+
+function upcomingLiveSessionTimeLabel(event: CoachCalendarEvent) {
+  if (event.timeLabel && event.timeLabel !== 'Time TBC') {
+    return event.timeLabel;
+  }
+  if (event.scheduledTime) {
+    return event.scheduledTime.slice(0, 5);
+  }
+  return 'Time TBC';
+}
+
+function upcomingLiveSessionMetaLabel(event: CoachCalendarEvent) {
+  return [
+    optionalDisplayValue(event.programme),
+    optionalDisplayValue(event.cohort),
+    optionalDisplayValue(event.group || event.learner),
+  ].filter(Boolean).join(' · ') || EMPTY_VALUE;
+}
+
+function buildTimetableFocusState(event: CoachCalendarEvent) {
+  return {
+    focusEvent: {
+      source: event.source || event.type,
+      eventKey: optionalDisplayValue(event.eventKey || event.id),
+      date: optionalDisplayValue(eventDisplayDate(event)),
+      title: optionalDisplayValue(event.title),
+      scheduledTime: event.scheduledTime ? event.scheduledTime.slice(0, 5) : undefined,
+      programme: optionalDisplayValue(event.programme),
+      cohort: optionalDisplayValue(event.cohort),
+      group: optionalDisplayValue(event.location || event.group),
+    },
+  };
+}
+
+function formatCalendarMonth(value?: string | null) {
+  const date = parseLocalDate(value);
+  if (!date) return EMPTY_VALUE;
+  return new Intl.DateTimeFormat('en-GB', { month: 'long' }).format(date).toUpperCase();
+}
+
+function formatCalendarDayNumber(value?: string | null) {
+  const date = parseLocalDate(value);
+  if (!date) return EMPTY_VALUE;
+  return new Intl.DateTimeFormat('en-GB', { day: '2-digit' }).format(date);
+}
+
+function formatCalendarWeekday(value?: string | null) {
+  const date = parseLocalDate(value);
+  if (!date) return EMPTY_VALUE;
+  return new Intl.DateTimeFormat('en-GB', { weekday: 'short' }).format(date).toUpperCase();
+}
+
+function formatUpcomingLiveSessionDayLabel(value?: string | null) {
+  const date = parseLocalDate(value);
+  if (!date) return EMPTY_VALUE;
+  const targetDate = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  const today = new Date();
+  const startOfToday = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+  const tomorrow = new Date(startOfToday);
+  tomorrow.setDate(startOfToday.getDate() + 1);
+  if (targetDate.getTime() === startOfToday.getTime()) return 'Today';
+  if (targetDate.getTime() === tomorrow.getTime()) return 'Tomorrow';
+  return formatDateLabel(value);
+}
+
+function eventTypeLabel(event: CoachCalendarEvent) {
+  if (event.source === 'progress-review') return eventPeriodLabel(event);
+  if (event.source === 'mcr') return 'Monthly Coaching';
+  return displayValue(event.title);
+}
+
+function eventStatusClasses(event: CoachCalendarEvent) {
+  if (isAtRiskEvent(event)) {
+    return {
+      row: 'bg-red-50/80 border border-red-200/50',
+      date: 'text-red-600',
+      badge: 'bg-red-100 text-red-700',
+      icon: 'ri-alert-fill text-red-500',
+    };
+  }
+  if (event.source === 'live-session') {
+    return {
+      row: 'bg-sky-50/70 border border-sky-100 hover:bg-sky-50',
+      date: 'text-sky-600',
+      badge: 'bg-sky-100 text-sky-700',
+      icon: 'ri-live-line text-sky-500',
+    };
+  }
+  if (event.status === 'scheduled' || event.status === 'in-progress') {
+    return {
+      row: 'bg-background-100/50 hover:bg-background-100',
+      date: 'text-foreground-400',
+      badge: 'bg-amber-100 text-amber-700',
+      icon: 'ri-time-line text-amber-500',
+    };
+  }
+  if (isCompletedEvent(event)) {
+    return {
+      row: 'hover:bg-background-50',
+      date: 'text-foreground-400',
+      badge: 'bg-primary-100 text-primary-700',
+      icon: 'ri-check-line text-emerald-500',
+    };
+  }
+  return {
+    row: 'bg-background-100/50 hover:bg-background-100',
+    date: 'text-foreground-400',
+    badge: 'bg-orange-100 text-orange-700',
+    icon: 'ri-calendar-schedule-line text-orange-500',
+  };
+}
+
+/* ═══════════════════════════════════════════════════════════
+   Priority model
+   ───────────────────────────────────────────────────────────
+   One ordered list decides who a coach opens first:
+     At Risk → Overdue Review → Poor Attendance → Missing Evidence
+   Every reason is derived from a field the dashboard API already returns, so
+   the badge on a row and the count on a tab can never disagree, and the answer
+   to "why?" travels with the verdict instead of being re-guessed per panel.
+   ═══════════════════════════════════════════════════════════ */
+type PriorityKey = 'at-risk' | 'overdue-review' | 'poor-attendance' | 'missing-evidence';
+
+const PRIORITY_ORDER: PriorityKey[] = ['at-risk', 'overdue-review', 'poor-attendance', 'missing-evidence'];
+
+const PRIORITY_RANK: Record<PriorityKey, number> = {
+  'at-risk': 0,
+  'overdue-review': 1,
+  'poor-attendance': 2,
+  'missing-evidence': 3,
+};
+
+const PRIORITY_META: Record<PriorityKey, { label: string; icon: string }> = {
+  'at-risk': { label: 'At Risk', icon: 'ri-alarm-warning-line' },
+  'overdue-review': { label: 'Overdue Review', icon: 'ri-calendar-close-line' },
+  'poor-attendance': { label: 'Poor Attendance', icon: 'ri-calendar-check-line' },
+  'missing-evidence': { label: 'Missing Evidence', icon: 'ri-file-list-3-line' },
+};
+
+// The priority vocabulary is five ranked reasons; StatusTone carries risk in
+// four bands. `at-risk` and `overdue-review` both read as `critical` — both are
+// "act now" severities, and the label text (not a second red shade) is what
+// tells them apart.
+const PRIORITY_TONE: Record<PriorityKey, StatusTone> = {
+  'at-risk': 'critical',
+  'overdue-review': 'critical',
+  'poor-attendance': 'upcoming',
+  'missing-evidence': 'brand',
+};
+
+interface PriorityReason {
+  key: PriorityKey;
+  label: string;
+  detail?: string;
+}
+
+interface LearnerPriority {
+  reasons: PriorityReason[];
+  primary: PriorityReason | null;
+  keys: Set<PriorityKey>;
+  /** Sort weight, highest = open this learner first. */
+  urgency: number;
+}
+
+interface OverdueSignal {
+  review: boolean;
+  coaching: boolean;
+  label: string;
+}
+
+function formatHours(value: number) {
+  return formatHoursMinutes(value);
+}
+
+function otjhPercentFor(learner: CoachLearner): number | null {
+  return learner.otjhTarget > 0 ? clampPercent((learner.otjhCompleted / learner.otjhTarget) * 100) : null;
+}
+
+/** Scheduled but already past, or still needing a date after its target passed. */
+function isOverdueEvent(event: CoachCalendarEvent, referenceDate = new Date()) {
+  if (isCompletedEvent(event) || event.status === 'cancelled') return false;
+  if (needsScheduling(event)) return isAtRiskEvent(event, referenceDate);
+  const date = parseLocalDate(eventDisplayDate(event));
+  return Boolean(date && date.getTime() < startOfDay(referenceDate).getTime());
+}
+
+function buildOverdueMap(learners: CoachLearner[], events: CoachCalendarEvent[]): Map<string, OverdueSignal> {
+  const overdueEvents = events.filter(event => isOverdueEvent(event));
+  const map = new Map<string, OverdueSignal>();
+  if (!overdueEvents.length) return map;
+
+  learners.forEach(learner => {
+    const matches = overdueEvents.filter(event => eventMatchesLearner(event, learner));
+    const review = matches.find(event => event.source === 'progress-review');
+    const coaching = matches.find(event => event.source === 'mcr');
+    if (!review && !coaching) return;
+    map.set(learner.id, {
+      review: Boolean(review),
+      coaching: Boolean(coaching),
+      label: formatDateLabel(eventTargetDate(review || coaching)),
+    });
+  });
+
+  return map;
+}
+
+function buildLearnerPriority(learner: CoachLearner, overdue?: OverdueSignal): LearnerPriority {
+  const reasons: PriorityReason[] = [];
+  const otjhStatus = normalizeOtjhStatus(learner.otjhStatus);
+  const otjhPercent = otjhPercentFor(learner);
+
+  if (otjhStatus === 'at-risk') {
+    reasons.push({
+      key: 'at-risk',
+      label: learner.recentFlag || learner.riskFlags[0] || 'Flagged at risk',
+      detail: otjhPercent !== null
+        ? `${otjhPercent}% of expected off-the-job hours`
+        : 'Immediate coaching action needed',
+    });
+  }
+
+  if (overdue?.review) {
+    reasons.push({
+      key: 'overdue-review',
+      label: 'Progress review overdue',
+      detail: overdue.label !== EMPTY_VALUE ? `Was due ${overdue.label}` : undefined,
+    });
+  } else if (overdue?.coaching) {
+    reasons.push({
+      key: 'overdue-review',
+      label: 'Coaching session overdue',
+      detail: overdue.label !== EMPTY_VALUE ? `Was due ${overdue.label}` : undefined,
+    });
+  }
+
+  if (learner.attendanceRateAvailable && learner.attendanceRate < ATTENDANCE_EXPECTED_RATE) {
+    reasons.push({
+      key: 'poor-attendance',
+      label: `Attendance ${learner.attendanceRate}%`,
+      detail: learner.attendanceRate < ATTENDANCE_MINIMUM_RATE
+        ? `Below the ${ATTENDANCE_MINIMUM_RATE}% minimum`
+        : `Below the ${ATTENDANCE_EXPECTED_RATE}% expected level`,
+    });
+  }
+
+  if (learner.evidenceCountAvailable) {
+    if (learner.evidenceCompletedCount === 0) {
+      reasons.push({
+        key: 'missing-evidence',
+        label: 'No evidence accepted yet',
+        detail: learner.evidenceCount > 0
+          ? `${learner.evidenceCount} awaiting your review`
+          : 'Nothing submitted on record',
+      });
+    } else if (learner.evidenceCount > 0) {
+      reasons.push({
+        key: 'missing-evidence',
+        label: `${learner.evidenceCount} evidence awaiting review`,
+        detail: `${learner.evidenceCompletedCount} accepted so far`,
+      });
+    }
+  }
+
+  reasons.sort((left, right) => PRIORITY_RANK[left.key] - PRIORITY_RANK[right.key]);
+  const primary = reasons[0] || null;
+  // Tier dominates the sort, then how many signals fired, then how far behind
+  // on hours — so the learner to open first genuinely sits at the top.
+  const tierWeight = primary ? (PRIORITY_ORDER.length - PRIORITY_RANK[primary.key]) * 1000 : 0;
+
+  return {
+    reasons,
+    primary,
+    keys: new Set(reasons.map(reason => reason.key)),
+    urgency: tierWeight + reasons.length * 50 + (100 - (otjhPercent ?? 100)),
+  };
+}
+
+/**
+ * Tone for a percentage against this page's own warning/success thresholds —
+ * the same three-way split every metric on this page already used under the
+ * name `toneFromPercent`, now returning the shared `StatusTone` vocabulary
+ * instead of a locally-invented one.
+ */
+function percentTone(value?: number | null, warningThreshold = 50, successThreshold = 75): StatusTone {
+  if (value === null || value === undefined || !Number.isFinite(value)) return 'neutral';
+  if (value >= successThreshold) return 'positive';
+  if (value >= warningThreshold) return 'caution';
+  return 'critical';
+}
+
+/** The avatar ring colour: OTJH risk first, then programme stage. */
+function learnerAvatarTone(learner: CoachLearner): StatusTone {
+  const otjhStatus = normalizeOtjhStatus(learner.otjhStatus);
+  if (otjhStatus === 'at-risk') return 'critical';
+  if (otjhStatus === 'need-attention') return 'caution';
+  const programmeStatus = normalizedProgramStatus(learner);
+  if (programmeStatus === 'completed') return 'positive';
+  if (programmeStatus === 'gateway') return 'brand';
+  if (programmeStatus === 'epa') return 'info';
+  return 'neutral';
+}
+
+/* ═══════════════════════════════════════════════════════════
+   Upcoming Schedule — one list for live sessions, monthly
+   coaching and progress reviews.
+   ═══════════════════════════════════════════════════════════ */
+function scheduleEventTitle(event: CoachCalendarEvent) {
+  if (event.source === 'live-session') return displayValue(event.title);
+  const learner = displayValue(event.learner);
+  return learner === EMPTY_VALUE ? displayValue(event.title) : learner;
+}
+
+function scheduleEventMeta(event: CoachCalendarEvent) {
+  return event.source === 'live-session' ? upcomingLiveSessionMetaLabel(event) : eventTypeLabel(event);
+}
+
+function scheduleEventTime(event: CoachCalendarEvent) {
+  if (event.source === 'live-session') return upcomingLiveSessionTimeLabel(event);
+  if (event.scheduledTime) return event.scheduledTime.slice(0, 5);
+  if (event.timeLabel && event.timeLabel !== 'Time TBC') return event.timeLabel;
+  return 'TBC';
+}
+
+/** Just the start, for the fixed-size "Next" badge -- a live session's
+ * "09:00 - 11:00" wraps and overflows a box sized for a single time. */
+function scheduleEventStartTime(event: CoachCalendarEvent) {
+  return scheduleEventTime(event).split(' - ')[0];
+}
+
+/** "12 Sep 2025" -> "12 Sep", so a quick-stat cell stays one line. */
+function shortDateLabel(value?: string | null) {
+  const label = displayValue(value);
+  if (label === EMPTY_VALUE) return EMPTY_VALUE;
+  const parts = label.split(' ');
+  return parts.length >= 2 ? `${parts[0]} ${parts[1]}` : label;
+}
+
+const KPI_FILTER_LABEL: Record<DashboardKpi, string> = {
+  caseload: 'Full caseload',
+  active: 'Active learners',
+  'on-break': 'Paused learners',
+  'on-track': 'On track learners',
+  'at-risk': 'At risk learners',
+  'need-attention': 'Learners needing attention',
+  completed: 'Completed learners',
+  epa: 'EPA learners',
+  evidence: 'Evidence awaiting review',
+  reviews: 'Upcoming reviews',
+};
+
+function formatWeekRangeLabel() {
+  const { start, end } = currentWeekRange();
+  const format = new Intl.DateTimeFormat('en-GB', { day: '2-digit', month: 'short' });
+  return `${format.format(start)} - ${format.format(end)}`;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   Scroll Reveal
+   ═══════════════════════════════════════════════════════════ */
+function SectionReveal({ children, className = '', delay = 0 }: { children: React.ReactNode; className?: string; delay?: number }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [visible, setVisible] = useState(false);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const obs = new IntersectionObserver(([e]) => { if (e.isIntersecting) { setTimeout(() => setVisible(true), delay); obs.disconnect(); } }, { threshold: 0.04, rootMargin: '0px 0px -12px 0px' });
+    obs.observe(el);
+    return () => obs.disconnect();
+  }, [delay]);
+  return (
+    <div ref={ref} className={`transition-all duration-[420ms] ease-out ${className} ${visible ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-3'}`}>
+      {children}
+    </div>
+  );
+}
+
+function LoadingBlock({ className = '' }: { className?: string }) {
+  return <div aria-hidden="true" className={`animate-pulse rounded-lg bg-background-100/90 ${className}`}></div>;
+}
+
+function AttentionSkeleton({ rows = 4 }: { rows?: number }) {
+  return (
+    <>
+      {Array.from({ length: rows }, (_, index) => (
+        <div
+          key={`attention-skeleton-${index}`}
+          className="grid items-center gap-3 rounded-2xl border border-foreground-200/60 bg-background-50 px-4 py-3.5 sm:px-5 lg:grid-cols-[minmax(0,1fr)_auto] lg:gap-5"
+        >
+          <div className="flex min-w-0 items-center gap-3">
+            <LoadingBlock className="h-10 w-10 rounded-full" />
+            <div className="min-w-0 flex-1">
+              <LoadingBlock className="h-3.5 w-40 max-w-[60%]" />
+              <LoadingBlock className="mt-2 h-3 w-56 max-w-[80%]" />
+            </div>
+          </div>
+          <div className="grid grid-cols-4 gap-2 lg:w-[380px]">
+            {Array.from({ length: 4 }, (_, cell) => (
+              <LoadingBlock key={`attention-cell-${index}-${cell}`} className="h-11" />
+            ))}
+          </div>
+        </div>
+      ))}
+    </>
+  );
+}
+
+function ScheduleSkeleton() {
+  return (
+    <>
+      {Array.from({ length: 2 }, (_, groupIndex) => (
+        <div key={`schedule-skeleton-${groupIndex}`} className="coach-upcoming-schedule__group rounded-xl border border-foreground-200/60 bg-background-50/70 p-3">
+          <div className="coach-upcoming-schedule__group-header grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-b border-foreground-100 pb-2.5">
+            <LoadingBlock className="h-4 w-32" />
+            <LoadingBlock className="h-5 w-7 rounded-full" />
+          </div>
+          <div className="coach-upcoming-schedule__events">
+            {Array.from({ length: 2 }, (_, rowIndex) => (
+              <div key={`schedule-row-${groupIndex}-${rowIndex}`} className="flex min-w-0 items-start gap-2.5 rounded-lg px-1.5 py-2">
+                <LoadingBlock className="h-7 w-[5.75rem] shrink-0" />
+                <LoadingBlock className="mt-1 h-3.5 w-3.5 shrink-0 rounded-full" />
+                <div className="min-w-0 flex-1 pt-0.5">
+                  <LoadingBlock className="h-3 w-3/5" />
+                  <LoadingBlock className="mt-1 h-2.5 w-2/5" />
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+    </>
+  );
+}
+
+export default function CoachDashboard() {
+  const navigate = useNavigate();
+  const { auth, isInitialized } = useAuth();
+  const coach = useCoachIdentity();
+  // For a coach this is their own address; for an admin it is the coach they
+  // chose, and empty until they choose one — which is what shows the picker.
+  const authenticatedCoachEmail = coach.email;
+  const authenticatedCoachName = coach.name;
+  const adminEmail = auth.account?.email || '';
+  // KPI cards open a quick drill-down first. The modal can still apply the
+  // same filter to the caseload list when the coach wants to keep working there.
+  const [kpiFilter, setKpiFilter] = useState<DashboardKpi | null>(null);
+  const [selectedKpi, setSelectedKpi] = useState<DashboardKpi | null>(null);
+  const [priorityFilter, setPriorityFilter] = useState<PriorityKey | null>(null);
+  const [ownerName, setOwnerName] = useState('Coach');
+  const [learners, setLearners] = useState<CoachLearner[]>([]);
+  const [assignedGroups, setAssignedGroups] = useState<CoachAssignedGroup[]>([]);
+  const [calendarEvents, setCalendarEvents] = useState<CoachCalendarEvent[]>([]);
+  const [calendarPreviewEvents, setCalendarPreviewEvents] = useState<CoachCalendarEvent[]>([]);
+  const [liveSessionEvents, setLiveSessionEvents] = useState<CoachCalendarEvent[]>([]);
+  const [evidenceQueue, setEvidenceQueue] = useState<EvidenceQueueLearner[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [loadWarning, setLoadWarning] = useState<string | null>(null);
+  const [calendarLoading, setCalendarLoading] = useState(true);
+  const [calendarError, setCalendarError] = useState<string | null>(null);
+  const [liveSessionsLoading, setLiveSessionsLoading] = useState(true);
+  const [liveSessionsError, setLiveSessionsError] = useState<string | null>(null);
+  const [caseloadExpanded, setCaseloadExpanded] = useState(true);
+  const [scheduleExpanded, setScheduleExpanded] = useState(true);
+  const [directoryCoaches, setDirectoryCoaches] = useState<DirectoryCoach[]>([]);
+  const handleDirectoryLoaded = useCallback((nextCoaches: DirectoryCoach[]) => {
+    setDirectoryCoaches(nextCoaches);
+  }, []);
+
+  const openCoachCalendar = useCallback((selected: DirectoryCoach, event: CoachCalendarEvent) => {
+    setCoachViewAs({ email: selected.email, name: selected.name }, adminEmail);
+    navigate('/coach/timetable', {
+      state: {
+        focusEvent: {
+          source: event.source,
+          eventKey: event.eventKey,
+          date: eventDisplayDate(event),
+          title: event.title,
+          scheduledTime: event.scheduledTime,
+          programme: event.programme,
+          cohort: event.cohort,
+          group: event.group,
+        },
+      },
+    });
+  }, [adminEmail, navigate]);
+
+  useEffect(() => {
+    if (!isInitialized) return;
+    const controller = new AbortController();
+
+    async function loadDashboard() {
+      setLoading(true);
+      setLoadWarning(null);
+      setCalendarLoading(true);
+      setCalendarError(null);
+      setLiveSessionsLoading(true);
+      setLiveSessionsError(null);
+
+      if (!authenticatedCoachEmail) {
+        setOwnerName(authenticatedCoachName);
+        setLearners([]);
+        setAssignedGroups([]);
+        setCalendarEvents([]);
+        setCalendarPreviewEvents([]);
+        setLiveSessionEvents([]);
+        setEvidenceQueue([]);
+        // An admin has no caseload of their own, so there is nothing missing to
+        // report — the picker below is the whole page for them.
+        setLoadWarning(coach.canChooseCoach ? null : 'Coach access is required to load this dashboard.');
+        setCalendarError('Coach access is required.');
+        setLiveSessionsError('Coach access is required.');
+        setCalendarLoading(false);
+        setLiveSessionsLoading(false);
+        setLoading(false);
+        return;
+      }
+
+      try {
+        const dashboard = await fetchSharedJsonGet<CoachDashboardApiResponse>(
+          withCoachViewAs(coachDashboardEndpoint()),
+          { signal: controller.signal, credentials: 'include' },
+        );
+        if (controller.signal.aborted) return;
+
+        const queueItems = (dashboard.evidence?.items || []).map(normalizeEvidenceQueueLearner);
+        const normalizedLearners = (dashboard.learners || []).map(normalizeLearner);
+        const attendanceLearners = dashboard.attendance?.learners || [];
+        const reviewHistoryLearners = dashboard.reviewHistory?.learners || [];
+        const events = sortEvents(dashboard.timetable?.events || []);
+        const nonLiveEvents = events.filter(event => event.source !== 'live-session');
+
+        setOwnerName(displayValue(dashboard.owner?.name) === EMPTY_VALUE ? authenticatedCoachName : String(dashboard.owner?.name));
+        setLearners(mergeEvidenceQueueIntoLearners(
+          mergeReviewHistory(
+            mergeAttendanceRates(normalizedLearners, attendanceLearners),
+            reviewHistoryLearners,
+          ),
+          queueItems,
+        ));
+        setAssignedGroups(dashboard.assignedGroups || []);
+        setEvidenceQueue(queueItems);
+        setCalendarEvents(nonLiveEvents);
+        setCalendarPreviewEvents(nonLiveEvents.filter(isWithinCalendarPreviewWindow));
+        setLiveSessionEvents(events.filter(event => event.source === 'live-session'));
+        setCalendarError(dashboard.errors?.timetable || null);
+        setLiveSessionsError(dashboard.errors?.timetable || null);
+        setCalendarLoading(false);
+        setLiveSessionsLoading(false);
+        setLoading(false);
+      } catch (error) {
+        if (controller.signal.aborted) return;
+        setLearners([]);
+        setAssignedGroups([]);
+        setCalendarEvents([]);
+        setCalendarPreviewEvents([]);
+        setLiveSessionEvents([]);
+        setLoadWarning(error instanceof Error ? error.message : 'Unable to load coach dashboard data right now.');
+        setCalendarError('Calendar unavailable right now.');
+        setLiveSessionsError('Live sessions unavailable right now.');
+        setCalendarLoading(false);
+        setLiveSessionsLoading(false);
+        setLoading(false);
+      }
+    }
+
+    loadDashboard();
+    return () => {
+      controller.abort();
+    };
+  }, [authenticatedCoachEmail, authenticatedCoachName, coach.canChooseCoach, isInitialized]);
+
+  useEffect(() => {
+    if (!selectedKpi) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setSelectedKpi(null);
+      }
+    };
+    window.addEventListener('keydown', closeOnEscape);
+    return () => window.removeEventListener('keydown', closeOnEscape);
+  }, [selectedKpi]);
+
+  const enrichedLearners = useMemo(() => enrichLearnerSchedule(learners, calendarEvents), [learners, calendarEvents]);
+  const activeLearners = useMemo(() => enrichedLearners.filter(isActiveLearner), [enrichedLearners]);
+  const onBreakLearners = useMemo(() => enrichedLearners.filter(isOnBreakLearner), [enrichedLearners]);
+  const completedLearners = useMemo(() => enrichedLearners.filter(isCompletedLearner), [enrichedLearners]);
+  const epaLearners = useMemo(() => enrichedLearners.filter(isEpaLearner), [enrichedLearners]);
+  const atRiskLearners = useMemo(
+    () => activeLearners.filter(learner => normalizeOtjhStatus(learner.otjhStatus) === 'at-risk'),
+    [activeLearners],
+  );
+  const needAttentionLearners = useMemo(
+    () => activeLearners.filter(learner => normalizeOtjhStatus(learner.otjhStatus) === 'need-attention'),
+    [activeLearners],
+  );
+  const onTrackLearners = useMemo(
+    () => activeLearners.filter(learner => normalizeOtjhStatus(learner.otjhStatus) === 'on-track'),
+    [activeLearners],
+  );
+  const evidenceLearners = useMemo(
+    () => evidenceQueue
+      .filter(learner => learner.pendingEvidence > 0)
+      .sort((a, b) => b.pendingEvidence - a.pendingEvidence || a.learner.localeCompare(b.learner)),
+    [evidenceQueue],
+  );
+  const atRiskCount = atRiskLearners.length;
+  const onTrackCount = onTrackLearners.length;
+  const totalCaseload = enrichedLearners.length;
+  const assignedGroupRows = useMemo(() => assignedGroups.map(group => {
+    const groupLearners = activeLearners.filter(learner => learnerBelongsToAssignedGroup(learner, group));
+    return {
+      ...group,
+      learnerCount: groupLearners.length,
+      atRiskCount: groupLearners.filter(learner => normalizeOtjhStatus(learner.otjhStatus) === 'at-risk').length,
+      needAttentionCount: groupLearners.filter(learner => normalizeOtjhStatus(learner.otjhStatus) === 'need-attention').length,
+    };
+  }), [activeLearners, assignedGroups]);
+  const pendingEvidence = useMemo(
+    () => evidenceLearners.reduce((total, learner) => total + learner.pendingEvidence, 0),
+    [evidenceLearners],
+  );
+  const completedEvidence = useMemo(
+    () => evidenceLearners.reduce((total, learner) => total + learner.acceptedEvidence, 0),
+    [evidenceLearners],
+  );
+  const activeLearnerIndex = useMemo(() => learnerIdentityIndex(activeLearners), [activeLearners]);
+  const activeCalendarEvents = useMemo(
+    () => calendarEvents.filter(event => eventMatchesLearnerIndex(event, activeLearnerIndex)),
+    [activeLearnerIndex, calendarEvents],
+  );
+  const visibleCalendarSourceEvents = useMemo(
+    () => calendarPreviewEvents.filter(event => eventMatchesLearnerIndex(event, activeLearnerIndex)),
+    [activeLearnerIndex, calendarPreviewEvents],
+  );
+  const upcomingLiveSessions = useMemo(() => sortEvents(
+    liveSessionEvents
+      .filter(event => event.source === 'live-session')
+      .filter(event => !['completed', 'cancelled'].includes(event.status) && isFutureCalendarEvent(event)),
+  ), [liveSessionEvents]);
+  const coachingCalendarLiveSessions = useMemo(
+    () => upcomingLiveSessions.filter(isWithinCalendarPreviewWindow),
+    [upcomingLiveSessions],
+  );
+
+  /* ── Upcoming Schedule: live sessions + coaching + reviews, one list ── */
+  const upcomingScheduleEvents = useMemo(
+    () => sortEvents([
+      ...visibleCalendarSourceEvents.filter(isFutureCalendarEvent),
+      ...coachingCalendarLiveSessions,
+    ]),
+    [coachingCalendarLiveSessions, visibleCalendarSourceEvents],
+  );
+  const upcomingScheduleGroups = useMemo(() => {
+    const grouped = new Map<string, CoachCalendarEvent[]>();
+    upcomingScheduleEvents.forEach(event => {
+      const date = parseLocalDate(eventDisplayDate(event));
+      if (!date) return;
+      const key = toIsoDate(date);
+      const existing = grouped.get(key);
+      if (existing) existing.push(event);
+      else grouped.set(key, [event]);
+    });
+    return Array.from(grouped.entries()).map(([date, events]) => ({ date, events }));
+  }, [upcomingScheduleEvents]);
+
+  /* ── Today / Needs Action ── */
+  const todayEvents = useMemo(() => {
+    const todayIso = toIsoDate(new Date());
+    return upcomingScheduleEvents.filter(event => {
+      const date = parseLocalDate(eventDisplayDate(event));
+      return Boolean(date && toIsoDate(date) === todayIso);
+    });
+  }, [upcomingScheduleEvents]);
+  const nextTodayEvent = todayEvents[0];
+  const remainingTodayEvents = todayEvents.slice(1);
+  /* ── This Week ── */
+  const weekEvents = useMemo(
+    () => [...activeCalendarEvents, ...liveSessionEvents].filter(event => isEventThisWeek(event)),
+    [activeCalendarEvents, liveSessionEvents],
+  );
+
+  /* ── Learners Requiring Attention (Risk Alert + At Risk Learners, merged) ── */
+  const overdueMap = useMemo(
+    () => buildOverdueMap(activeLearners, activeCalendarEvents),
+    [activeCalendarEvents, activeLearners],
+  );
+  const priorityMap = useMemo(() => {
+    const map = new Map<string, LearnerPriority>();
+    enrichedLearners.forEach(learner => map.set(learner.id, buildLearnerPriority(learner, overdueMap.get(learner.id))));
+    return map;
+  }, [enrichedLearners, overdueMap]);
+  const attentionQueue = useMemo(
+    () => activeLearners
+      .map(learner => ({ learner, priority: priorityMap.get(learner.id) }))
+      .filter((entry): entry is { learner: CoachLearner; priority: LearnerPriority } => Boolean(entry.priority?.reasons.length))
+      .sort((left, right) => right.priority.urgency - left.priority.urgency || left.learner.name.localeCompare(right.learner.name)),
+    [activeLearners, priorityMap],
+  );
+  const priorityCounts = useMemo(() => {
+    const counts = {} as Record<PriorityKey, number>;
+    PRIORITY_ORDER.forEach(key => { counts[key] = 0; });
+    attentionQueue.forEach(entry => entry.priority.keys.forEach(key => { counts[key] += 1; }));
+    return counts;
+  }, [attentionQueue]);
+
+  const kpiFilterPredicate = useMemo((): ((learner: CoachLearner) => boolean) | null => {
+    switch (kpiFilter) {
+      case 'caseload': return () => true;
+      case 'active': return isActiveLearner;
+      case 'on-break': return isOnBreakLearner;
+      case 'completed': return isCompletedLearner;
+      case 'epa': return isEpaLearner;
+      case 'at-risk':
+      case 'need-attention':
+      case 'on-track':
+        return learner => isActiveLearner(learner) && normalizeOtjhStatus(learner.otjhStatus) === kpiFilter;
+      default: return null;
+    }
+  }, [kpiFilter]);
+
+  const attentionRows = useMemo(() => {
+    if (kpiFilterPredicate) {
+      return enrichedLearners
+        .filter(kpiFilterPredicate)
+        .map(learner => ({ learner, priority: priorityMap.get(learner.id)! }))
+        .sort((left, right) => right.priority.urgency - left.priority.urgency || left.learner.name.localeCompare(right.learner.name));
+    }
+    return priorityFilter
+      ? attentionQueue.filter(entry => entry.priority.keys.has(priorityFilter))
+      : attentionQueue;
+  }, [attentionQueue, enrichedLearners, kpiFilterPredicate, priorityFilter, priorityMap]);
+
+  const attentionPanelTitle = kpiFilter ? KPI_FILTER_LABEL[kpiFilter] : 'Learners Requiring Attention';
+  const attentionPanelSubtitle = kpiFilter
+    ? 'Filtered from the KPI cards above, ordered by priority'
+    : 'At Risk → Overdue Review → Poor Attendance → Missing Evidence';
+  const attentionHasOverflow = attentionRows.length > AT_RISK_SCROLL_THRESHOLD;
+
+  const schedulePanelLoading = (calendarLoading || liveSessionsLoading) && !upcomingScheduleEvents.length;
+
+  const scrollToSection = (id: string) => {
+    window.requestAnimationFrame(() => {
+      document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+  };
+
+  const scrollToAttention = () => scrollToSection('learner-caseload');
+
+  const openCaseloadFilter = (filter: DashboardKpi) => {
+    setPriorityFilter(null);
+    setKpiFilter(filter);
+    scrollToAttention();
+  };
+
+  const applyPriorityFilter = (key: PriorityKey) => {
+    setKpiFilter(null);
+    setPriorityFilter(current => (current === key ? null : key));
+  };
+
+  const allActionItems: ActionItem[] = [
+    {
+      id: 'today-sessions',
+      label: "Today's schedule",
+      hint: todayEvents.length === 1 ? '1 session or review today' : `${todayEvents.length} sessions or reviews today`,
+      count: todayEvents.length,
+      icon: 'ri-calendar-schedule-line',
+      tone: 'warning',
+      onClick: () => navigate('/coach/timetable', {
+        state: {
+          focusEvent: {
+            date: toIsoDate(new Date()),
+          },
+        },
+      }),
+    },
+  ];
+  const actionItems = allActionItems.filter(item => item.count > 0);
+  // The number that answers "how much is on me today" for the KPI strip —
+  // a straight sum of the same counts the action list below already shows.
+  const needsActionCount = actionItems.reduce((total, item) => total + item.count, 0);
+
+  // An administrator reaches this page with no caseload of their own. Rather
+  // than a dashboard of zeros, they pick whose workspace to open; the selection
+  // then travels with every coach request (see `@/lib/coachViewAs`), so the
+  // sidebar's caseload, timetable and marking pages follow the same coach.
+  if (coach.canChooseCoach && !coach.isViewingAsCoach) {
+    return (
+      <WorkspaceShell
+        // No sidebar until a coach is chosen: every coach page reads the
+        // selected coach, so those links would open a caseload, a timetable and
+        // a marking queue belonging to nobody. Picking one is the only thing to
+        // do here, and the nav returns with the choice.
+        role="coach" roleLabel={coachNav.label} navItems={[]} workspaceLabel={coachNav.workspaceLabel}
+        pageTitle="Coach Workspace" pageSubtitle="Choose a coach to open their workspace"
+        userName={auth.account?.displayName || auth.user?.fullName || 'Administrator'} userRole="Administrator"
+      >
+        <div className="space-y-6 p-3 md:p-6">
+          <CoachDirectoryPicker
+            onSelect={selected => setCoachViewAs({ email: selected.email, name: selected.name }, adminEmail)}
+            onDirectoryLoaded={handleDirectoryLoaded}
+          />
+          <AllCoachesCalendar coaches={directoryCoaches} onOpenCoach={openCoachCalendar} />
+        </div>
+      </WorkspaceShell>
+    );
+  }
+
+  return (
+    <WorkspaceShell
+      role="coach" roleLabel={coachNav.label} navItems={coachNav.items} workspaceLabel={coachNav.workspaceLabel}
+      pageTitle="Coach Dashboard" pageSubtitle="Who needs attention, what needs doing today, what is coming next"
+      userName={ownerName} userRole="Progress Coach"
+    >
+      <WorkspaceDashboardLayout className="coach-dashboard" overview={<div className="space-y-5">
+          <div className="flex items-center gap-3">
+            <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-primary-100 text-primary-600"><AppIcon className="ri-user-heart-line h-5 w-5" /></span>
+            <div className="min-w-0"><p className="break-words text-sm font-semibold text-foreground-900">{ownerName}</p><p className="mt-0.5 text-xs text-foreground-500">Coach overview</p></div>
+          </div>
+          <section id="today-actions" className="scroll-mt-4 border-t border-[var(--kbc-border)] pt-5">
+            <SectionHeader
+              icon="ri-calendar-schedule-line"
+              title="Today's schedule"
+              description="Your next session or review for today"
+              actions={<StatusBadge tone="info" dot={false} label={`${todayEvents.length} today`} />}
+            />
+
+            {loading && !nextTodayEvent && (
+              <LoadingBlock className="mt-4 h-[132px] rounded-2xl" />
+            )}
+
+            {!loading && !nextTodayEvent && (
+              <EmptyState
+                size="sm"
+                icon="ri-check-double-line"
+                title="Nothing scheduled today"
+                description="No live sessions, reviews or coaching sessions are scheduled for today."
+              />
+            )}
+
+            {nextTodayEvent && (
+              <div className="mt-4">
+                <Link
+                  to="/coach/timetable"
+                  state={buildTimetableFocusState(nextTodayEvent)}
+                  className="group flex min-w-0 items-center gap-4 rounded-xl border border-primary-100 bg-primary-50/50 px-4 py-3.5 transition-colors hover:border-primary-200 hover:bg-primary-50"
+                >
+                  <span className="flex h-14 w-14 shrink-0 flex-col items-center justify-center rounded-xl bg-background-50 text-center shadow-sm ring-1 ring-primary-100">
+                    <span className="text-[10px] font-semibold uppercase text-primary-500">Next</span>
+                    <span className="whitespace-nowrap text-sm font-bold tabular-nums text-primary-800">{scheduleEventStartTime(nextTodayEvent)}</span>
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-sm font-semibold text-foreground-950">{scheduleEventTitle(nextTodayEvent)}</span>
+                    <span className="mt-1 block truncate text-[12px] text-foreground-500">{scheduleEventMeta(nextTodayEvent)}</span>
+                  </span>
+                  <span className="hidden items-center gap-1 text-[12px] font-semibold text-primary-700 sm:inline-flex">
+                    Open timetable
+                    <AppIcon className="ri-arrow-right-line text-sm transition-transform group-hover:translate-x-0.5"></AppIcon>
+                  </span>
+                </Link>
+              </div>
+            )}
+
+            {remainingTodayEvents.length > 0 && (
+              <div className="mt-3 border-t border-foreground-100 pt-3">
+                <SectionLabel>Later today</SectionLabel>
+                <div className="mt-2 grid max-h-48 gap-2 overflow-y-auto pr-1 sm:grid-cols-2 lg:grid-cols-3">
+                  {remainingTodayEvents.map(event => {
+                    const classes = eventStatusClasses(event);
+                    return (
+                      <Link
+                        key={`today-${event.eventKey || event.id}`}
+                        to="/coach/timetable"
+                        state={buildTimetableFocusState(event)}
+                        className="group flex min-w-0 items-center gap-2.5 rounded-lg border border-foreground-100 bg-background-50 px-3 py-2 transition-colors hover:border-primary-200 hover:bg-primary-50/50"
+                      >
+                        <span className={cn('shrink-0 rounded-md px-2 py-1 text-center text-[12px] font-bold tabular-nums', classes.badge)}>
+                          {scheduleEventTime(event)}
+                        </span>
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate text-[12px] font-semibold text-foreground-900">{scheduleEventTitle(event)}</span>
+                          <span className="block truncate text-[11px] text-foreground-400">{scheduleEventMeta(event)}</span>
+                        </span>
+                        <AppIcon className={cn('shrink-0 text-[13px] transition-transform group-hover:translate-x-0.5', classes.icon)}></AppIcon>
+                      </Link>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </section>
+            <section className="border-t border-[var(--kbc-border)] pt-5">
+              <SectionHeader
+                icon="ri-node-tree"
+                title="My Assigned Groups"
+                description="Official curriculum group assignments"
+                actions={<StatusBadge tone="brand" dot={false} label={`${assignedGroupRows.length} groups`} />}
+              />
+              <div className="mt-3.5 space-y-2.5">
+                {loading && assignedGroupRows.length === 0 && (
+                  <>
+                    <LoadingBlock className="h-20 rounded-xl" />
+                    <LoadingBlock className="h-20 rounded-xl" />
+                  </>
+                )}
+                {!loading && assignedGroupRows.length === 0 && (
+                  <EmptyState
+                    size="sm"
+                    icon="ri-user-search-line"
+                    title="No groups assigned"
+                    description="No official curriculum groups are assigned to this coach yet."
+                  />
+                )}
+                {!loading && assignedGroupRows.slice(0, 4).map(group => (
+                  <div key={group.id || `${group.programme}-${group.cohort}-${group.name}`} className="rounded-xl border border-foreground-200/70 bg-background-50 p-3 shadow-sm">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <p className="truncate text-sm font-bold text-foreground-950" title={group.name}>{group.name}</p>
+                        <p className="mt-0.5 truncate text-[12px] text-foreground-500" title={`${group.programme} · ${group.cohort}`}>{group.programme} <span className="text-foreground-300">·</span> {group.cohort}</p>
+                      </div>
+                      <span className="shrink-0 rounded-full bg-primary-50 px-2.5 py-1 text-[11px] font-bold text-primary-700">{group.learnerCount}</span>
+                    </div>
+                    <div className="mt-3 grid grid-cols-3 gap-2 text-center">
+                      <div className="rounded-lg bg-background-100 px-2 py-1.5">
+                        <p className="text-[10px] font-bold text-foreground-900">{group.learnerCount}</p>
+                        <p className="text-[9px] uppercase text-foreground-400">Active</p>
+                      </div>
+                      <div className="rounded-lg bg-amber-50 px-2 py-1.5">
+                        <p className="text-[10px] font-bold text-amber-700">{group.needAttentionCount}</p>
+                        <p className="text-[9px] uppercase text-amber-600">Attention</p>
+                      </div>
+                      <div className="rounded-lg bg-red-50 px-2 py-1.5">
+                        <p className="text-[10px] font-bold text-red-700">{group.atRiskCount}</p>
+                        <p className="text-[9px] uppercase text-red-600">At risk</p>
+                      </div>
+                    </div>
+                    {displayValue(group.schedule) !== EMPTY_VALUE && (
+                      <p className="mt-2 truncate text-[11px] text-foreground-400" title={group.schedule}>
+                        <AppIcon className="ri-time-line mr-1 text-[12px]"></AppIcon>
+                        {group.schedule}
+                      </p>
+                    )}
+                  </div>
+                ))}
+                {!loading && assignedGroupRows.length > 4 && (
+                  <Link to="/coach/caseload" className="inline-flex w-full items-center justify-center gap-1.5 rounded-lg border border-primary-100 bg-primary-50 px-3 py-2 text-[12px] font-semibold text-primary-700 transition-colors hover:bg-primary-100">
+                    Open My Learners
+                    <AppIcon className="ri-arrow-right-line text-[13px]"></AppIcon>
+                  </Link>
+                )}
+              </div>
+            </section>
+        </div>}>
+
+        {/* ═══════════════════════════════════════════════════
+            1. CASELOAD HEALTH — the 3-4 numbers that matter, not
+               eight equally-loud tiles.
+            ═══════════════════════════════════════════════════ */}
+        {/* The coach dashboard uses the same opening rhythm as the Super Admin
+            dashboard: a welcome row followed by the shared control hero. */}
+        <div className="flex flex-col justify-between gap-3 min-[1800px]:flex-row min-[1800px]:items-end">
+          <div>
+            <h1 className="font-heading text-2xl font-bold tracking-tight text-foreground-950 md:text-3xl">Welcome back, {ownerName}</h1>
+            <p className="mt-1 text-[11px] text-foreground-500 md:text-xs">Monitor your caseload health, learner progress and coaching actions in real time.</p>
+          </div>
+          <div className="flex items-center gap-2">
+            <Link
+              to="/coach/timetable"
+              className="inline-flex h-9 items-center gap-2 rounded-lg border border-foreground-200/70 bg-background-50 px-3 text-[11px] font-semibold text-foreground-700 shadow-sm transition-smooth hover:border-primary-300 hover:bg-primary-50/40"
+            >
+              <AppIcon className="ri-calendar-line text-sm text-foreground-500"></AppIcon>
+              <span>{formatWeekRangeLabel()}</span>
+              <AppIcon className="ri-arrow-right-s-line text-xs text-foreground-400"></AppIcon>
+            </Link>
+            <button
+              type="button"
+              onClick={scrollToAttention}
+              className="inline-flex h-9 items-center gap-2 rounded-lg border border-foreground-200/70 bg-background-50 px-3 text-[11px] font-semibold text-foreground-700 shadow-sm transition-smooth hover:border-primary-300 hover:bg-primary-50/40"
+            >
+              <AppIcon className="ri-filter-3-line text-sm text-foreground-500"></AppIcon>
+              <span>Filters</span>
+            </button>
+          </div>
+        </div>
+
+        <WorkspaceHeroBanner
+          eyebrow="Coaching"
+          title="Coach Control"
+          description="Caseload health, learner progress and coaching actions"
+          icon="ri-user-heart-line"
+          stats={[
+            { label: 'Caseload', value: String(totalCaseload) },
+            { label: 'At risk', value: String(atRiskCount) },
+            { label: 'Need action', value: String(needsActionCount) },
+          ]}
+        />
+
+        {/* ═══════════════════════════════════════════════════
+            2. TODAY & NEEDS ACTION — overdue reviews, at-risk
+               learners, evidence and unscheduled sessions.
+            ═══════════════════════════════════════════════════ */}
+
+
+        {(loading || loadWarning) && (
+          <div className={`rounded-lg border px-3.5 py-2.5 text-[12.5px] ${loadWarning ? 'border-amber-200 bg-amber-50 text-amber-800' : 'border-foreground-200/60 bg-background-50 text-foreground-500'}`}>
+            {loading ? 'Loading live coach dashboard data...' : loadWarning}
+          </div>
+        )}
+
+        {/* ═══════════════════════════════════════════════════
+            CASELOAD HEALTH
+            ═══════════════════════════════════════════════════ */}
+        <SectionReveal delay={70}>
+          <div className="min-w-0">
+            <div className="space-y-3">
+              <SectionHeader icon="ri-heart-pulse-line" title="Caseload health" />
+              <div className="grid grid-cols-2 gap-3 min-[1600px]:grid-cols-5">
+                <FilterMetricCard
+                  label="Caseload"
+                  value={totalCaseload}
+                  note={`${onTrackCount} on track`}
+                  tone="brand"
+                  icon="ri-group-line"
+                  active={kpiFilter === 'caseload'}
+                  onFilter={() => setSelectedKpi('caseload')}
+                />
+                <FilterMetricCard
+                  label="Active"
+                  value={activeLearners.length}
+                  note="Currently active"
+                  tone="positive"
+                  icon="ri-user-follow-line"
+                  active={kpiFilter === 'active'}
+                  onFilter={() => setSelectedKpi('active')}
+                />
+                <FilterMetricCard
+                  label="Paused"
+                  value={onBreakLearners.length}
+                  note="Programme paused"
+                  tone="caution"
+                  icon="ri-pause-line"
+                  active={kpiFilter === 'on-break'}
+                  onFilter={() => setSelectedKpi('on-break')}
+                />
+                <FilterMetricCard
+                  label="Completed"
+                  value={completedLearners.length}
+                  note="Finished the programme"
+                  tone="positive"
+                  icon="ri-verified-badge-line"
+                  active={kpiFilter === 'completed'}
+                  onFilter={() => setSelectedKpi('completed')}
+                />
+                <FilterMetricCard
+                  label="EPA"
+                  value={epaLearners.length}
+                  note="At EPA stage"
+                  tone="info"
+                  icon="ri-medal-line"
+                  active={kpiFilter === 'epa'}
+                  onFilter={() => setSelectedKpi('epa')}
+                />
+              </div>
+            </div>
+
+
+          </div>
+        </SectionReveal>
+
+        {/* ═══════════════════════════════════════════════════
+            3. LEARNERS REQUIRING ATTENTION  +  4. UPCOMING SCHEDULE
+            ═══════════════════════════════════════════════════ */}
+        <SectionReveal delay={100}>
+          <div className="grid grid-cols-1 items-stretch gap-4 min-[1800px]:grid-cols-3">
+
+            <div id="learner-caseload" className="scroll-mt-4 min-[1800px]:col-span-2">
+            <Panel className="flex h-full flex-col" padding="lg">
+              <SectionHeader
+                icon="ri-user-search-line"
+                title={attentionPanelTitle}
+                description={attentionPanelSubtitle}
+                actions={
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => setCaseloadExpanded(current => !current)}
+                      aria-expanded={caseloadExpanded}
+                      aria-controls="coach-caseload-content"
+                      aria-label={`${caseloadExpanded ? 'Collapse' : 'Expand'} caseload panel`}
+                      className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-foreground-200/70 bg-background-50 text-foreground-400 transition-colors hover:border-primary-200 hover:bg-primary-50 hover:text-primary-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary-300"
+                    >
+                      <AppIcon className={`${caseloadExpanded ? 'ri-arrow-down-s-line' : 'ri-arrow-right-s-line'} text-base`}></AppIcon>
+                    </button>
+                    <Link
+                      to="/coach/caseload"
+                      className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg border border-primary-100 bg-primary-50 px-3 py-1.5 text-[12px] font-semibold text-primary-700 transition-colors hover:bg-primary-100"
+                    >
+                      <AppIcon className="ri-group-line text-[13px]"></AppIcon>
+                      All learners
+                    </Link>
+                  </>
+                }
+              />
+
+              {caseloadExpanded && (
+                <div id="coach-caseload-content">
+                  {/* Priority queue filters */}
+                  <div className="mt-3.5">
+                    {kpiFilter ? (
+                      <FilterChip label="Filter" value={KPI_FILTER_LABEL[kpiFilter]} onRemove={() => setKpiFilter(null)} />
+                    ) : (
+                      <PageTabs
+                        label="Filter learners by priority"
+                        value={priorityFilter ?? 'all'}
+                        onChange={(next) => (next === 'all' ? setPriorityFilter(null) : applyPriorityFilter(next as PriorityKey))}
+                        items={priorityTabItems(attentionQueue.length, priorityCounts)}
+                      />
+                    )}
+                  </div>
+
+                  <div className={cn('mt-3.5 min-h-0 space-y-2.5', attentionHasOverflow && 'max-h-[36rem] overflow-y-auto pr-1.5')}>
+                    {loading && !attentionRows.length && <AttentionSkeleton />}
+                    {!loading && attentionRows.map((entry, index) => (
+                      <AttentionLearnerRow
+                        key={entry.learner.id}
+                        rank={index + 1}
+                        learner={entry.learner}
+                        priority={entry.priority}
+                        onOpen={() => navigate(`/coach/learner-case-file?id=${encodeURIComponent(entry.learner.id)}`, {
+                          state: {
+                            learnerId: entry.learner.id,
+                            learnerName: entry.learner.name,
+                            ...(entry.learner.learnerType ? { kind: entry.learner.learnerType } : {}),
+                            ...(entry.learner.enrolmentId ? { enrolmentId: entry.learner.enrolmentId } : {}),
+                          },
+                        })}
+                      />
+                    ))}
+                    {!loading && !attentionRows.length && (
+                      <EmptyState
+                        variant={kpiFilter || priorityFilter ? 'no-matches' : 'empty'}
+                        icon={kpiFilter || priorityFilter ? undefined : 'ri-shield-check-line'}
+                        title={kpiFilter || priorityFilter ? 'No learners match this filter' : 'No learners need attention'}
+                        description={kpiFilter || priorityFilter
+                          ? 'Clear the filter to see the full priority queue.'
+                          : 'Everyone on your caseload is on track for hours, attendance and reviews.'}
+                      />
+                    )}
+                  </div>
+                </div>
+              )}
+            </Panel>
+            </div>
+
+            {/* ── Upcoming Schedule (live sessions + calendar, merged) ── */}
+            <Panel className="coach-upcoming-schedule flex flex-col" padding="lg">
+              <SectionHeader
+                className="coach-upcoming-schedule__header"
+                icon="ri-calendar-schedule-line"
+                title="Upcoming schedule"
+                description={`Next ${COACHING_CALENDAR_WINDOW_DAYS} days · live, coaching & reviews`}
+                actions={
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => setScheduleExpanded(current => !current)}
+                      aria-expanded={scheduleExpanded}
+                      aria-controls="coach-schedule-content"
+                      aria-label={`${scheduleExpanded ? 'Collapse' : 'Expand'} upcoming schedule`}
+                      className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-foreground-200/70 bg-background-50 text-foreground-400 transition-colors hover:border-primary-200 hover:bg-primary-50 hover:text-primary-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary-300"
+                    >
+                      <AppIcon className={`${scheduleExpanded ? 'ri-arrow-down-s-line' : 'ri-arrow-right-s-line'} text-base`}></AppIcon>
+                    </button>
+                    <Link
+                      to="/coach/timetable"
+                      className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-primary-100 bg-primary-50 px-3 py-1.5 text-[12px] font-semibold text-primary-700 transition-colors hover:bg-primary-100"
+                    >
+                      <AppIcon className="ri-calendar-line text-[13px]"></AppIcon>
+                      Calendar
+                    </Link>
+                  </>
+                }
+              />
+
+              {scheduleExpanded && (
+                <div id="coach-schedule-content" className={cn('coach-upcoming-schedule__content mt-3.5 overflow-y-auto', !schedulePanelLoading && !upcomingScheduleGroups.length ? 'flex-1 justify-center' : 'max-h-[36rem] pr-1.5')}>
+                  {schedulePanelLoading && <ScheduleSkeleton />}
+                  {!schedulePanelLoading && upcomingScheduleGroups.map(group => (
+                    <div key={`schedule-group-${group.date}`} className="coach-upcoming-schedule__group rounded-lg border border-foreground-200/60 bg-background-100/40 p-3">
+                      <div className="coach-upcoming-schedule__group-header grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-b border-foreground-100 pb-2.5">
+                        <div className="flex min-w-0 items-center gap-2.5">
+                          <span className="shrink-0 text-[17px] font-bold leading-none tabular-nums text-foreground-900">{formatCalendarDayNumber(group.date)}</span>
+                          <span className="min-w-0 truncate text-[12px] font-semibold leading-tight text-foreground-700">{formatUpcomingLiveSessionDayLabel(group.date)}</span>
+                          <span className="shrink-0 text-[12px] leading-tight text-foreground-400">{formatCalendarWeekday(group.date)} &middot; {formatCalendarMonth(group.date)}</span>
+                        </div>
+                        <span className="coach-upcoming-schedule__count shrink-0 rounded-full bg-background-100 px-2 py-0.5 text-[12px] font-semibold leading-5 tabular-nums text-foreground-500">{group.events.length}</span>
+                      </div>
+                      <div className="coach-upcoming-schedule__events">
+                        {group.events.map(event => {
+                          const classes = eventStatusClasses(event);
+                          return (
+                            <Link
+                              key={event.eventKey || event.id}
+                              to="/coach/timetable"
+                              state={buildTimetableFocusState(event)}
+                              className="coach-upcoming-schedule__event group flex min-w-0 items-start gap-2.5 rounded-lg px-1.5 py-2 transition-colors hover:bg-background-50 hover:text-primary-800"
+                            >
+                              <span className={cn('flex h-7 w-[5.75rem] shrink-0 items-center justify-center rounded-md px-2 text-center text-[12px] font-bold leading-none tabular-nums whitespace-nowrap', classes.badge)}>
+                                {scheduleEventTime(event)}
+                              </span>
+                              <AppIcon className={cn('mt-1 flex h-4 w-4 shrink-0 items-center justify-center text-[14px] transition-transform group-hover:translate-x-0.5', classes.icon)}></AppIcon>
+                              <span className="min-w-0 flex-1 pt-0.5">
+                                <span className="block whitespace-normal break-words text-[13px] font-semibold leading-tight text-foreground-900">{scheduleEventTitle(event)}</span>
+                                <span className="mt-1 block min-w-0 truncate text-[12px] leading-tight text-foreground-400">{scheduleEventMeta(event)}</span>
+                              </span>
+                            </Link>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ))}
+                  {!schedulePanelLoading && !upcomingScheduleGroups.length && (
+                    <EmptyState
+                      size="sm"
+                      icon="ri-calendar-check-line"
+                      title="Nothing scheduled"
+                      description={calendarError || liveSessionsError || `Nothing scheduled in the next ${COACHING_CALENDAR_WINDOW_DAYS} days.`}
+                    />
+                  )}
+                </div>
+              )}
+            </Panel>
+          </div>
+        </SectionReveal>
+
+      </WorkspaceDashboardLayout>
+
+      {selectedKpi && (
+        <KpiDetailModal
+          type={selectedKpi}
+          learners={enrichedLearners}
+          calendarEvents={activeCalendarEvents}
+          evidenceQueue={evidenceLearners}
+          pendingEvidence={pendingEvidence}
+          completedEvidence={completedEvidence}
+          onClose={() => setSelectedKpi(null)}
+          onFilter={(filter) => {
+            setSelectedKpi(null);
+            openCaseloadFilter(filter);
+          }}
+        />
+      )}
+    </WorkspaceShell>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════
+   Metric cards — MetricCard/CompactMetric only filter the list
+   below when clicked, per the shared component's contract. The
+   overlay button adds the one thing that contract doesn't cover
+   for this page: a corner control that opens the KPI drill-down
+   modal without turning the whole card into a nested button.
+   ═══════════════════════════════════════════════════════════ */
+function FilterMetricCard({ label, value, note, tone, icon, active, onFilter }: {
+  label: string;
+  value: number;
+  note?: string;
+  tone: StatusTone;
+  icon: string;
+  active: boolean;
+  onFilter: () => void;
+}) {
+  return (
+    <div className="relative">
+      <MetricCard
+        label={label}
+        value={value}
+        valuePosition="end"
+        note={note}
+        tone={tone}
+        icon={icon}
+        iconClassName="!bg-primary-100/60 !text-primary-600"
+        active={active}
+        className={cn(
+          'border border-transparent transition-all',
+          active ? 'border-primary-300 bg-primary-50/60 shadow-md ring-2 ring-primary-300/70' : '',
+        )}
+      />
+      <button
+        type="button"
+        onClick={onFilter}
+        aria-pressed={active}
+        aria-label={`Open ${label} details`}
+        title={`Open ${label} details`}
+        className="absolute inset-0 rounded-2xl focus:outline-none focus-visible:ring-2 focus-visible:ring-primary-300"
+      />
+      <span className="pointer-events-none absolute right-2 top-2 z-10 text-foreground-400">
+        <AppIcon className="ri-arrow-right-up-line text-[14px]"></AppIcon>
+      </span>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════
+   Today / Needs Action row
+   ═══════════════════════════════════════════════════════════ */
+interface ActionItem {
+  id: string;
+  label: string;
+  hint: string;
+  count: number;
+  icon: string;
+  tone: 'danger' | 'warning';
+  to?: string;
+  onClick?: () => void;
+}
+
+const ACTION_TONE: Record<ActionItem['tone'], StatusTone> = { danger: 'critical', warning: 'caution' };
+
+/* ═══════════════════════════════════════════════════════════
+   Priority filter tabs — "All" plus the five ranked reasons,
+   in priority order, hiding whichever have nothing in them.
+   ═══════════════════════════════════════════════════════════ */
+function priorityTabItems(totalCount: number, counts: Record<PriorityKey, number>): PageTabItem[] {
+  return [
+    { value: 'all', label: 'All', count: totalCount },
+    ...PRIORITY_ORDER.map(key => ({
+      value: key,
+      label: PRIORITY_META[key].label,
+      count: counts[key],
+      tone: PRIORITY_TONE[key],
+      hideWhenEmpty: true,
+    })),
+  ];
+}
+
+/* ═══════════════════════════════════════════════════════════
+   Learners Requiring Attention — one row per learner: rank,
+   who, why, and the four figures a coach checks before opening
+   the case file.
+   ═══════════════════════════════════════════════════════════ */
+function AttentionLearnerRow({ rank, learner, priority, onOpen }: {
+  rank: number;
+  learner: CoachLearner;
+  priority: LearnerPriority;
+  onOpen: () => void;
+}) {
+  const primary = priority.primary;
+  const tone = primary ? PRIORITY_TONE[primary.key] : 'neutral';
+  const extraReasons = Math.max(priority.reasons.length - 1, 0);
+
+  const otjhPercent = otjhPercentFor(learner);
+  const otjhLabel = learner.otjhTarget > 0 ? `${formatHours(learner.otjhCompleted)} / ${formatHours(learner.otjhTarget)}` : EMPTY_VALUE;
+  const progressLabel = learner.overallProgressAvailable ? `${learner.overallProgress}%` : EMPTY_VALUE;
+  const attendanceLabel = learner.attendanceRateAvailable ? `${learner.attendanceRate}%` : EMPTY_VALUE;
+  const review = nextReviewCell(learner);
+  const programmeLine = learner.group !== EMPTY_VALUE ? learner.group : learner.programme;
+
+  const detail = [
+    primary?.detail,
+    programmeLine !== EMPTY_VALUE ? programmeLine : null,
+    extraReasons > 0 ? `+${extraReasons} more reason${extraReasons === 1 ? '' : 's'}` : null,
+  ].filter(Boolean).join(' · ') || undefined;
+
+  return (
+    <ActionRow
+      tone={tone}
+      onClick={onOpen}
+      leading={<LearnerAvatar name={learner.name} initials={learner.initials} tone={tone} />}
+      title={
+        <span className="flex items-center gap-2">
+          <span className="hidden text-[12px] font-semibold text-foreground-300 lg:inline">{rank}</span>
+          {learner.name}
+        </span>
+      }
+      status={primary ? <StatusBadge tone={tone} label={PRIORITY_META[primary.key].label} size="sm" /> : null}
+      subtitle={
+        primary
+          ? <ReasonLine icon={PRIORITY_META[primary.key].icon} label={primary.label} detail={detail} tone={tone} />
+          : 'On track across hours, attendance and reviews'
+      }
+      meta={
+        <div className="grid grid-cols-2 gap-x-5 gap-y-2 sm:grid-cols-4">
+          <CompactMetric label="Progress" value={progressLabel} tone={percentTone(learner.overallProgressAvailable ? learner.overallProgress : null, 40, 75)} />
+          <CompactMetric label="OTJH" value={otjhLabel} tone={percentTone(otjhPercent, 45, 75)} />
+          <CompactMetric label="Attendance" value={attendanceLabel} tone={percentTone(learner.attendanceRateAvailable ? learner.attendanceRate : null, ATTENDANCE_MINIMUM_RATE, ATTENDANCE_EXPECTED_RATE)} />
+          <CompactMetric label="Next review" value={review.value} tone={review.tone} />
+        </div>
+      }
+      actions={<AppIcon className="ri-arrow-right-s-line text-[15px] text-foreground-300"></AppIcon>}
+    />
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════
+   Next review cell — an overdue review says so rather than
+   showing a date the coach has to compare against today.
+   ═══════════════════════════════════════════════════════════ */
+function nextReviewCell(learner: CoachLearner): { value: string; tone: StatusTone } {
+  if (learner.nextReviewStatus === 'overdue') return { value: 'Overdue', tone: 'critical' };
+  if (learner.nextReviewStatus === 'needs-schedule') return { value: shortDateLabel(learner.nextReview), tone: 'caution' };
+  if (learner.nextReviewStatus === 'upcoming') return { value: shortDateLabel(learner.nextReview), tone: 'neutral' };
+  return { value: EMPTY_VALUE, tone: 'neutral' };
+}
+
+/* ═══════════════════════════════════════════════════════════
+   KPI drill-down modal
+   ═══════════════════════════════════════════════════════════ */
+function KpiDetailModal({ type, learners, calendarEvents, evidenceQueue, pendingEvidence, completedEvidence, onClose, onFilter }: {
+  type: DashboardKpi;
+  learners: CoachLearner[];
+  calendarEvents: CoachCalendarEvent[];
+  evidenceQueue: EvidenceQueueLearner[];
+  pendingEvidence: number;
+  completedEvidence: number;
+  onClose: () => void;
+  onFilter: (filter: DashboardKpi) => void;
+}) {
+  const navigate = useNavigate();
+  const meta: Record<DashboardKpi, { title: string; subtitle: string; icon: string; iconStyle: string }> = {
+    caseload: { title: 'Learner caseload', subtitle: 'All learners currently assigned to you', icon: 'ri-group-line', iconStyle: 'bg-primary-100 text-primary-600' },
+    active: { title: 'Active learners', subtitle: 'Learners currently active on their programme', icon: 'ri-user-follow-line', iconStyle: 'bg-emerald-100 text-emerald-600' },
+    'on-break': { title: 'Paused learners', subtitle: 'Learners whose programme is currently paused', icon: 'ri-pause-line', iconStyle: 'bg-amber-100 text-amber-600' },
+    'on-track': { title: 'Learners on track', subtitle: 'Learners currently meeting their OTJH target', icon: 'ri-checkbox-circle-line', iconStyle: 'bg-emerald-100 text-emerald-600' },
+    'at-risk': { title: 'Learners at risk', subtitle: 'Learners requiring immediate coaching action', icon: 'ri-alarm-warning-line', iconStyle: 'bg-red-100 text-red-600' },
+    'need-attention': { title: 'Learners needing attention', subtitle: 'Learners who need targeted support this week', icon: 'ri-error-warning-line', iconStyle: 'bg-amber-100 text-amber-600' },
+    completed: { title: 'Completed learners', subtitle: 'Learners who have finished the programme', icon: 'ri-verified-badge-line', iconStyle: 'bg-green-100 text-green-700' },
+    epa: { title: 'EPA learners', subtitle: 'Learners currently at the end-point assessment stage', icon: 'ri-award-line', iconStyle: 'bg-secondary-100 text-secondary-700' },
+    evidence: { title: 'Evidence awaiting review', subtitle: 'Evidence submissions and review status', icon: 'ri-file-search-line', iconStyle: 'bg-secondary-100 text-secondary-600' },
+    reviews: { title: 'Upcoming reviews', subtitle: 'Progress reviews scheduled in the next 14 days', icon: 'ri-file-chart-line', iconStyle: 'bg-primary-100 text-primary-600' },
+  };
+  const current = meta[type];
+  const filterForType: Partial<Record<DashboardKpi, DashboardKpi>> = {
+    caseload: 'caseload',
+    active: 'active',
+    'on-break': 'on-break',
+    'on-track': 'on-track',
+    'at-risk': 'at-risk',
+    'need-attention': 'need-attention',
+    completed: 'completed',
+    epa: 'epa',
+  };
+  const modalLearners = type === 'caseload'
+    ? learners
+    : type === 'active'
+      ? learners.filter(isActiveLearner)
+      : type === 'on-break'
+        ? learners.filter(isOnBreakLearner)
+      : type === 'completed'
+        ? learners.filter(isCompletedLearner)
+      : type === 'epa'
+        ? learners.filter(isEpaLearner)
+    : type === 'on-track' || type === 'at-risk' || type === 'need-attention'
+      ? learners.filter(learner => isActiveLearner(learner) && normalizeOtjhStatus(learner.otjhStatus) === type)
+      : [];
+  const reviews = sortEvents(calendarEvents.filter(event => event.source === 'progress-review' && isWithinNextDays(event, 14)));
+  const evidenceLearners = evidenceQueue;
+
+  useEffect(() => {
+    const previousOverflow = document.body.style.overflow;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose();
+    };
+
+    document.body.style.overflow = 'hidden';
+    window.addEventListener('keydown', handleKeyDown);
+
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [onClose]);
+
+  const openLearnerProfile = (learner: CoachLearner) => {
+    navigate(`/coach/learner-case-file?id=${encodeURIComponent(learner.id)}`, {
+      state: {
+        learnerId: learner.id,
+        learnerName: learner.name,
+        ...(learner.learnerType ? { kind: learner.learnerType } : {}),
+        ...(learner.enrolmentId ? { enrolmentId: learner.enrolmentId } : {}),
+      },
+    });
+    onClose();
+  };
+
+  // Scrolls the whole overlay rather than centring a fixed-height box. A
+  // centred flex item taller than its container overflows in BOTH directions,
+  // and the half above the viewport cannot be scrolled back to -- which cropped
+  // the header, cutting the icon in half and pushing the title under the panel
+  // edge. `my-auto` inside a `min-h-full` wrapper still centres a short dialog,
+  // while a tall one starts at the top where it can actually be read.
+  return createPortal(
+    <div className="fixed inset-0 z-[9999] overflow-y-auto overscroll-contain p-3 sm:p-6 lg:p-8" role="dialog" aria-modal="true" aria-labelledby="kpi-modal-title" aria-describedby="kpi-modal-description">
+      <button type="button" onClick={onClose} className="fixed inset-0 bg-foreground-950/10 backdrop-blur-[5px] backdrop-saturate-125" aria-label="Close popup"></button>
+      <div className="relative mx-auto flex min-h-full w-full max-w-5xl items-start justify-center">
+        <div className="relative my-auto flex max-h-[88vh] w-full flex-col overflow-hidden rounded-2xl border border-white/80 bg-background-50 shadow-xl">
+        {/* shrink-0 so a long caseload cannot squeeze the header away: the body
+            below is the flex child that scrolls, and this stays put. */}
+        <header className="relative z-10 shrink-0 overflow-hidden border-b border-foreground-100/80 bg-gradient-to-r from-primary-50/90 via-background-50 to-secondary-50/60 px-5 py-5 sm:px-7 sm:py-6">
+          <div className="pointer-events-none absolute -right-12 -top-20 h-48 w-48 rounded-full bg-primary-200/25 blur-3xl"></div>
+          <div className="relative flex items-start justify-between gap-4">
+            <div className="flex min-w-0 items-center gap-4">
+              <span className={`flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl shadow-sm ring-1 ring-white/80 sm:h-14 sm:w-14 ${current.iconStyle}`}><AppIcon className={`${current.icon} text-xl`}></AppIcon></span>
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2.5">
+                  <h2 id="kpi-modal-title" className="font-heading text-xl font-bold tracking-tight text-foreground-900 sm:text-2xl">{current.title}</h2>
+                  <span className="inline-flex h-7 min-w-7 items-center justify-center rounded-full border border-primary-200/80 bg-background-50 px-2.5 text-xs font-bold text-primary-700 shadow-sm">{type === 'evidence' ? pendingEvidence : type === 'reviews' ? reviews.length : modalLearners.length}</span>
+                </div>
+                <p id="kpi-modal-description" className="mt-1.5 text-xs leading-5 text-foreground-500 sm:text-sm">{current.subtitle}</p>
+              </div>
+            </div>
+            <button type="button" onClick={onClose} className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-foreground-200/80 bg-background-50/90 text-foreground-500 shadow-sm transition-all hover:-translate-y-0.5 hover:border-foreground-300 hover:text-foreground-800 focus:outline-none focus:ring-2 focus:ring-primary-300 focus:ring-offset-2" aria-label="Close"><AppIcon className="ri-close-line text-xl"></AppIcon></button>
+          </div>
+        </header>
+
+        <div className="min-h-0 flex-1 overflow-y-auto bg-gradient-to-b from-background-50 to-background-100/50 p-4 sm:p-6">
+          {(type === 'caseload' || type === 'active' || type === 'on-break' || type === 'on-track' || type === 'at-risk' || type === 'need-attention' || type === 'completed' || type === 'epa') && (
+            <div className="space-y-3.5">
+              {modalLearners.map(learner => {
+                const status = OTJH_STATUS_META[normalizeOtjhStatus(learner.otjhStatus)];
+                const attendance = learner.attendanceRateAvailable ? `${learner.attendanceRate}%` : EMPTY_VALUE;
+                const otjh = learner.otjhTarget > 0 ? `${learner.otjhCompleted}/${learner.otjhTarget}` : EMPTY_VALUE;
+                return (
+                  <button
+                    key={learner.id}
+                    type="button"
+                    onClick={() => openLearnerProfile(learner)}
+                    className="group grid w-full gap-4 rounded-2xl border border-foreground-200/80 bg-background-50 p-4 text-left shadow-sm transition-colors hover:border-primary-200 focus:outline-none focus:ring-2 focus:ring-primary-300 focus:ring-offset-2 sm:grid-cols-[minmax(0,1fr)_auto] sm:p-5 lg:grid-cols-[minmax(0,1fr)_minmax(320px,0.72fr)_auto] lg:items-center"
+                    title={`Open ${learner.name}'s profile`}
+                    aria-label={`Open ${learner.name}'s profile`}
+                  >
+                    <div className="flex min-w-0 items-center gap-3.5">
+                      <LearnerAvatar name={learner.name} initials={learner.initials} tone={learnerAvatarTone(learner)} size="lg" />
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="truncate text-sm font-bold text-foreground-900 transition-colors group-hover:text-primary-700 sm:text-[15px]">{learner.name}</span>
+                          {type === 'active' || type === 'on-break' ? (
+                            <StatusBadge tone={isActiveLearner(learner) ? 'positive' : 'caution'} label={displayValue(learner.rawProgramStatus)} size="sm" />
+                          ) : type === 'completed' || type === 'epa' ? (
+                            <StatusBadge tone={type === 'completed' ? 'positive' : 'info'} label={type === 'completed' ? 'Completed' : 'EPA'} size="sm" />
+                          ) : (
+                            <StatusBadge tone={status.tone} label={status.label} size="sm" />
+                          )}
+                        </div>
+                        <p className="mt-1 truncate text-xs text-foreground-500">{learner.programme} <span className="text-foreground-300">·</span> {learner.group}</p>
+                      </div>
+                    </div>
+                    <div className="grid min-w-0 grid-cols-3 gap-2 text-center sm:col-span-2 lg:col-span-1 lg:min-w-[320px]">
+                      <ModalMiniMetric label="OTJH" value={otjh} />
+                      <ModalMiniMetric label="KSB" value={ksbCellValue(learner)} />
+                      <ModalMiniMetric label="Attendance" value={attendance} tone={percentTone(learner.attendanceRateAvailable ? learner.attendanceRate : null, ATTENDANCE_MINIMUM_RATE, ATTENDANCE_EXPECTED_RATE)} />
+                    </div>
+                    <span className="hidden h-10 w-10 items-center justify-center rounded-lg bg-background-100 text-foreground-400 transition-colors group-hover:bg-primary-50 group-hover:text-primary-700 sm:flex"><AppIcon className="ri-arrow-right-s-line text-xl"></AppIcon></span>
+                  </button>
+                );
+              })}
+              {!modalLearners.length && (
+                <EmptyState icon={current.icon} title="No learners in this status" description="This list will update automatically when learner data changes." />
+              )}
+            </div>
+          )}
+
+          {type === 'evidence' && (
+            <div className="space-y-3">
+              {evidenceLearners.map(learner => {
+                // The marking queue has no learnerType of its own -- cross-reference the
+                // caseload list already loaded on this page instead of guessing.
+                const caseloadMatch = learners.find(candidate => candidate.id === learner.learnerId);
+                return (
+                <Link
+                  key={learner.id}
+                  to={`/coach/learner-case-file?id=${encodeURIComponent(learner.learnerId)}&tab=evidence`}
+                  state={{
+                    learnerId: learner.learnerId,
+                    learnerName: learner.learner,
+                    tab: 'evidence',
+                    ...(caseloadMatch?.learnerType ? { kind: caseloadMatch.learnerType } : {}),
+                    ...(caseloadMatch?.enrolmentId ? { enrolmentId: caseloadMatch.enrolmentId } : {}),
+                  }}
+                  onClick={onClose}
+                  className="flex items-center gap-3 rounded-2xl border border-foreground-200/70 bg-background-50 px-4 py-3 shadow-sm transition-colors hover:border-secondary-200 hover:bg-secondary-50/30"
+                >
+                  <LearnerAvatar name={learner.learner} initials={learner.initials} tone="brand" />
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-[13px] font-semibold text-foreground-900">{learner.learner}</p>
+                    <p className="mt-0.5 truncate text-[12px] text-foreground-400">{learner.programme} · {learner.group}</p>
+                  </div>
+                  <div className="text-right">
+                    <p className="text-sm font-bold text-secondary-700">{learner.pendingEvidence} / {learner.totalEvidence}</p>
+                    <p className="text-[12px] text-foreground-400">Pending / Total</p>
+                    {learner.isOverdue && <p className="mt-0.5 text-[12px] font-semibold text-red-600">Overdue</p>}
+                  </div>
+                  <AppIcon className="ri-arrow-right-s-line text-foreground-300"></AppIcon>
+                </Link>
+                );
+              })}
+              {!evidenceLearners.length && (
+                <EmptyState icon="ri-file-search-line" title="No evidence awaiting review" description="Learners will appear here when submitted evidence needs marking." />
+              )}
+            </div>
+          )}
+
+          {type === 'reviews' && (
+            <div className="space-y-2">
+              {reviews.map(event => {
+                const date = eventDisplayDate(event);
+                return (
+                  <div key={event.eventKey || event.id} className="flex items-center gap-3 rounded-lg border border-foreground-100 p-3">
+                    <span className="flex h-10 w-10 shrink-0 flex-col items-center justify-center rounded-lg bg-primary-50 text-primary-700">
+                      <span className="text-[12px] font-bold uppercase">{formatCalendarMonth(date)}</span>
+                      <span className="text-sm font-bold leading-none">{formatCalendarDayNumber(date)}</span>
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate text-[13px] font-semibold text-foreground-900">{displayValue(event.learner)}</p>
+                      <p className="mt-0.5 text-[12px] text-foreground-400">{formatTimeLabel(event)} · {eventTypeLabel(event)}</p>
+                    </div>
+                    <AppIcon className="ri-arrow-right-s-line text-foreground-300"></AppIcon>
+                  </div>
+                );
+              })}
+              {!reviews.length && (
+                <EmptyState icon="ri-calendar-check-line" title="No reviews due" description="There are no progress reviews scheduled in the next 14 days." />
+              )}
+            </div>
+          )}
+        </div>
+
+        <footer className="flex flex-wrap items-center justify-end gap-2.5 border-t border-foreground-100 bg-background-100/60 px-5 py-4 sm:px-7">
+          <button type="button" onClick={onClose} className="rounded-xl border border-foreground-200 bg-background-50 px-4 py-2.5 text-xs font-semibold text-foreground-700 shadow-sm transition-colors hover:bg-background-100 focus:outline-none focus:ring-2 focus:ring-primary-300 focus:ring-offset-2">Close</button>
+          {filterForType[type] && <button type="button" onClick={() => onFilter(filterForType[type]!)} className="primary-action rounded-xl bg-primary-600 px-4 py-2.5 text-xs font-semibold text-white shadow-sm transition-colors hover:bg-primary-700 focus:outline-none focus:ring-2 focus:ring-primary-300 focus:ring-offset-2">View in caseload list</button>}
+          {type === 'evidence' && <Link to="/coach/marking-queue" onClick={onClose} className="primary-action rounded-xl bg-primary-600 px-4 py-2.5 text-xs font-semibold text-white shadow-sm transition-colors hover:bg-primary-700 focus:outline-none focus:ring-2 focus:ring-primary-300 focus:ring-offset-2">Open marking queue</Link>}
+          {type === 'reviews' && <Link to="/coach/progress-reviews" onClick={onClose} className="primary-action rounded-xl bg-primary-600 px-4 py-2.5 text-xs font-semibold text-white shadow-sm transition-colors hover:bg-primary-700 focus:outline-none focus:ring-2 focus:ring-primary-300 focus:ring-offset-2">Open reviews</Link>}
+        </footer>
+        </div>
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
+function ModalMiniMetric({ label, value, tone = 'neutral' }: { label: string; value: string; tone?: StatusTone }) {
+  const style = toneStyle(tone);
+  const toneClass = tone === 'neutral'
+    ? 'border-foreground-200/60 bg-background-50 text-foreground-800'
+    : cn(style.border, style.bg, style.text);
+
+  return (
+    <div className={cn('min-w-0 rounded-lg border px-2 py-2.5 sm:px-3', toneClass)}>
+      <p className="truncate text-xs font-bold leading-none sm:text-sm">{value}</p>
+      <p className="mt-1.5 truncate text-[12px] font-semibold uppercase tracking-[0.08em] opacity-70">{label}</p>
+    </div>
+  );
+}

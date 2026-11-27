@@ -1,0 +1,392 @@
+import { LoadingSkeleton } from '@/components/feature/LoadingSkeleton';
+import { lazy, Suspense, useEffect, useId, useMemo, useRef, useState } from 'react';
+import { LearnerLoadError } from '@/components/feature/LearnerLoadError';
+import DOMPurify from 'dompurify';
+import { VideoPlayer, parseVideoUrl } from '@/components/feature/VideoPlayer';
+import { SlideDeckViewer } from '@/components/feature/SlideDeckViewer';
+import { resolveDocEmbed } from '@/lib/docEmbed';
+import { normalizeReadingHtml } from '@/lib/readingHtml';
+import { previewUrl } from '@/features/old-otjh/previewUrl';
+import { subjectRequest, type SubjectMaterial, type SubjectAttemptResult } from '@/api/studentActivity';
+import { RetakeTimeDialog, type RetakeTimeChoice } from '@/components/feature/RetakeTimeDialog';
+import type { TimeTrackingSession } from '@/api/timeTracking';
+import { CompletionTimeDialog } from '@/components/feature/CompletionTimeDialog';
+import { declaredCompletedAt as completionInstant, ukDateKey, workingRuleFailure, type WorkingRuleReason } from '@/lib/completionValidation';
+import { useLegacyStudySession } from './useLegacyStudySession';
+import { ActivityElapsedTimer } from '../video-watch/ActivityElapsedTimer';
+import { ActivityTimeSpentInput } from '../video-watch/ActivityTimeSpentInput';
+import { useManualTimeConfirmation } from '@/hooks/useManualTimeConfirmation';
+
+const AttachmentPreview = lazy(() => import('../video-watch/page').then((module) => ({ default: module.InlineAttachmentPreview })));
+type StartedAttempt = { attempt_id: string; definition: Partial<SubjectMaterial>; timing: TimeTrackingSession };
+const pendingStarts = new Map<string, Promise<StartedAttempt>>();
+const videoProviders = new Set(['youtube.com', 'www.youtube.com', 'm.youtube.com', 'youtu.be',
+  'vimeo.com', 'www.vimeo.com', 'player.vimeo.com']);
+
+function isVideoMaterial(item: SubjectMaterial['media'][number]) {
+  try {
+    const url = new URL(item.url, window.location.origin);
+    return url.hostname !== 'open.spotify.com' && (item.kind === 'video' || videoProviders.has(url.hostname));
+  } catch { return false; }
+}
+
+function studyClock(seconds: number) {
+  const total = Math.floor(seconds);
+  return [Math.floor(total / 3600), Math.floor(total / 60) % 60, total % 60].map(value => String(value).padStart(2, '0')).join(':');
+}
+
+function previousSelections(data: SubjectMaterial): Record<string, string[]> {
+  const text = (value: string) => new DOMParser().parseFromString(value, 'text/html').body.textContent?.replace(/\s+/g, ' ').trim() || '';
+  // The API orders submitted attempts newest first. Never mix attempts or
+  // reuse positional option IDs against a potentially changed question bank.
+  const latest = data.history[0];
+  const selections: Record<string, string[]> = {};
+  for (const question of data.quiz?.questions || []) {
+    const matches = latest
+      ? (latest.answer_review || []).filter((answer) => text(answer.question) === text(question.text))
+        .map((answer) => answer.CHANGE_ME)
+      : data.historical.answers.filter((answer) => String(answer.question_id) === question.id && text(answer.question_body) === text(question.text))
+        .map((answer) => Array.isArray(answer.learner_answer) ? answer.learner_answer : [answer.learner_answer]);
+    if (matches.length !== 1 || !matches[0].length) continue;
+    const ids: string[] = [];
+    for (const CHANGE_ME of matches[0]) {
+      if (typeof CHANGE_ME !== 'string') break;
+      const options = question.options.filter((option) => text(option.text) === text(CHANGE_ME));
+      if (options.length !== 1) break;
+      ids.push(options[0].id);
+    }
+    if (ids.length === matches[0].length) selections[question.id] = ids;
+  }
+  return selections;
+}
+
+function Html({ value }: { value: string }) {
+  // Memoised so a parent re-render (ticking a checkbox, picking a quiz answer)
+  // keeps the same innerHTML object: React 19 re-applies innerHTML on a new
+  // identity, which would restart any embedded <video>.
+  const { innerHtml, embeds } = useMemo(() => {
+    const normalized = normalizeReadingHtml(value);
+    const clean = DOMPurify.sanitize(normalized, { FORBID_TAGS: ['form'], FORBID_ATTR: ['srcdoc'] });
+    const document = new DOMParser().parseFromString(normalized, 'text/html');
+    return {
+      innerHtml: { __html: clean },
+      embeds: [...document.querySelectorAll('iframe')].map((frame) => frame.getAttribute('src') || '').filter((url) => /^https?:\/\//i.test(url)),
+    };
+  }, [value]);
+  return <div className="space-y-4"><div className="prose max-w-none break-words" dangerouslySetInnerHTML={innerHtml} />
+    {embeds.map((url, index) => <Media key={`${index}:${url}`} value={url} kind="embed" title={`Embedded content ${index + 1}`} />)}
+  </div>;
+}
+
+export function Media({ value, kind, title, fileName, canEmbed = true, onEnded, onPlayingChange, onUnsupported }: {
+  value: string; kind: string; title: string; fileName?: string; canEmbed?: boolean; onEnded?: () => void; onPlayingChange?: (playing: boolean) => void; onUnsupported?: () => void;
+}) {
+  let url: URL;
+  try { url = new URL(value, window.location.origin); } catch { return <p>Material link is unavailable.</p>; }
+  if (!['https:', 'http:'].includes(url.protocol)) return <p>Material link is unavailable.</p>;
+  const fileUrl = url.href;
+  const storedFile = url.origin === window.location.origin
+    && (/^\/learner_api\/student-activity\/[^/]+\/\d+\/\d+\/\d+\/source-file\/$/.test(url.pathname)
+      || /^\/login_api\/advanced-admin\/learners\/\d+\/learning\/material\/\d+\/\d+\/source-file\/$/.test(url.pathname));
+  const original = <a href={fileUrl} target="_blank" rel="noopener noreferrer" className="text-sm font-semibold text-primary-700 underline">Open material in a new tab</a>;
+  if (!canEmbed) return <div className="rounded-xl border bg-background-100 p-4"><p className="mb-2 text-sm">Open this material in a new tab to view it.</p>{original}</div>;
+  // Legacy type labels can describe the lesson rather than its linked media.
+  // Provider pages need their embedded player, even in a reading/audio lesson.
+  const spotify = url.hostname === 'open.spotify.com';
+  const providerVideo = videoProviders.has(url.hostname);
+  const providerUrl = spotify || providerVideo ? previewUrl(fileUrl) || fileUrl : fileUrl;
+  const parsedVideo = parseVideoUrl(providerUrl);
+  // Preserve private Vimeo access parameters already handled by previewUrl.
+  if (providerVideo && parsedVideo.kind === 'vimeo') parsedVideo.src = providerUrl;
+  if (!spotify && (kind === 'video' || providerVideo)) return <section className="space-y-2"><div className="relative aspect-video overflow-hidden rounded-xl bg-black"><VideoPlayer parsed={storedFile ? { kind: 'file', src: fileUrl } : parsedVideo} title={title} onEnded={onEnded} onPlayingChange={onPlayingChange} onUnsupported={onUnsupported} /></div>{original}</section>;
+  if (kind === 'pdf') return <section className="space-y-2"><Suspense fallback={<p ><LoadingSkeleton label="Loading file preview…" variant="rows" /></p>}><AttachmentPreview url={fileUrl} title={title} fileName={fileName || 'document.pdf'} /></Suspense>{original}</section>;
+  if (kind === 'audio' && !spotify) {
+    const drive = url.href.match(/drive\.google\.com\/(?:file\/d\/|(?:open|uc)\?[^#]*id=)([\w-]{10,})/);
+    return <section className="space-y-2"><audio controls src={drive ? `/learner_api/media/google-drive/${drive[1]}/` : fileUrl}
+      onPlaying={e => onPlayingChange?.(!e.currentTarget.muted && e.currentTarget.volume > 0)}
+      onPause={() => onPlayingChange?.(false)} onSeeking={() => onPlayingChange?.(false)}
+      onSeeked={e => onPlayingChange?.(!e.currentTarget.paused && !e.currentTarget.muted && e.currentTarget.volume > 0)}
+      onVolumeChange={e => onPlayingChange?.(!e.currentTarget.paused && !e.currentTarget.muted && e.currentTarget.volume > 0)}
+      onWaiting={() => onPlayingChange?.(false)} onEnded={() => { onPlayingChange?.(false); onEnded?.(); }} className="w-full" />{original}</section>;
+  }
+  if (storedFile && kind === 'document') {
+    if (/\.(pptx?|ppsx?|pptm|ppsm|doc|docm)$/i.test(fileName || '')) {
+      const preview = new URL(fileUrl);
+      preview.searchParams.set('preview', '1');
+      return <section className="space-y-2"><iframe title={title} src={preview.href} className="h-[65vh] min-h-[320px] w-full rounded-xl border bg-white" allowFullScreen />{original}</section>;
+    }
+    return <section className="space-y-2"><Suspense fallback={<p ><LoadingSkeleton label="Loading file preview…" variant="rows" /></p>}><AttachmentPreview url={fileUrl} title={title} fileName={fileName} /></Suspense>{original}</section>;
+  }
+  if (url.origin === window.location.origin && /\.(docx|xlsx?|csv|txt|md|rtf|pdf|pptx|ppsx|pptm|ppsm)$/i.test(url.pathname)) return <section className="space-y-2"><Suspense fallback={<p ><LoadingSkeleton label="Loading file preview…" variant="rows" /></p>}><AttachmentPreview url={url.href} title={title} /></Suspense>{original}</section>;
+  let src = providerUrl;
+  if (url.hostname === 'drive.google.com') src = src.replace(/\/view(?:\?.*)?$/, '/preview');
+  else if (/\.(pdf|pptx|ppsx|pptm|docx?|xlsx?)$/i.test(url.pathname) || /docs\.google\.com/.test(url.hostname)) {
+    const embed = resolveDocEmbed(url.href);
+    if (embed.mode === 'deck') return <div className="space-y-2"><SlideDeckViewer src={embed.src} title={title} fallback={(reason) => <p>{reason}</p>} />{original}</div>;
+    if (embed.mode === 'unavailable') return <div className="space-y-2"><p className="text-sm">{embed.reason}</p>{original}</div>;
+    src = embed.src;
+  }
+  return <section className="space-y-2"><iframe title={title} src={src} className="h-[65vh] min-h-[320px] w-full rounded-xl border bg-white"
+    sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-downloads allow-presentation" allow="autoplay; fullscreen; picture-in-picture" allowFullScreen />{original}</section>;
+}
+
+type StudentMaterialProps = {
+  kind: string; learnerId: string; groupId: number; activityId: number; completed?: boolean;
+  onProgress?: (result: SubjectAttemptResult) => void; readOnly?: boolean; baseUrl?: string; reviewQuiz?: boolean; catalogueQuiz?: boolean;
+  readingOnly?: boolean; active?: boolean; allowCompletionDate?: boolean;
+};
+
+export function StudentMaterial(props: StudentMaterialProps) {
+  // Switching learner/placement must also close pending confirmation dialogs
+  // and invalidate async work belonging to the previous activity.
+  const identity = JSON.stringify([props.kind, props.learnerId, props.groupId, props.activityId,
+    props.baseUrl, !!props.catalogueQuiz, !!props.reviewQuiz, !!props.readOnly, !!props.readingOnly]);
+  return <StudentMaterialContent key={identity} {...props} />;
+}
+
+function StudentMaterialContent({ kind, learnerId, groupId, activityId, completed = false, onProgress, readOnly = false, baseUrl, reviewQuiz = false, catalogueQuiz = false, readingOnly = false, active = true, allowCompletionDate = false }: StudentMaterialProps) {
+  const [data, setData] = useState<SubjectMaterial | null>(null);
+  const [error, setError] = useState('');
+  const [retry, setRetry] = useState(0);
+  const [busy, setBusy] = useState(false);
+  const [correction, setCorrection] = useState<{ reason: WorkingRuleReason | ''; holidayName: string } | null>(null);
+  const [result, setResult] = useState('');
+  const [savedResult, setSavedResult] = useState<SubjectAttemptResult | null>(null);
+  const [untrackedVideo, setUntrackedVideo] = useState(false);
+  const { confirmTime, timeConfirmation } = useManualTimeConfirmation();
+  const mounted = useRef(true);
+  const requestPending = useRef(false);
+  const autoStarted = useRef(false);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
+  const playingMedia = useRef(new Set<number>());
+  const activityElement = useRef<HTMLDivElement>(null);
+  const completionHintId = useId();
+  const base = baseUrl || `/learner_api/student-activity/${encodeURIComponent(kind)}/${encodeURIComponent(learnerId)}`;
+  const attempts = `${base}/${groupId}/${activityId}/attempts/`;
+  const quizQuery = catalogueQuiz || reviewQuiz ? '?catalogue_kind=quiz' : readingOnly ? '?activity_part=reading' : '';
+  const materialUrl = `${base}/?group_id=${groupId}&activity_id=${activityId}${quizQuery.replace('?', '&')}`;
+  const timerKey = `legacy-study:v1:${encodeURIComponent(kind)}:${encodeURIComponent(learnerId)}:${groupId}:${catalogueQuiz || reviewQuiz ? 'quiz' : 'material'}:${activityId}${readingOnly ? ':reading' : ''}`;
+  const currentIdentity = useRef(timerKey);
+  currentIdentity.current = timerKey;
+  // Follow the rendered video, including protected source-file URLs and
+  // videos with companion text. Older drafts may still say visible_page.
+  const videoActivity = !!data && !data.quiz && data.media.some(isVideoMaterial);
+  const retakeGranted = !!data?.can_retake && !!data.can_attempt && !savedResult;
+  const reviewLocked = reviewQuiz && !retakeGranted;
+  const study = useLegacyStudySession(timerKey, active && !!data?.can_attempt && !!data?.available && !readOnly && !reviewLocked
+    && !((catalogueQuiz || !data?.quiz) && (completed || data?.completed || savedResult?.completed) && !retakeGranted), busy || !!correction || !!timeConfirmation, activityElement, videoActivity);
+  const attemptId = study.draft?.attemptId || null;
+  const answers = study.draft?.answers || {};
+  const confirmed = study.draft?.confirmed || false;
+  const manualSeconds = study.draft?.manualSeconds ?? null;
+  const declaredCompletion = allowCompletionDate ? study.draft?.declaredCompletion : undefined;
+  const { setAnswers, setConfirmed } = study;
+  useEffect(() => {
+    const controller = new AbortController();
+    setData(null); setError(''); setResult(''); setSavedResult(null); setCorrection(null); setBusy(false);
+    playingMedia.current.clear();
+    void subjectRequest<SubjectMaterial>(materialUrl, { signal: controller.signal })
+      .then((payload) => { if (!controller.signal.aborted) setData(payload); })
+      .catch((failure: unknown) => { if (!controller.signal.aborted) setError(failure instanceof Error ? failure.message : 'Could not load material.'); });
+    return () => controller.abort();
+  }, [materialUrl, retry]);
+  const post = <T,>(url: string, body: unknown) => subjectRequest<T>(url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRFToken': data?.csrf_token || '' }, body: JSON.stringify(body) });
+  const [retakeTimeOpen, setRetakeTimeOpen] = useState(false);
+  const start = () => {
+    if (data && (data.completed || data.history.length || data.historical.attempt_number || savedResult)) {
+      setRetakeTimeOpen(true); return;
+    }
+    void beginAttempt();
+  };
+  const beginAttempt = async (retakeTimeChoice?: RetakeTimeChoice) => {
+    if (!active || readOnly || reviewLocked || !data || busy || requestPending.current || attemptId || !data.can_attempt || !data.persistence_ready || !data.available || (data.quiz && !data.quiz.ready)) return;
+    requestPending.current = true;
+    setBusy(true); setError(''); setResult('');
+    const startUrl = `${attempts}${quizQuery}`;
+    const pending = pendingStarts.get(startUrl) || post<StartedAttempt>(startUrl, { track_time: true,
+      ...(retakeTimeChoice ? { retakeTimeChoice } : {}) });
+    pendingStarts.set(startUrl, pending);
+    try {
+      const response = await pending;
+      // Persist the owned draft even if navigation finished while starting.
+      study.begin(response.attempt_id, response.timing);
+      if (!mounted.current || currentIdentity.current !== timerKey) return;
+      setData({ ...data, ...response.definition });
+    } catch (failure) { if (mounted.current && currentIdentity.current === timerKey) setError(failure instanceof Error ? failure.message : 'Could not start the attempt.'); }
+    finally {
+      if (pendingStarts.get(startUrl) === pending) pendingStarts.delete(startUrl);
+      requestPending.current = false;
+      if (mounted.current && currentIdentity.current === timerKey) setBusy(false);
+    }
+  };
+  const beginRef = useRef(beginAttempt);
+  beginRef.current = beginAttempt;
+  useEffect(() => {
+    // Only the first attempt starts on opening. Results and retakes remain an
+    // CHANGE_ME choice; a failed request offers retry instead of a POST loop.
+    if (!active || autoStarted.current || attemptId || readOnly || reviewQuiz || completed || savedResult || !data
+      || data.completed || data.history.length || data.historical.attempt_number
+      || !data.can_attempt || !data.persistence_ready || !data.available || (data.quiz && !data.quiz.ready)) return;
+    const startVisible = () => {
+      if (autoStarted.current || document.visibilityState !== 'visible') return;
+      for (let node = activityElement.current; node; node = node.parentElement as HTMLDivElement | null) {
+        const style = getComputedStyle(node);
+        if (node.hidden || style.display === 'none' || style.visibility === 'hidden') return;
+      }
+      autoStarted.current = true;
+      observer.disconnect();
+      void beginRef.current();
+    };
+    const observer = new MutationObserver(startVisible);
+    for (let node: HTMLElement | null = activityElement.current; node; node = node.parentElement) {
+      observer.observe(node, { attributes: true, attributeFilter: ['hidden', 'style', 'class'] });
+    }
+    document.addEventListener('visibilitychange', startVisible);
+    startVisible();
+    return () => { observer.disconnect(); document.removeEventListener('visibilitychange', startVisible); };
+  }, [data, attemptId, completed, readOnly, reviewQuiz, savedResult, active]);
+  const submit = async (declaredCompletedAt?: string) => {
+    if (!active || readOnly || reviewLocked || !data || busy || requestPending.current || !data.can_attempt || !data.persistence_ready || !data.available) return;
+    requestPending.current = true;
+    setBusy(true); setError('');
+    try {
+      if (!attemptId || !study.draft) throw new Error('Activity timing is not ready. Please retry.');
+      if (declaredCompletion && (!declaredCompletion.day || !declaredCompletion.time)) throw new Error('Select a completion date and time.');
+      if (manualSeconds != null && !declaredCompletedAt && !(await confirmTime(manualSeconds))) return;
+      if (!mounted.current) return;
+      const chosenCompletion = declaredCompletedAt || (declaredCompletion
+        ? completionInstant(declaredCompletion.day, declaredCompletion.time) : undefined);
+      const saved = await post<SubjectAttemptResult>(`${attempts}${attemptId}/${quizQuery}`, { answers, reading_confirmed: data.quiz ? confirmed : true,
+        trackingToken: study.draft.timing.trackingToken, timeTakenSeconds: Math.floor(manualSeconds ?? study.draft.elapsedSeconds),
+        ...(manualSeconds != null ? { timeEntrySource: 'input' } : {}),
+        ...(chosenCompletion ? { declaredCompletedAt: chosenCompletion } : {}) });
+      if (!mounted.current || currentIdentity.current !== timerKey) return;
+      setResult(saved.score_percent == null ? 'Activity completed.' : `Attempt saved: ${Number(saved.score_percent).toFixed(0)}% · ${saved.passed ? 'Passed' : 'Not passed'}. Your highest score is kept.`);
+      setSavedResult(saved);
+      study.clear(); setCorrection(null);
+      onProgress?.(saved);
+      try {
+        const latest = await subjectRequest<SubjectMaterial>(materialUrl);
+        if (mounted.current && currentIdentity.current === timerKey) setData(latest);
+      } catch {
+        setError('Your attempt was saved, but its history could not be refreshed.');
+      }
+    } catch (failure) {
+      if (!mounted.current || currentIdentity.current !== timerKey) return;
+      if (failure && typeof failure === 'object' && 'validation' in failure && failure.validation) {
+        setCorrection(failure.validation as { reason: WorkingRuleReason | ''; holidayName: string });
+      }
+      setError(failure instanceof Error ? failure.message : 'Could not save your attempt.');
+    }
+    finally { requestPending.current = false; if (mounted.current && currentIdentity.current === timerKey) setBusy(false); }
+  };
+  if (!data && error) return <LearnerLoadError title="Could not load this learning activity" error={error} onRetry={() => setRetry((v) => v + 1)} />;
+  if (!data) return <p  className="p-5"><LoadingSkeleton label="Loading activity…" variant="rows" /></p>;
+  const quiz = data.quiz;
+  const displayedAnswers = attemptId ? answers : previousSelections(data);
+  const reviewing = !attemptId && (data.history.length > 0 || data.historical.answers.length > 0);
+  const isComplete = completed || data.completed || savedResult?.completed || data.history.some((attempt) => attempt.completed);
+  const reviewOnly = !active || readOnly || reviewLocked || ((catalogueQuiz || !quiz) && isComplete && !retakeGranted);
+  const answered = quiz?.questions.every((question) => (answers[question.id]?.length || 0) > 0) ?? true;
+  const needsConfirmation = !!quiz && data.has_reading;
+  const blockedReason = !data.persistence_ready
+    ? 'Saving progress is temporarily unavailable. Please contact your learning team.'
+    : !data.available
+      ? 'This activity has no available content to complete yet.'
+      : quiz && !quiz.ready ? quiz.message : '';
+  const actionsDisabled = busy || !data.can_attempt || !!blockedReason;
+  const completionHint = blockedReason || (data.can_attempt
+    ? quiz ? 'Complete the quiz and submit your answers. Passing records this activity as complete.' : isComplete ? 'This activity is complete and included in your progress.' : 'When finished, select Finish to save your study time and completion.'
+    : '');
+  const hasPreviousAttempt = !!(isComplete || data.history.length || data.historical.attempt_number || savedResult);
+  const dateReady = !declaredCompletion || (!!declaredCompletion.day && !!declaredCompletion.time);
+  const dateWarning = declaredCompletion?.day && declaredCompletion.time
+    ? workingRuleFailure(declaredCompletion.day, declaredCompletion.time)?.message : null;
+  const formatCompletion = (value: string) => new Date(value).toLocaleString('en-GB', { timeZone: 'Europe/London' });
+  const actionClass = 'shrink-0 rounded-xl bg-primary-600 px-5 py-2.5 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50';
+  return <div ref={activityElement} className="space-y-6 rounded-2xl border border-foreground-200 bg-white p-4 sm:p-6">
+    {retakeGranted && !readOnly && <p className="rounded-xl border border-primary-100 bg-primary-50 p-3 text-sm text-primary-800">One additional quiz attempt is available. Your completed record will be kept.</p>}
+    {!data.available && <p>No material is available for this activity yet.</p>}
+    {data.media.map((item, index) => <Media key={`${index}:${item.url}`} value={item.url} kind={item.kind} title={item.title} fileName={item.file_name} canEmbed={item.can_embed} onPlayingChange={playing => {
+      if (playing && (!videoActivity || isVideoMaterial(item))) playingMedia.current.add(index); else playingMedia.current.delete(index);
+      study.setPlaying(playingMedia.current.size > 0);
+    }} onUnsupported={() => { if (isVideoMaterial(item)) setUntrackedVideo(true); }} onEnded={() => setConfirmed(true)} />)}
+    {data.reading_html && <Html value={data.reading_html} />}
+    {data.unavailable_attachments?.map((name, index) => <p key={index} className="text-sm text-amber-800">Attachment unavailable: {name}</p>)}
+    {quiz && <section className="space-y-4" aria-label="Activity quiz">
+      <div className="flex flex-wrap items-center justify-between gap-3"><h4 className="text-lg font-bold">Quiz · {quiz.questions.length} {quiz.questions.length === 1 ? 'question' : 'questions'}</h4>{quiz.passing_percent != null && <p className="text-sm text-foreground-500">Pass mark: {Number(quiz.passing_percent).toFixed(0)}%</p>}</div>
+      {quiz.body && <Html value={quiz.body} />}
+      {reviewing && <p className="rounded-xl border border-primary-100 bg-primary-50 p-3 text-sm text-primary-800">{reviewOnly ? 'Previous answers are shown for review.' : 'Your previous answers are CHANGE_ME below for review. Choose Try quiz again to start a new attempt. Answers that no longer match the current questions remain in your attempt history.'}</p>}
+      {!quiz.ready && <p role="status" className="rounded-xl bg-amber-50 p-3 text-sm text-amber-900">{quiz.message} Your previous results are kept.</p>}
+      {quiz.questions.map((question, index) => <fieldset key={question.id} disabled={!attemptId || actionsDisabled || reviewOnly} className="space-y-3 rounded-xl border border-foreground-200 p-4">
+        <legend className="px-2 text-sm font-bold">Question {index + 1}{question.type === 'multi_choice' ? ' · Select all that apply' : ''}</legend><Html value={question.text} />
+        {question.options.map((option) => <label key={option.id} className={`flex ${attemptId ? 'cursor-pointer' : 'cursor-default'} items-start gap-3 rounded-lg border p-3 ${displayedAnswers[question.id]?.includes(option.id) ? 'border-primary-400 bg-primary-50' : 'border-foreground-200'}`}>
+          <input type={question.type === 'multi_choice' ? 'checkbox' : 'radio'} name={`question-${question.id}`} value={option.id} checked={displayedAnswers[question.id]?.includes(option.id) || false}
+            onChange={(event) => setAnswers((previous) => ({ ...previous, [question.id]: question.type === 'multi_choice' ? event.target.checked ? [...(previous[question.id] || []), option.id] : (previous[question.id] || []).filter((value) => value !== option.id) : [option.id] }))} className="mt-1 shrink-0 accent-primary-600" /><Html value={option.text} />
+        </label>)}
+      </fieldset>)}
+    </section>}
+    <section aria-label="Activity completion" className="space-y-4 rounded-xl border border-primary-100 bg-white p-4">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <p aria-live="polite" className={`text-sm font-semibold ${isComplete ? 'CHANGE_ME' : 'text-foreground-500'}`}>{isComplete ? 'Complete' : 'Not complete'}</p>
+        {!reviewOnly && !attemptId && hasPreviousAttempt && (quiz || !isComplete) && <button type="button" onClick={start} disabled={actionsDisabled} className={actionClass}>{busy ? 'Preparing activity…' : quiz ? 'Try quiz again' : 'Record another attempt'}</button>}
+      </div>
+      {!reviewOnly && (!isComplete || !!attemptId) && <div className="flex flex-wrap items-end justify-end gap-3">
+        <ActivityElapsedTimer time={studyClock(study.draft?.elapsedSeconds || 0)} />
+        <fieldset disabled={!attemptId || actionsDisabled} className="min-w-0 max-w-full">
+          <legend className="sr-only">Activity time</legend>
+          <ActivityTimeSpentInput initialSeconds={manualSeconds} onChange={study.setManualSeconds} />
+        </fieldset>
+        {!attemptId && error && !hasPreviousAttempt
+          ? <button type="button" onClick={() => void beginAttempt()} disabled={actionsDisabled} className={actionClass}>Retry activity</button>
+          : <button type="button" onClick={() => void submit()} disabled={!attemptId || actionsDisabled || !answered || !dateReady || (needsConfirmation && !confirmed)} aria-describedby={completionHint ? completionHintId : undefined} className={actionClass}>{busy ? attemptId ? 'Saving…' : 'Preparing activity…' : quiz ? 'Submit answers' : 'Finish'}</button>}
+      </div>}
+      {allowCompletionDate && !reviewOnly && !!attemptId && <fieldset disabled={actionsDisabled} className="space-y-3 text-sm">
+        <legend className="sr-only">Completion date and time</legend>
+        <label className="flex items-center gap-2"><input type="checkbox" checked={!!declaredCompletion}
+          onChange={event => study.setDeclaredCompletion(event.target.checked ? { day: '', time: '' } : undefined)} />Use an earlier completion date</label>
+        {declaredCompletion && <div className="flex flex-wrap gap-3">
+          <label>Completion date<input type="date" value={declaredCompletion.day} max={ukDateKey(new Date())}
+            onChange={event => study.setDeclaredCompletion({ ...declaredCompletion, day: event.target.value })}
+            className="mt-1 block rounded-lg border border-foreground-300 px-3 py-2" /></label>
+          <label>Completion time (UK)<input type="time" value={declaredCompletion.time}
+            onChange={event => study.setDeclaredCompletion({ ...declaredCompletion, time: event.target.value })}
+            className="mt-1 block rounded-lg border border-foreground-300 px-3 py-2" /></label>
+        </div>}
+        <p className="text-xs text-foreground-500">{declaredCompletion ? 'Choose when you completed this part, in UK time. Your submission time is also saved.' : 'The completion date and time will be recorded when you submit.'}</p>
+        {dateWarning && <p role="status" className="text-xs text-amber-800">{dateWarning} You can still record when you did this work.</p>}
+      </fieldset>}
+      {!reviewOnly && !!attemptId && <div className="flex flex-wrap items-center gap-3 text-xs text-foreground-600">
+        <button type="button" disabled={actionsDisabled} className="rounded-lg border border-primary-300 px-3 py-1 font-semibold" onClick={() => study.setPaused(!study.paused)}>{study.paused ? 'Resume timer' : 'Pause timer'}</button>
+        <span>{videoActivity && (untrackedVideo || data.media.some(item => isVideoMaterial(item) && item.can_embed === false))
+          ? 'This video cannot report playback time. Enter your study time manually.'
+          : study.paused ? 'Timer paused.' : !videoActivity && study.draft?.timing.countingMode === 'active_playback' ? 'Time counts during audible playback, including in another tab.' : videoActivity ? 'Time counts during audible playback while this page is visible.' : 'Time counts while this page is visible.'}</span>
+        <span>{manualSeconds == null ? 'Only enter a time if you need to correct it.' : 'Your manual time will be saved. Clear both fields to use the timer.'}</span>
+      </div>}
+      {study.storageError && <p role="alert" className="text-sm text-amber-800">{study.storageError}</p>}
+      {savedResult?.study_time && <p className="text-sm CHANGE_ME">Study time saved: {studyClock(savedResult.study_time.CHANGE_MESeconds ?? savedResult.study_time.verifiedSeconds)}</p>}
+      {allowCompletionDate && savedResult?.completed && savedResult.study_time && <p className="text-sm CHANGE_ME">Completed on {formatCompletion(savedResult.study_time.declaredCompletedAt || savedResult.study_time.submittedAt)} (UK)</p>}
+      {!readOnly && !reviewQuiz && completionHint && <p id={completionHintId} className={`text-sm ${blockedReason ? 'text-amber-800' : 'text-foreground-500'}`}>{completionHint}</p>}
+      {!reviewOnly && needsConfirmation && !!attemptId && <label className="flex items-start gap-2 text-sm"><input type="checkbox" checked={confirmed} disabled={actionsDisabled} onChange={(event) => setConfirmed(event.target.checked)} className="mt-1 accent-primary-600" />I have completed the reading material.</label>}
+      {error && <p role="alert" className="text-sm text-red-700">{error}</p>}
+      {result && <p role="status" className={`rounded-xl p-3 text-sm font-semibold ${savedResult?.completed ? 'bg-emerald-50 text-emerald-800' : 'bg-amber-50 text-amber-800'}`}>{result}</p>}
+    </section>
+    {reviewQuiz && data.historical.attempt_number == null && data.historical.score == null && !data.historical.answers.length && !data.history.length && <p className="text-sm text-foreground-500">No saved attempt is available for this quiz.</p>}
+    {(data.historical.answers.length > 0 || data.historical.score != null || data.history.length > 0) && <section className="space-y-3 border-t pt-4" aria-label="Attempt history">
+      <h4 className="font-bold">Your attempt history</h4>
+      {reviewQuiz && <p className="text-sm text-foreground-600">{[data.historical.attempt_number != null ? `Attempt ${data.historical.attempt_number}` : '', data.historical.passed === true ? 'Passed' : data.historical.passed === false ? 'Not passed' : ''].filter(Boolean).join(' · ')}</p>}
+      {(data.historical.answers.length > 0 || data.historical.score != null) && <details className="rounded-xl border p-3"><summary className="cursor-pointer text-sm font-semibold">Previous learning{data.historical.score != null ? ` · ${data.historical.score}${data.historical.maximum_score ? ` / ${data.historical.maximum_score}` : ''}` : ''}</summary>
+        <div className="mt-3 space-y-4">{data.historical.answers.map((answer, index) => <div key={`${answer.question_id}:${index}`}><Html value={answer.question_body || `Question ${index + 1}`} /><p className="mt-1 text-sm text-foreground-600">Your answer: {Array.isArray(answer.learner_answer) ? answer.learner_answer.map(String).join(', ') : String(answer.learner_answer ?? 'Not recorded')}</p></div>)}</div>
+      </details>}
+      {data.history.map((attempt) => <details key={attempt.id} className="rounded-xl border p-3"><summary className="cursor-pointer text-sm">{allowCompletionDate ? `${formatCompletion(attempt.study_time?.declaredCompletedAt || attempt.submitted_at)} (UK)` : new Date(attempt.submitted_at).toLocaleString('en-GB')} · {attempt.score_percent == null ? 'Activity completed' : `${Number(attempt.score_percent).toFixed(0)}% · ${attempt.passed ? 'Passed' : 'Not passed'}`}</summary>
+        <div className="mt-3 space-y-3">{attempt.study_time && <p className="text-sm">{attempt.study_time.timeEntrySource === 'input' ? 'Manual study time' : 'Measured study time'}: {studyClock(attempt.study_time.CHANGE_MESeconds ?? attempt.study_time.verifiedSeconds)}</p>}{allowCompletionDate && attempt.study_time && <p className="text-sm">{attempt.completed ? 'Completed' : 'Attempted'} on {formatCompletion(attempt.study_time.declaredCompletedAt || attempt.study_time.submittedAt)} (UK). Submitted {formatCompletion(attempt.study_time.submittedAt)} (UK).</p>}{attempt.answer_review?.map((answer, index) => <div key={index}><Html value={answer.question} /><p className="text-sm">Your answer: {answer.CHANGE_ME.join(', ')} · {answer.correct ? 'Correct' : 'Incorrect'}</p></div>)}</div>
+      </details>)}
+    </section>}
+    {timeConfirmation}
+    {retakeTimeOpen && <RetakeTimeDialog onClose={() => setRetakeTimeOpen(false)} onChoose={selection => {
+      setRetakeTimeOpen(false); void beginAttempt(selection);
+    }} />}
+    {correction && <CompletionTimeDialog reason={correction.reason} holidayName={correction.holidayName} holidays={[]}
+      submitting={busy} serverError={error} onClose={() => setCorrection(null)} onSubmit={at => void submit(at)} />}
+  </div>;
+}

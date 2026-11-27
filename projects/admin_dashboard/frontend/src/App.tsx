@@ -1,0 +1,218 @@
+import { Routes, Route, Navigate, useLocation } from "react-router-dom";
+import { lazy, Suspense, useEffect, useState, useContext } from "react";
+import type { Dispatch, SetStateAction } from "react";
+import { AuthContext } from "./context/AuthContext";
+
+import Sidebar from "./components/sidebar/sidebar";
+import AnalyticsMeetings from "./components/analytics/AnalyticsMeetings";
+import BookingsCalendarPage from "./components/calendar/BookingsCalendarPage";
+import AttendancePage from "./components/attendance/AttendancePage";
+import LmsLogin from "./login/LmsLogin";
+import RequireRole from "./components/auth/RequireRole";
+import TicketCardsPage from "./pages/TicketCardsPage";
+
+import useMediaQuery from "./helpers/useMediaQuery";
+
+const CoachWellbeingPage = lazy(() => import("./components/wellbeing/CoachWellbeingPage"));
+const LearnerResultTickets = lazy(() => import("./pages/admin/learner-result-tickets/page"));
+const ConnectMicrosoftPage = lazy(() => import("./components/ConnectMicrosoftPage"));
+const LocalLogin = lazy(() => import("./login/Login"));
+const useLocalLogin = import.meta.env.DEV
+  && import.meta.env.VITE_LOCAL_LOGIN === "true"
+  && ["localhost", "127.0.0.1", "[::1]"].includes(window.location.hostname);
+
+function DashboardPage({ onOpenSidebar }: { onOpenSidebar: () => void }) {
+  return <AnalyticsMeetings onOpenSidebar={onOpenSidebar} />;
+}
+
+function AttendanceRoute({ onOpenSidebar }: { onOpenSidebar: () => void }) {
+  return <AttendancePage onOpenSidebar={onOpenSidebar} />;
+}
+
+function wellbeingViewFromLocation(location: ReturnType<typeof useLocation>) {
+  const params = new URLSearchParams(location.search);
+  const queryView = String(params.get("view") || params.get("wb_view") || "").toLowerCase();
+  if (queryView === "tickets" || queryView === "safeguarding-tickets") return "tickets";
+
+  const hashView = location.hash.replace(/^#/, "").toLowerCase();
+  if (hashView === "tickets" || hashView === "safeguarding-tickets") return "tickets";
+
+  const cleanPath = location.pathname.replace(/\/+$/, "").toLowerCase();
+  if (cleanPath.endsWith("/tickets") || cleanPath.endsWith("/safeguarding-tickets")) return "tickets";
+
+  return "";
+}
+
+function CoachWellbeingRoute({
+  setMobileOpen,
+  isDesktop,
+}: {
+  setMobileOpen: Dispatch<SetStateAction<boolean>>;
+  isDesktop: boolean;
+}) {
+  const location = useLocation();
+  const role = localStorage.getItem("role");
+
+  if (wellbeingViewFromLocation(location) === "tickets" && role !== "qa") {
+    return <Navigate to="/" replace />;
+  }
+
+  return (
+    <Suspense fallback={<div className="min-h-screen rounded-3xl bg-white p-6 text-sm text-slate-500">Loading wellbeing...</div>}>
+      <CoachWellbeingPage
+        setMobileOpen={setMobileOpen}
+        isDesktop={isDesktop}
+      />
+    </Suspense>
+  );
+}
+
+export default function App() {
+  const isDesktop = useMediaQuery("(min-width: 1280px)"); // xl
+  const [collapsed, setCollapsed] = useState(false);
+  const [mobileOpen, setMobileOpen] = useState(false);
+  const location = useLocation();
+  const isLoginPage = ["/login", "/login/lms/callback", "/auth/lms/callback"].includes(location.pathname.replace(/\/+$/, ""));
+
+
+  // logout handler
+  const auth = useContext(AuthContext);
+  const handleLogout = () => {
+    auth?.setUser?.(null);
+    localStorage.removeItem("access");
+    localStorage.removeItem("token");
+    localStorage.removeItem("refresh");
+    localStorage.removeItem("refresh_token");
+    localStorage.removeItem("role");
+    localStorage.removeItem("coach_id");
+    localStorage.removeItem("username");
+    sessionStorage.clear();
+    window.location.replace("/login");
+  };
+
+  useEffect(() => {
+    if (!isDesktop) {
+      setCollapsed(true);
+      setMobileOpen(false);
+    }
+  }, [isDesktop]);
+
+  const contentPad = isDesktop ? (collapsed ? "pl-20" : "pl-64") : "";
+
+  const token = localStorage.getItem("token");
+
+  if (!token && !isLoginPage) {
+    return <Navigate to="/login" replace />;
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-100">
+      {/* Sidebar appears after login */}
+      {token && !isLoginPage && (
+        <Sidebar
+          collapsed={collapsed}
+          setCollapsed={setCollapsed}
+          mobileOpen={mobileOpen}
+          setMobileOpen={setMobileOpen}
+          isDesktop={isDesktop}
+          onLogout={handleLogout}
+        />
+      )}
+
+      <main className={`transition-all duration-300 ${token ? contentPad : ""}`}>
+        <div className="p-3 sm:p-4 lg:p-6 min-h-screen overflow-x-hidden">
+          <Routes>
+            <Route path="/login" element={useLocalLogin ? (
+              <Suspense fallback={<div role="status">Loading sign-in...</div>}>
+                <LocalLogin />
+              </Suspense>
+            ) : <LmsLogin key="login" />} />
+            <Route path="/auth/lms/callback" element={<LmsLogin key="callback" callback />} />
+            <Route path="/login/lms/callback" element={<LmsLogin key="callback" callback />} />
+
+            {/* Default ticket cards */}
+            <Route
+              path="/"
+              element={
+                <RequireRole allow={["qa", "coach"]}>
+                  <TicketCardsPage
+                    onOpenSidebar={() => setMobileOpen(true)}
+                    isDesktop={isDesktop}
+                  />
+                </RequireRole>
+              }
+            />
+
+            {/* QA + Coach */}
+            <Route
+              path="/dashboard"
+              element={
+                <RequireRole allow={["qa", "coach"]}>
+                  <DashboardPage onOpenSidebar={() => setMobileOpen(true)} />
+                </RequireRole>
+              }
+            />
+            <Route
+              path="/bookings-calendar"
+              element={
+                <RequireRole allow={["qa", "coach"]}>
+                  <BookingsCalendarPage onOpenSidebar={() => setMobileOpen(true)} />
+                </RequireRole>
+              }
+            />
+
+            {/* QA only */}
+            <Route
+              path="/attendance"
+              element={
+                <RequireRole allow={["qa", "coach"]}>
+                  <AttendanceRoute onOpenSidebar={() => setMobileOpen(true)} />
+                </RequireRole>
+              }
+            />
+
+            {/* Coach Wellbeing */}
+            <Route
+              path="/coach-wellbeing/*"
+              element={
+                <RequireRole allow={["qa", "coach"]}>
+                  <CoachWellbeingRoute
+                    setMobileOpen={setMobileOpen}
+                    isDesktop={isDesktop}
+                  />
+                </RequireRole>
+              }
+            />
+
+            {/* Learner Result Tickets */}
+            <Route
+              path="/learner-result-tickets"
+              element={
+                <RequireRole allow={["qa", "coach"]}>
+                  <Suspense fallback={<div className="min-h-screen rounded-3xl bg-white p-6 text-sm text-slate-500">Loading learner results...</div>}>
+                    <LearnerResultTickets />
+                  </Suspense>
+                </RequireRole>
+              }
+            />
+
+            {/* Connect Microsoft */}
+            <Route
+              path="/connect-microsoft"
+              element={
+                <RequireRole allow={["qa", "coach"]}>
+                  <Suspense fallback={<div className="min-h-screen rounded-3xl bg-white p-6 text-sm text-slate-500">Loading...</div>}>
+                    <ConnectMicrosoftPage />
+                  </Suspense>
+                </RequireRole>
+              }
+            />
+
+            {/* fallback */}
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Routes>
+        </div>
+      </main>
+    </div>
+  );
+}

@@ -1,0 +1,112 @@
+export type ReviewPeriodKey = "4w" | "8w" | "12w" | "all";
+export type PeriodCounts = Record<ReviewPeriodKey, { required: number; completed: number; overdue: number }>;
+
+export interface CoachConflict {
+  // "coach": different coach on Aptem and the LMS (counted under the LMS coach).
+  // "status": Active on one system but not the other (counted only when
+  // Active / Delivery on the LMS; see ``counted``).
+  kind?: "coach" | "status";
+  name: string;
+  email: string;
+  aptem_coach: string;
+  lms_coach: string;
+  aptem_status?: string;
+  lms_status?: string;
+  // Whether the learner is in the dashboard's numbers (on the LMS caseload).
+  counted?: boolean;
+}
+
+// Badge / heading label for a coach's conflicts, by the kinds present.
+export function conflictsLabel(conflicts: CoachConflict[]): string {
+  const n = conflicts.length;
+  const kinds = new Set(conflicts.map((c) => c.kind ?? "coach"));
+  const kind = kinds.size > 1 ? "data" : kinds.has("status") ? "status" : "coach";
+  return `${n} ${kind} conflict${n > 1 ? "s" : ""}`;
+}
+
+export interface CoachRecord {
+  id: number;
+  associate: string;
+  coach: string;
+  caseOwner: string;
+  caseOwnerId?: number | null;
+  phone: string;
+  lastSubDate: string;
+  elapsedDays: number;
+  lastSnapshotDate: string;
+  totalLearners: number;
+  recentSubmitters: number;
+  learnerEngagement: number;
+  // Average attendance rate (%) from the LMS; null when the LMS has none.
+  attendanceRate?: number | null;
+  otjhOnTrack: number;
+  otjhNormal?: number;
+  otjhNeedAttention: number;
+  otjhAtRisk: number;
+  // Variance-based OTJH counts (match the Metric Breakdown / chart bands).
+  otjhVarOnTrack?: number;
+  otjhVarNeedAttention?: number;
+  otjhVarAtRisk?: number;
+  lastWeekPending: number | null;
+  pending: number;
+  markingProgressWeekly: number | null;
+  evidenceAccepted: number;
+  evidenceReferred: number;
+  referredClosure: number;
+  referredClosureAvailable?: boolean;
+  referredClosurePct: number;
+  totalEvidence: number;
+  prToday: number;
+  prYesterday: number;
+  prMinus2: number;
+  prLastWeek: number;
+  prSecondWeek: number;
+  prThirdWeek: number;
+  prFourthWeek: number;
+  prRequired4Weeks: number;
+  prCompleted4Weeks: number;
+  prDoneOld4Weeks?: number;
+  prBehindRate4Weeks: number;
+  prRequired8Weeks: number;
+  prCompleted8Weeks: number;
+  prBehind8Weeks: number;
+  prBehindRate8Weeks: number;
+  prOverallRequired: number;
+  prOverallCompleted: number;
+  prOverallBehind: number;
+  prOverallCompletionRate: number;
+  // Integer percentage returned by the LMS coach-directory performance rule.
+  prLmsRate?: number | null;
+  prRequired12Weeks?: number;
+  prCompleted12Weeks?: number;
+  prCompletionRate12Weeks?: number;
+  mcmRequired4Weeks?: number;
+  mcmCompleted4Weeks?: number;
+  mcmCompletionRate4Weeks?: number;
+  mcmBehind4Weeks?: number;
+  mcmBehindRate4Weeks?: number;
+  mcmRequired8Weeks?: number;
+  mcmCompleted8Weeks?: number;
+  mcmCompletionRate8Weeks?: number;
+  mcmBehind8Weeks?: number;
+  mcmBehindRate8Weeks?: number;
+  mcmRequired12Weeks?: number;
+  mcmCompleted12Weeks?: number;
+  mcmCompletionRate12Weeks?: number;
+  mcmBehind12Weeks?: number;
+  // Learners whose Aptem coach and LMS coach are different coaches.
+  coachConflicts?: CoachConflict[];  // LMS review counts per window (4w/8w/12w/all) for the home-page
+  // PR & MCM performance charts' time-period filter.
+  prByLearner?: PeriodCounts;
+  mcmByLearner?: PeriodCounts;
+  // Daily marking-submission buckets (from the New LMS).
+  evToday?: number;
+  evYesterday?: number;
+  evMinus2?: number;
+  evMinus3?: number;
+  evMinus4?: number;
+  evMinus5?: number;
+  evMinus6?: number;
+  evMinus7?: number;
+  evidenceWeekTotal?: number;
+}

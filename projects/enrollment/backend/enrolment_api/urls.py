@@ -1,0 +1,98 @@
+from django.urls import include, path
+from .pending_signatures import pending_signatures
+from .plr_pdf_preview import plr_pdf_preview
+from .plr_pdf_import import plr_pdf_import
+from . import eligibility_applications, eligibility_exception, programme_catalog, programme_structure_views
+from . import bksb, cv_job_documents, documents, eligibility_form, eligibility_layout, extended_ilr, ilr_eligibility_evidence, ilr_employer_details, ilr_learner_record, plr_evidence, policy_documents, postcode_lookup, views, wizard_bootstrap, wizard_custom_uploads, wizard_inclusion, wizard_layout
+
+urlpatterns = [
+    path('wizard/<str:kind>/<int:learner_id>/plr-pdf-import/', plr_pdf_import, name='plr-pdf-import'),
+    path('wizard/<str:kind>/<int:learner_id>/plr-pdf-preview/', plr_pdf_preview, name='plr-pdf-preview'),
+    path('pending-signatures/', pending_signatures, name='learner-pending-signatures'),
+    path('document-revisions/', include('enrolment_api.document_templates.revision_urls')),
+    path('document-templates/', include('enrolment_api.document_templates.urls')),
+    # Saved applications: enrolment staff only; strictly read-only.
+    path('eligibility-applications/', eligibility_applications.eligibility_applications, name='eligibility-applications'),
+    path('eligibility-applications/<int:application_id>/', eligibility_applications.eligibility_application_detail, name='eligibility-application-detail'),
+    path('eligibility-applications/<int:application_id>/exception/', eligibility_exception.eligibility_exception, name='eligibility-application-exception'),
+    path('skills-radar/', include('enrolment_api.skills_radar.urls')),
+    path('programme-structure/validate/', programme_structure_views.programme_structure_validate, name='programme-structure-validate'),
+    path('programme-structure/preview/', programme_structure_views.programme_structure_preview, name='programme-structure-preview'),
+    path('programme-structure/draft/', programme_structure_views.programme_structure_draft, name='programme-structure-draft'),
+    path('programme-structure/draft/reconcile/', programme_structure_views.programme_structure_reconcile, name='programme-structure-reconcile'),
+    path('programme-structure/publish/', programme_structure_views.programme_structure_publish, name='programme-structure-publish'),
+    path('programme-structure/catalog/readiness/', programme_catalog.catalogue_readiness, name='programme-catalog-readiness'),
+    path('programme-structure/catalog/staff/', programme_catalog.staff_options, name='programme-catalog-staff'),
+    path('programme-structure/catalog/lms/readiness/', programme_catalog.lms_readiness, name='programme-catalog-lms-readiness'),
+    path('programme-structure/catalog/lms/preview/', programme_catalog.lms_preview, name='programme-catalog-lms-preview'),
+    path('programme-structure/catalog/lms/import/', programme_catalog.lms_import, name='programme-catalog-lms-import'),
+    path('programme-structure/catalog/programmes/<uuid:programme_id>/lms/', programme_catalog.lms_link_status, name='programme-catalog-lms-link'),
+    path('programme-structure/catalog/programmes/<uuid:programme_id>/lms/check/', programme_catalog.lms_check_updates, name='programme-catalog-lms-check'),
+    path('programme-structure/catalog/programmes/<uuid:programme_id>/lms/apply/', programme_catalog.lms_apply_updates, name='programme-catalog-lms-apply'),
+    path('programme-structure/catalog/programmes/', programme_catalog.programmes, name='programme-catalog-programmes'),
+    path('programme-structure/catalog/programmes/<uuid:programme_id>/', programme_catalog.programme_detail, name='programme-catalog-programme'),
+    path('programme-structure/catalog/programmes/<uuid:programme_id>/pricing/', programme_catalog.programme_pricing, name='programme-catalog-pricing'),
+    path('programme-structure/catalog/programmes/<uuid:programme_id>/<slug:resource>/', programme_catalog.programme_records, name='programme-catalog-records'),
+    path('programme-structure/catalog/programmes/<uuid:programme_id>/<slug:resource>/<uuid:record_id>/', programme_catalog.programme_records, name='programme-catalog-record'),
+    path('health/', views.health, name='enrolment-health'),
+    path('commercial-users/<int:pk>/board/', views.commercial_board, name='commercial-board'),
+    # Public apprenticeship eligibility form (/apprenticeship_application) — no sign-in
+    path('public/apprenticeship-application/', eligibility_form.submit_application, name='public-apprenticeship-application'),
+    # ...the form it shows (published from the eligibility form builder) and its postcode check — no sign-in
+    path('public/eligibility-form-layout/', eligibility_layout.public_eligibility_form_layout, name='public-eligibility-form-layout'),
+    path('public/postcode-lookup/', postcode_lookup.postcode_lookup, name='public-postcode-lookup'),
+    # The eligibility form builder: the published layout and its publish (enrolment staff)
+    path('eligibility-form-layout/', eligibility_layout.eligibility_form_layout, name='eligibility-form-layout'),
+    path('eligibility-form-layout/versions/<int:version>/', eligibility_layout.eligibility_form_layout_version, name='eligibility-form-layout-version'),
+    path('eligibility-form-layout/draft/', eligibility_layout.eligibility_form_draft, name='eligibility-form-layout-draft'),
+    path('eligibility-form-layout/publish/', eligibility_layout.publish_eligibility_form_layout, name='eligibility-form-layout-publish'),
+    # Extended ILR questionnaire (kind: apprenticeship | commercial)
+    path('extended-ilr/<str:kind>/<int:learner_id>/', extended_ilr.extended_ilr, name='extended-ilr'),
+    # Eligibility proof of identification/residency (Azure-backed, path on the ILR row)
+    path('extended-ilr/<str:kind>/<int:learner_id>/eligibility-evidence/', ilr_eligibility_evidence.eligibility_evidence, name='extended-ilr-eligibility-evidence'),
+    path('extended-ilr/<str:kind>/<int:learner_id>/eligibility-evidence/<uuid:file_id>/', ilr_eligibility_evidence.delete_eligibility_evidence, name='extended-ilr-eligibility-evidence-delete'),
+    path('extended-ilr/<str:kind>/<int:learner_id>/eligibility-evidence/<uuid:file_id>/download/', ilr_eligibility_evidence.download_eligibility_evidence, name='extended-ilr-eligibility-evidence-download'),
+    # CV/Job Description step: CV, transcript and GCSE evidence (Azure-backed, path on the Wizard_Cv_Job row)
+    path('wizard/<str:kind>/<int:learner_id>/cv-documents/', cv_job_documents.cv_documents, name='wizard-cv-documents'),
+    path('wizard/<str:kind>/<int:learner_id>/cv-documents/<uuid:file_id>/', cv_job_documents.delete_cv_document, name='wizard-cv-document-delete'),
+    path('wizard/<str:kind>/<int:learner_id>/cv-documents/<uuid:file_id>/download/', cv_job_documents.download_cv_document, name='wizard-cv-document-download'),
+    # PLR entries' certificate/evidence files (Azure-backed, path on the Wizard_Plr_Records row)
+    path('wizard/<str:kind>/<int:learner_id>/plr-evidence/', plr_evidence.plr_evidence, name='wizard-plr-evidence'),
+    path('wizard/<str:kind>/<int:learner_id>/plr-evidence/<uuid:file_id>/', plr_evidence.delete_plr_evidence, name='wizard-plr-evidence-delete'),
+    path('wizard/<str:kind>/<int:learner_id>/plr-evidence/<uuid:file_id>/download/', plr_evidence.download_plr_evidence, name='wizard-plr-evidence-download'),
+    # The wizard builder: the published layout (read by every wizard) and its publish (enrolment staff)
+    # The Inclusion step: whether the learner has answered the assessment on the Safeguarding site
+    path('wizard/<str:kind>/<int:learner_id>/inclusion/', wizard_inclusion.wizard_inclusion, name='wizard-inclusion'),
+    # BKSB LIVE 2 initial English/Maths assessments. Credentials and provider
+    # calls stay in enrolment_api.bksb; launch URLs are short-lived and are not
+    # persisted or logged.
+    path('bksb/test/', bksb.bksb_connection_test, name='bksb-connection-test'),
+    path('bksb/courses/', bksb.bksb_courses, name='bksb-courses'),
+    path('wizard/<str:kind>/<int:learner_id>/initial-assessments/', bksb.initial_assessments, name='wizard-initial-assessments'),
+    path('wizard/<str:kind>/<int:learner_id>/initial-assessments/bksb-account/', bksb.auto_login_account, name='wizard-bksb-auto-login'),
+    path('wizard/<str:kind>/<int:learner_id>/initial-assessments/<str:subject>/launch/', bksb.launch_initial_assessment, name='wizard-initial-assessment-launch'),
+    path('wizard-layout/', wizard_layout.wizard_layout, name='wizard-layout'),
+    path('wizard-layout/publish/', wizard_layout.publish_wizard_layout, name='wizard-layout-publish'),
+    path('wizard-layout/versions/', wizard_layout.wizard_layout_versions, name='wizard-layout-versions'),
+    path('wizard-layout/versions/<int:version>/', wizard_layout.wizard_layout_version, name='wizard-layout-version'),
+    path('wizard-layout/assignments/', wizard_layout.assign_wizard_layout, name='wizard-layout-assignments'),
+    path('wizard-layout/<str:kind>/<int:learner_id>/', wizard_layout.wizard_layout, name='wizard-layout-learner'),
+    # Files on the builder's custom upload fields (Azure-backed, path in the field's own column)
+    path('wizard/<str:kind>/<int:learner_id>/custom-uploads/<str:field_key>/', wizard_custom_uploads.custom_uploads, name='wizard-custom-uploads'),
+    path('wizard/<str:kind>/<int:learner_id>/custom-uploads/<str:field_key>/<uuid:file_id>/', wizard_custom_uploads.delete_custom_upload, name='wizard-custom-upload-delete'),
+    path('wizard/<str:kind>/<int:learner_id>/custom-uploads/<str:field_key>/<uuid:file_id>/download/', wizard_custom_uploads.download_custom_upload, name='wizard-custom-upload-download'),
+    # Employer Details prefill from the learner's employer and organisation (read-only)
+    path('extended-ilr/<str:kind>/<int:learner_id>/employer-details/', ilr_employer_details.ilr_employer_details, name='extended-ilr-employer-details'),
+    path('ilr-learner-record/<str:kind>/<int:learner_id>/', ilr_learner_record.ilr_learner_record, name='ilr-learner-record'),
+    # Board + ILR together — one round-trip to open the wizard.
+    path('wizard-bootstrap/<str:kind>/<int:learner_id>/', wizard_bootstrap.wizard_bootstrap, name='wizard-bootstrap'),
+    # Generated compliance documents (Azure-backed)
+    path('document-types/', documents.document_types, name='document-types'),
+    path('policy-documents/<slug:doc_id>/', policy_documents.open_policy_document, name='policy-document-open'),
+    path('documents/<str:kind>/<int:learner_id>/', documents.documents, name='enrolment-documents'),
+    path('documents/<str:kind>/<int:learner_id>/<uuid:doc_id>/download/', documents.download_document, name='enrolment-document-download'),
+    path('documents/<str:kind>/<int:learner_id>/<uuid:doc_id>/sign/', documents.sign_document, name='enrolment-document-sign'),
+    # Replaces the stored PDF in place, so a document rebuilt with a new
+    # signature keeps its id and the signatures already recorded on it.
+    path('documents/<str:kind>/<int:learner_id>/<uuid:doc_id>/file/', documents.replace_document_file, name='enrolment-document-file'),
+]

@@ -1,0 +1,171 @@
+import { WorkspaceMetricContent } from '@/components/ui/WorkspaceMetricContent';
+import { useEffect, useMemo, useState } from 'react';
+import { WorkspaceShell } from '@/components/feature/WorkspaceShell';
+import { roleNavMap } from '@/mocks/navigation';
+import { fetchLearnerSummary, type LearnerSummary } from '@/api/learnerDetail';
+import {
+  cancelEventBooking,
+  createEventBooking,
+  fetchEventBookings,
+  fetchEvents,
+  type EngagementEvent,
+  type EventBooking,
+} from '@/api/engagement';
+import { useMyLearner } from '@/hooks/useMyLearner';
+import { RowsSkeleton } from '@/components/feature/Skeletons';
+
+const learnerNav = roleNavMap.learner;
+type StatusFilter = 'all' | EngagementEvent['status'];
+
+const statusStyle: Record<EngagementEvent['status'], { label: string; cls: string; icon: string }> = {
+  upcoming: { label: 'Upcoming', cls: 'bg-amber-50 text-amber-700 ring-amber-200', icon: 'ri-calendar-schedule-line' },
+  ongoing: { label: 'Live now', cls: 'bg-blue-50 text-blue-700 ring-blue-200', icon: 'ri-live-line' },
+  completed: { label: 'Completed', cls: 'bg-emerald-50 text-emerald-700 ring-emerald-200', icon: 'ri-checkbox-circle-line' },
+};
+
+const typeIcon: Record<string, string> = {
+  workshop: 'ri-tools-line', social: 'ri-group-line', networking: 'ri-links-line',
+  competition: 'ri-trophy-line', celebration: 'ri-sparkling-line',
+};
+
+function dateParts(value: string) {
+  const parts = value.trim().split(/\s+/);
+  return parts.length >= 2 ? { day: parts[0], month: parts[1] } : { day: '–', month: 'TBC' };
+}
+
+function EventRow({ event, booking, busy, onBook, onCancel }: { event: EngagementEvent; booking?: EventBooking; busy: boolean; onBook: () => void; onCancel: () => void }) {
+  const status = statusStyle[event.status];
+  const date = dateParts(event.date);
+  return (
+    <article className="group relative overflow-hidden rounded-3xl border border-foreground-200/70 bg-white shadow-[0_5px_24px_rgba(28,10,55,0.05)] transition-all duration-300 hover:-translate-y-0.5 hover:border-primary-200 hover:shadow-[0_14px_36px_rgba(68,30,115,0.11)]">
+      <div className="absolute inset-y-0 left-0 w-1 bg-gradient-to-b from-primary-600 via-secondary-500 to-accent-400"></div>
+      <div className="grid gap-4 p-4 pl-5 sm:gap-5 sm:p-5 sm:pl-6 lg:grid-cols-[82px_minmax(0,1fr)_minmax(250px,0.7fr)_130px] lg:items-center">
+        <div className="flex h-[76px] w-[76px] shrink-0 flex-col items-center justify-center rounded-2xl bg-gradient-to-br from-primary-50 to-secondary-100 ring-1 ring-primary-100">
+          <span className="text-2xl font-bold leading-none text-primary-800">{date.day}</span><span className="mt-1 text-[10px] font-bold uppercase tracking-wider text-primary-500">{date.month}</span>
+        </div>
+
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2"><span className="flex h-7 w-7 items-center justify-center rounded-lg bg-primary-50 text-primary-600"><AppIcon className={typeIcon[event.type] || 'ri-calendar-event-line'}></AppIcon></span><span className="text-[9px] font-bold uppercase tracking-[0.15em] text-primary-600">{event.type}</span></div>
+          <h2 className="mt-2 text-lg font-bold text-foreground-900">{event.title}</h2>
+          <p className="mt-1 line-clamp-2 max-w-2xl text-sm leading-6 text-foreground-500">{event.description || 'No event description has been added yet.'}</p>
+        </div>
+
+        <div className="grid gap-2.5 rounded-2xl bg-background-100/70 p-3.5 text-xs text-foreground-600 sm:grid-cols-2 lg:grid-cols-1">
+          <p className="flex items-start gap-2"><AppIcon className="ri-time-line mt-0.5 text-primary-500"></AppIcon><span>{event.date || 'Date TBC'}{event.time ? ` · ${event.time}` : ''}</span></p>
+          <p className="flex items-start gap-2"><AppIcon className="ri-map-pin-2-line mt-0.5 text-primary-500"></AppIcon><span>{event.location || 'Location TBC'}</span></p>
+          <p className="flex items-start gap-2"><AppIcon className="ri-user-star-line mt-0.5 text-primary-500"></AppIcon><span>{event.organizer || 'Organizer TBC'}</span></p>
+        </div>
+
+        <div className="flex flex-wrap items-center justify-between gap-3 lg:flex-col lg:items-stretch">
+          <span className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-[10px] font-bold ring-1 ring-inset ${status.cls}`}><AppIcon className={status.icon}></AppIcon>{status.label}</span>
+          <div className="text-left lg:text-center"><p className="text-sm font-bold text-foreground-800">{event.attendees}</p><p className="text-[9px] uppercase tracking-wider text-foreground-400">Attendees</p></div>
+          {booking ? <div className="flex w-full items-center gap-2 lg:flex-col"><span className="inline-flex h-9 flex-1 items-center justify-center gap-1.5 rounded-xl bg-emerald-50 px-3 text-xs font-bold text-emerald-700 ring-1 ring-inset ring-emerald-200"><AppIcon className="ri-checkbox-circle-fill"></AppIcon>Booked</span><button onClick={onCancel} disabled={busy} className="text-[10px] font-semibold text-foreground-400 transition hover:text-red-600 disabled:opacity-50">{busy ? 'Updating…' : 'Cancel booking'}</button></div> : <button onClick={onBook} disabled={busy || event.status === 'completed'} className="primary-action h-10 w-full rounded-xl bg-primary-700 px-4 text-xs font-bold text-white shadow-md shadow-primary-700/20 transition hover:bg-primary-800 disabled:cursor-not-allowed disabled:bg-background-200 disabled:text-foreground-400 disabled:shadow-none lg:w-auto">{busy ? <AppIcon className="ri-loader-4-line animate-spin"></AppIcon> : event.status === 'completed' ? 'Booking closed' : 'Book place'}</button>}
+        </div>
+      </div>
+    </article>
+  );
+}
+
+export default function LearnerEventsPage() {
+  const myLearner = useMyLearner();
+  const [learner, setLearner] = useState<LearnerSummary | null>(null);
+  const [events, setEvents] = useState<EngagementEvent[]>([]);
+  const [bookings, setBookings] = useState<EventBooking[]>([]);
+  const [status, setStatus] = useState<StatusFilter>('all');
+  const [type, setType] = useState('all');
+  const [query, setQuery] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+  const [busyEventId, setBusyEventId] = useState('');
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    Promise.all([fetchLearnerSummary(myLearner.kind, myLearner.id), fetchEvents(), fetchEventBookings(myLearner.id)])
+      .then(([detail, rows, bookingRows]) => { if (!cancelled) { setLearner(detail); setEvents(rows); setBookings(bookingRows); setError(''); } })
+      .catch((reason: unknown) => { if (!cancelled) setError(reason instanceof Error ? reason.message : 'Could not load events.'); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [myLearner.id, myLearner.kind]);
+
+  const types = useMemo(() => Array.from(new Set(events.map((event) => event.type))).sort(), [events]);
+  const filtered = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    return events.filter((event) => {
+      if (status !== 'all' && event.status !== status) return false;
+      if (type !== 'all' && event.type !== type) return false;
+      return !needle || [event.title, event.description, event.location, event.organizer].some((value) => value.toLowerCase().includes(needle));
+    });
+  }, [events, query, status, type]);
+
+  const counts = {
+    upcoming: events.filter((event) => event.status === 'upcoming').length,
+    ongoing: events.filter((event) => event.status === 'ongoing').length,
+    completed: events.filter((event) => event.status === 'completed').length,
+    attendees: events.reduce((sum, event) => sum + event.attendees, 0),
+  };
+
+  const activeBookings = useMemo(() => new Map(bookings.filter((booking) => booking.status === 'booked').map((booking) => [booking.eventId, booking])), [bookings]);
+
+  async function bookEvent(event: EngagementEvent) {
+    if (!learner) return;
+    setBusyEventId(event.id); setError(''); setNotice('');
+    try {
+      const result = await createEventBooking({ eventId: event.id, learnerEmail: learner.email });
+      setBookings((current) => [result.booking, ...current.filter((booking) => booking.eventId !== event.id)]);
+      setEvents((current) => current.map((item) => item.id === event.id ? result.event : item));
+      setNotice(`Your place at “${event.title}” is booked.`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not book this event.');
+    } finally { setBusyEventId(''); }
+  }
+
+  async function cancelBooking(event: EngagementEvent, booking: EventBooking) {
+    setBusyEventId(event.id); setError(''); setNotice('');
+    try {
+      const result = await cancelEventBooking(booking.id);
+      setBookings((current) => current.map((item) => item.id === booking.id ? result.booking : item));
+      setEvents((current) => current.map((item) => item.id === event.id ? result.event : item));
+      setNotice(`Your booking for “${event.title}” was cancelled.`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Could not cancel this booking.');
+    } finally { setBusyEventId(''); }
+  }
+
+  return (
+    <WorkspaceShell role="learner" roleLabel={learnerNav.label} navItems={learnerNav.items} workspaceLabel={learnerNav.workspaceLabel} pageTitle="Events" pageSubtitle="Community workshops, networking and celebrations" userName={learner?.name || 'Learner'} userRole={learner?.programme ? `${learner.programme} Apprentice` : 'Apprentice'}>
+      <main className="page-container min-w-0 w-full space-y-3 p-3 md:space-y-4 md:p-6">
+        <section className="learner-super-admin-hero relative overflow-hidden rounded-2xl p-4 text-primary-800 sm:rounded-3xl sm:p-6 md:p-6 workspace-page-hero">
+          <div className="pointer-events-none absolute -right-20 -top-32 h-80 w-80 rounded-full bg-fuchsia-300/15 blur-3xl hidden"></div>
+          <div className="relative grid gap-6 lg:grid-cols-[minmax(0,1fr)_500px] lg:items-end">
+            <div><span className="inline-flex items-center gap-2 rounded-full border border-primary-200/60 bg-primary-100/60 px-3 py-1 text-[10px] font-bold uppercase tracking-[0.15em] text-primary-600"><AppIcon className="ri-calendar-event-line text-primary-600"></AppIcon>Community calendar</span><h1 className="mt-3 text-[22px] font-bold leading-tight text-primary-800 sm:text-2xl md:text-3xl">Connect beyond the classroom</h1><p className="mt-2 max-w-xl text-sm leading-6 text-foreground-500">Find workshops, networking sessions and community events, with all the details you need in one place.</p></div>
+            <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-2">{[
+              ['All events', events.length, 'ri-calendar-2-line', 'text-violet-200'], ['Upcoming', counts.upcoming, 'ri-calendar-schedule-line', 'text-amber-300'], ['Live now', counts.ongoing, 'ri-live-line', 'text-blue-300'], ['Attendances', counts.attendees, 'ri-group-line', 'text-pink-300'],
+            ].map(([label, value, icon]) => <div key={String(label)} className="ui-metric-card coach-metric-card"><WorkspaceMetricContent label={String(label)} value={loading ? '?' : value} icon={String(icon)} valuePosition="stacked" /></div>)}</div>
+          </div>
+        </section>
+
+        {error && <div className="rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-700"><AppIcon className="ri-error-warning-line mr-2"></AppIcon>{error}</div>}
+        {notice && <div className="flex items-center justify-between rounded-xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-700"><span><AppIcon className="ri-checkbox-circle-line mr-2"></AppIcon>{notice}</span><button onClick={() => setNotice('')}><AppIcon className="ri-close-line"></AppIcon></button></div>}
+
+        <section className="rounded-2xl border border-foreground-200/70 bg-white/95 p-2.5 shadow-[0_8px_30px_rgba(31,14,59,0.08)] backdrop-blur-xl md:sticky md:top-2 md:z-10">
+          <div className="flex flex-col gap-2.5 xl:flex-row xl:items-center xl:justify-between"><div className="grid grid-cols-2 gap-1.5 sm:flex">{(['all', 'upcoming', 'ongoing', 'completed'] as StatusFilter[]).map((item) => { const count = item === 'all' ? events.length : item === 'upcoming' ? counts.upcoming : item === 'ongoing' ? counts.ongoing : counts.completed; return <button key={item} onClick={() => setStatus(item)} className={`flex min-w-0 items-center justify-center gap-1.5 whitespace-nowrap rounded-xl px-2.5 py-2.5 text-[11px] font-semibold transition sm:gap-2 sm:px-4 sm:text-xs ${status === item ? 'bg-primary-700 text-white shadow-md shadow-primary-700/20' : 'text-foreground-500 hover:bg-primary-50 hover:text-primary-700'}`}><span className="truncate">{item === 'all' ? 'All events' : statusStyle[item].label}</span><span className={`shrink-0 rounded-full px-1.5 py-0.5 text-[9px] ${status === item ? 'bg-white/15 text-white' : 'bg-background-100 text-foreground-400'}`}>{count}</span></button>; })}</div><div className="flex flex-col gap-2 sm:flex-row"><select value={type} onChange={(event) => setType(event.target.value)} className="h-10 w-full rounded-xl border border-foreground-200 bg-background-50 px-3 text-xs font-semibold text-foreground-600 outline-none focus:border-primary-400 sm:w-auto"><option value="all">All event types</option>{types.map((item) => <option key={item} value={item}>{item[0].toUpperCase() + item.slice(1)}</option>)}</select><label className="relative block sm:w-72"><AppIcon className="ri-search-line absolute left-3 top-1/2 -translate-y-1/2 text-foreground-400"></AppIcon><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search events…" className="h-10 w-full rounded-xl border border-foreground-200 bg-background-50 pl-9 pr-3 text-xs outline-none transition focus:border-primary-400 focus:bg-white focus:ring-4 focus:ring-primary-100" /></label></div></div>
+        </section>
+
+        {loading ? <Loading /> : filtered.length ? <section><div className="mb-4 flex items-end justify-between"><div><h2 className="text-lg font-bold text-foreground-900">Community events</h2><p className="mt-1 text-xs text-foreground-500">Choose an event and book your place instantly</p></div><span className="rounded-full border border-background-200 bg-white px-3 py-1 text-[10px] font-semibold text-foreground-500">{filtered.length} {filtered.length === 1 ? 'event' : 'events'}</span></div><div className="space-y-3">{filtered.map((event) => { const booking = activeBookings.get(event.id); return <EventRow key={event.id} event={event} booking={booking} busy={busyEventId === event.id} onBook={() => bookEvent(event)} onCancel={() => booking && cancelBooking(event, booking)} />; })}</div></section> : <Empty />}
+      </main>
+    </WorkspaceShell>
+  );
+}
+
+function Loading() {
+  // Skeleton rather than a spinner: this stands in for the page's own
+  // content, so it should hold that shape while it loads.
+  return (
+    <div className="rounded-2xl border border-background-200 bg-white p-4 sm:rounded-3xl sm:p-5">
+      <RowsSkeleton rows={5} />
+    </div>
+  );
+}
+function Empty() { return <div className="rounded-2xl border border-dashed border-foreground-300 bg-white px-4 py-10 text-center sm:rounded-3xl sm:px-6 sm:py-16"><span className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-primary-50 text-primary-500"><AppIcon className="ri-calendar-close-line text-xl"></AppIcon></span><h2 className="mt-3 text-sm font-bold text-foreground-800">No events found</h2><p className="mt-1 text-xs leading-5 text-foreground-400">Try changing the filters, or check back when new events are published.</p></div>; }

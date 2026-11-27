@@ -1,0 +1,255 @@
+import { useEffect, useState } from 'react';
+import { AUTH_STORAGE_KEY, clearAuthStorage, readStoredAuthUser, type StoredAuthUser } from '../utils/authStorage';
+import { fetchWithTimeout } from '../utils/fetchWithTimeout';
+
+export interface AccessControl {
+  /** Effective server permissions. Backend checks remain authoritative. */
+  permissions: string[];
+  can: (permission: string) => boolean;
+  adminAccess: boolean;
+  eventManagerAccess: boolean;
+  operationsAccess: boolean;
+  itAccess: boolean;
+  marketingAccess: boolean;
+  canManageEvents: boolean;
+  canManageCohorts: boolean;
+  canManageNews: boolean;
+  /** Engagement Centre specialist ("Call centre agent" in Django admin). */
+  callCentreAgent: boolean;
+  /** Engagement Centre director ("Call centre director" in Django admin, or a super admin). */
+  callCentreDirector: boolean;
+  /** Either Engagement Centre role: opens the Engagement Centre and every dashboard. */
+  callCentreAccess: boolean;
+  /** The coaches' screen of the Engagement Centre ("Engagement Centre coach" in Django admin); nothing else. */
+  callCentreCoach: boolean;
+  /** Django super admin. */
+  superuser: boolean;
+  sessionInvalid: boolean;
+}
+
+const EMPTY_ACCESS: AccessControl = {
+  permissions: [],
+  can: () => false,
+  adminAccess: false,
+  eventManagerAccess: false,
+  operationsAccess: false,
+  itAccess: false,
+  marketingAccess: false,
+  canManageEvents: false,
+  canManageCohorts: false,
+  canManageNews: false,
+  callCentreAgent: false,
+  callCentreDirector: false,
+  callCentreAccess: false,
+  callCentreCoach: false,
+  superuser: false,
+  sessionInvalid: false,
+};
+
+const ACCESS_REFRESH_TTL_MS = 60000;
+let sharedAccessKey = '';
+let sharedAccessFetchedAt = 0;
+let sharedAccessValue: AccessControl | null = null;
+let sharedAccessPromise: Promise<AccessControl | null> | null = null;
+
+function invalidSessionAccess(): AccessControl {
+  return { ...EMPTY_ACCESS, sessionInvalid: true };
+}
+
+function deriveAccessFromUser(user: StoredAuthUser | null | undefined): AccessControl {
+  if (!user) {
+    return EMPTY_ACCESS;
+  }
+
+  const access = user?.access || {};
+  const groups = new Set((Array.isArray(user?.groups) ? user.groups : []).map(item => String(item).trim()));
+  const hasPermissionData = Array.isArray(access.permissions);
+  const permissions = hasPermissionData ? (access.permissions as unknown[]).filter((item): item is string => typeof item === 'string') : [];
+  const hasGroupData = groups.size > 0;
+
+  const adminAccess = hasGroupData
+    ? groups.has('Admin Access')
+    : Boolean(access.adminAccess);
+
+  const eventManagerAccess = hasGroupData
+    ? (adminAccess || groups.has('Event Manager Access'))
+    : (adminAccess || Boolean(access.eventManagerAccess) || Boolean(access.canManageEvents));
+
+  const operationsAccess = hasGroupData
+    ? (adminAccess || groups.has('Operations Access'))
+    : (adminAccess || Boolean(access.operationsAccess) || Boolean(access.canManageCohorts));
+
+  const itAccess = hasGroupData
+    ? (adminAccess || groups.has('IT Access'))
+    : (adminAccess || Boolean(access.itAccess));
+
+  const marketingAccess = hasGroupData
+    ? (adminAccess || groups.has('Marketing Access'))
+    : (adminAccess || Boolean(access.marketingAccess));
+
+  const superuser = Boolean(user.isSuperuser) || Boolean(access.isSuperuser);
+  const callCentreAgent = hasGroupData ? groups.has('Call Centre Agent Access') : Boolean(access.callCentreAgentAccess);
+  const callCentreDirector = typeof access.callCentreDirectorAccess === 'boolean' ? access.callCentreDirectorAccess : superuser
+    || (hasGroupData ? groups.has('Call Centre Director Access') : Boolean(access.callCentreDirectorAccess));
+  const callCentreCoach = hasGroupData ? groups.has('Call Centre Coach Access') : Boolean(access.callCentreCoachAccess);
+
+  // Older cached sessions keep their existing controls until refreshed. Once
+  // the server supplies permissions, group names cannot override that list.
+  const can = (permission: string): boolean => {
+    const qualified = permission.includes('.') ? permission : `login.${permission}`;
+    if (hasPermissionData) return permissions.includes(qualified);
+    if (superuser || adminAccess) return true;
+    if (qualified === 'login.view_user_activity') return itAccess;
+    if (qualified.endsWith('_news')) return qualified.startsWith('login.view_') || itAccess || marketingAccess;
+    if (qualified.endsWith('_events')) return qualified.startsWith('login.view_') || eventManagerAccess;
+    if (qualified.endsWith('_training_plan')) return qualified.startsWith('login.view_') || operationsAccess;
+    return qualified.startsWith('login.view_');
+  };
+  const canManage = (resource: string) => ['add', 'change', 'delete'].some(action => can(`${action}_${resource}`));
+
+  return {
+    permissions,
+    can,
+    adminAccess,
+    eventManagerAccess,
+    operationsAccess,
+    itAccess,
+    marketingAccess,
+    canManageEvents: canManage('events'),
+    canManageCohorts: canManage('training_plan'),
+    canManageNews: canManage('news'),
+    callCentreAgent,
+    callCentreDirector,
+    callCentreAccess: callCentreAgent || callCentreDirector,
+    callCentreCoach,
+    superuser,
+    sessionInvalid: false,
+  };
+}
+
+function parseAccessFromStorage(): AccessControl {
+  // Access in localStorage is cache only for temporary UI continuity. The
+  // backend/database response below is the source of truth.
+  return deriveAccessFromUser(readStoredAuthUser());
+}
+
+function resetSharedAccessCache() {
+  sharedAccessKey = '';
+  sharedAccessFetchedAt = 0;
+  sharedAccessValue = null;
+  sharedAccessPromise = null;
+}
+
+export default function useAccessControl(): AccessControl {
+  const [access, setAccess] = useState<AccessControl>(() => parseAccessFromStorage());
+
+  useEffect(() => {
+    const syncFromStorage = () => setAccess(parseAccessFromStorage());
+
+    const syncFromServer = async () => {
+      const user = readStoredAuthUser();
+      if (!user) {
+        setAccess(EMPTY_ACCESS);
+        return;
+      }
+
+      const searchParams = new URLSearchParams();
+      if (user.id !== undefined && user.id !== null && String(user.id).trim()) {
+        searchParams.set('userId', String(user.id));
+      } else if (user.email && String(user.email).trim()) {
+        searchParams.set('email', String(user.email));
+      } else if (user.username && String(user.username).trim()) {
+        searchParams.set('username', String(user.username));
+      } else {
+        return;
+      }
+
+      const accessKey = searchParams.toString();
+      const now = Date.now();
+
+      if (sharedAccessKey === accessKey && now - sharedAccessFetchedAt < ACCESS_REFRESH_TTL_MS) {
+        if (sharedAccessValue) {
+          setAccess(sharedAccessValue);
+        }
+        return;
+      }
+
+      if (sharedAccessKey === accessKey && sharedAccessPromise) {
+        const nextAccess = await sharedAccessPromise;
+        if (nextAccess) {
+          setAccess(nextAccess);
+        }
+        return;
+      }
+
+      sharedAccessKey = accessKey;
+      sharedAccessPromise = (async () => {
+        const response = await fetchWithTimeout(`/api/auth/access/?${searchParams.toString()}`, { timeoutMs: 8000 });
+        sharedAccessFetchedAt = Date.now();
+        if (!response.ok) {
+          if (response.status === 404) {
+            // A 404 from access means the cached auth user is stale or invalid
+            // (for example a deleted login_db user id). Clear it immediately so
+            // the app stops sending invalid ids and asks for a fresh login.
+            clearAuthStorage();
+            sharedAccessValue = invalidSessionAccess();
+            return sharedAccessValue;
+          }
+          sharedAccessValue = null;
+          return null;
+        }
+
+        const payload = (await response.json()) as StoredAuthUser;
+        const merged: StoredAuthUser = {
+          ...user,
+          ...payload,
+          access: payload.access || user.access,
+          groups: Array.isArray(payload.groups) ? payload.groups : user.groups,
+        };
+
+        // Keep localStorage as a cache of the latest database-backed access.
+        window.localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(merged));
+        sharedAccessValue = deriveAccessFromUser(merged);
+        return sharedAccessValue;
+      })();
+
+      try {
+        const nextAccess = await sharedAccessPromise;
+        if (nextAccess) {
+          setAccess(nextAccess);
+        }
+      } catch {
+        // Keep local access when refresh fails.
+      } finally {
+        sharedAccessPromise = null;
+      }
+    };
+
+    const handleFocus = () => {
+      sharedAccessFetchedAt = 0;
+      syncFromStorage();
+      void syncFromServer();
+    };
+
+    const handleAuthChanged = () => {
+      resetSharedAccessCache();
+      syncFromStorage();
+      void syncFromServer();
+    };
+
+    syncFromStorage();
+    void syncFromServer();
+
+    window.addEventListener('storage', syncFromStorage);
+    window.addEventListener('kbc-auth-changed', handleAuthChanged);
+    window.addEventListener('focus', handleFocus);
+
+    return () => {
+      window.removeEventListener('storage', syncFromStorage);
+      window.removeEventListener('kbc-auth-changed', handleAuthChanged);
+      window.removeEventListener('focus', handleFocus);
+    };
+  }, []);
+
+  return access;
+}

@@ -1,0 +1,550 @@
+"""Wizard builder: layout validation, storage assignment, DDL, publishing and
+the projection of custom answers into their columns.
+
+SimpleTestCase with a recording fake cursor: no query reaches a database.
+"""
+import json
+import os
+from contextlib import nullcontext
+from datetime import datetime, timezone
+from decimal import Decimal
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from django.test import RequestFactory, SimpleTestCase
+from django.urls import resolve
+
+from enrolment_api import wizard_layout as wl
+
+
+class FakeCursor:
+    """Records every statement; answers fetchone() from a queue."""
+
+    def __init__(self, results=None):
+        self.executed = []
+        self.results = list(results or [])
+
+    def execute(self, sql, params=None):
+        self.executed.append((" ".join(sql.split()), params))
+
+    def fetchone(self):
+        return self.results.pop(0) if self.results else None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class FakeConnections(dict):
+    def __init__(self, cursor):
+        super().__init__(enrolment=SimpleNamespace(cursor=lambda: cursor))
+
+
+def custom(label, type_="text", **extra):
+    return {"key": extra.pop("key", ""), "builtin": False, "hidden": False, "label": label, "type": type_, **extra}
+
+
+def step(slug, items, label=None, builtin=True, **extra):
+    return {"slug": slug, "label": label or slug, "builtin": builtin, "hidden": False, "items": items, **extra}
+
+
+def cv_step(layout):
+    return next(s for s in layout["steps"] if s["slug"] == "cv-job")
+
+
+class NormalizeLayoutTests(SimpleTestCase):
+    def test_step_visibility_is_persisted_and_journey_steps_are_protected(self):
+        raw = {"steps": [step("personal-details", [], hidden=True), step("ilr-details", [])]}
+        layout, _ = wl.normalize_layout(raw, None)
+        self.assertTrue(layout["steps"][0]["hidden"])
+        for slug in ("ilr-details", "skills-radar"):
+            with self.subTest(slug=slug), self.assertRaises(wl.LayoutError):
+                wl.normalize_layout({"steps": [step(slug, [], hidden=True)]}, None)
+
+    def test_content_blocks_have_no_answer_storage(self):
+        layout, plan = wl.normalize_layout({"steps": [step("cv-job", [
+            custom("GCSEs", "heading"),
+            custom("Please provide your qualification details.\nUse one line per qualification.", "description"),
+            custom("", "divider"),
+        ])]}, None)
+        items = cv_step(layout)["items"]
+        self.assertEqual([item["type"] for item in items], ["heading", "description", "divider"])
+        self.assertEqual([item["required"] for item in items], [False, False, False])
+        self.assertTrue(all("table" not in item and "column" not in item for item in items))
+        self.assertEqual(plan, {})
+
+    def test_radio_and_checkbox_fields_use_their_answer_storage(self):
+        layout, plan = wl.normalize_layout({"steps": [step("cv-job", [
+            custom("Preferred route", "radio", options=["Online", "In person"]),
+            custom("Subjects completed", "checkbox", options=["English", "Maths"]),
+        ])]}, None)
+        items = cv_step(layout)["items"]
+        self.assertEqual([item["type"] for item in items], ["radio", "checkbox"])
+        self.assertEqual(plan["Wizard_Cv_Job"]["columns"], {
+            "Custom_preferred_route": "text",
+            "Custom_subjects_completed": "jsonb",
+        })
+
+    def test_new_text_types_share_text_storage(self):
+        layout, plan = wl.normalize_layout(
+            {"steps": [step("cv-job", [custom("Short answer", "single_line"), custom("Long answer", "multi_line")])]},
+            None,
+        )
+        items = cv_step(layout)["items"]
+        self.assertEqual([item["type"] for item in items], ["single_line", "multi_line"])
+        self.assertEqual(plan["Wizard_Cv_Job"]["columns"], {
+            "Custom_short_answer": "text",
+            "Custom_long_answer": "text",
+        })
+
+    def test_new_custom_field_gets_a_column_in_its_steps_table(self):
+        layout, plan = wl.normalize_layout(
+            {"steps": [step("cv-job", [{"key": "cv.experience", "builtin": True, "hidden": False},
+                                       custom("Years in role", "number", required=True)])]},
+            None,
+        )
+        item = cv_step(layout)["items"][1]
+        self.assertEqual(item["key"], "cf_years_in_role")
+        self.assertEqual(item["table"], "Wizard_Cv_Job")
+        self.assertEqual(item["column"], "Custom_years_in_role")
+        self.assertTrue(item["required"])
+        self.assertEqual(plan["Wizard_Cv_Job"]["columns"], {"Custom_years_in_role": "numeric"})
+        # An existing table is never re-created, only extended.
+        self.assertFalse(plan["Wizard_Cv_Job"]["create"])
+        self.assertEqual(plan["Wizard_Cv_Job"]["index"], "wizard_cv_job_learner_uniq")
+
+    def test_client_cannot_choose_storage(self):
+        layout, _plan = wl.normalize_layout(
+            {"steps": [step("personal-details", [custom("Hobby", table="Created_users", column="Password")])]},
+            None,
+        )
+        item = layout["steps"][0]["items"][0]
+        self.assertEqual((item["table"], item["column"]), ("Wizard_Personal_Details", "Custom_hobby"))
+
+    def test_a_step_added_in_the_builder_gets_its_own_table(self):
+        layout, plan = wl.normalize_layout(
+            {"steps": [step("new", [custom("Laptop model")], label="Equipment", builtin=False)]},
+            None,
+        )
+        new_step = layout["steps"][0]
+        self.assertTrue(new_step["slug"].startswith("custom-equipment-"))
+        self.assertEqual(new_step["table"], "Wizard_Custom_equipment")
+        self.assertTrue(plan["Wizard_Custom_equipment"]["create"])
+
+    def test_steps_without_a_learner_table_get_one_created_for_custom_fields(self):
+        _layout, plan = wl.normalize_layout({"steps": [step("policies", [custom("Read the handbook?", "dropdown", options=["Yes", "No"])])]}, None)
+        self.assertTrue(plan["Wizard_Policies"]["create"])
+        self.assertEqual(plan["Wizard_Policies"]["columns"], {"Custom_read_the_handbook": "text"})
+
+    def test_published_field_keeps_its_key_and_column_and_type(self):
+        first, _ = wl.normalize_layout({"steps": [step("cv-job", [custom("Years in role", "number")])]}, None)
+        renamed = json.loads(json.dumps(first))
+        cv_step(renamed)["items"][0]["label"] = "Years in current role"
+        second, _ = wl.normalize_layout(renamed, first)
+        item = cv_step(second)["items"][0]
+        self.assertEqual((item["key"], item["column"]), ("cf_years_in_role", "Custom_years_in_role"))
+        self.assertEqual(item["label"], "Years in current role")
+
+        retyped = json.loads(json.dumps(first))
+        cv_step(retyped)["items"][0]["type"] = "text"
+        with self.assertRaisesMessage(wl.LayoutError, "type cannot change"):
+            wl.normalize_layout(retyped, first)
+
+    def test_legacy_text_field_can_be_upgraded_to_multi_line(self):
+        first, _ = wl.normalize_layout({"steps": [step("cv-job", [custom("Long answer")])]}, None)
+        upgraded = json.loads(json.dumps(first))
+        cv_step(upgraded)["items"][0]["type"] = "multi_line"
+        second, plan = wl.normalize_layout(upgraded, first)
+        item = cv_step(second)["items"][0]
+        self.assertEqual(item["type"], "multi_line")
+        self.assertEqual(item["column"], "Custom_long_answer")
+        self.assertEqual(plan["Wizard_Cv_Job"]["columns"], {"Custom_long_answer": "text"})
+
+    def test_a_field_left_out_of_the_layout_is_kept_hidden_with_its_column(self):
+        first, _ = wl.normalize_layout({"steps": [step("cv-job", [custom("Years in role", "number")])]}, None)
+        second, plan = wl.normalize_layout({"steps": [step("cv-job", [])]}, first)
+        kept = cv_step(second)["items"]
+        self.assertEqual(len(kept), 1)
+        self.assertTrue(kept[0]["hidden"])
+        self.assertEqual(kept[0]["column"], "Custom_years_in_role")
+        # Its column is still part of the plan, so nothing ever drops it.
+        self.assertIn("Custom_years_in_role", plan["Wizard_Cv_Job"]["columns"])
+
+    def test_same_label_twice_gets_distinct_columns(self):
+        layout, _ = wl.normalize_layout({"steps": [step("cv-job", [custom("Notes"), custom("Notes")])]}, None)
+        cols = [i["column"] for i in cv_step(layout)["items"]]
+        self.assertEqual(cols, ["Custom_notes", "Custom_notes_2"])
+
+    def test_dropdown_needs_options(self):
+        with self.assertRaisesMessage(wl.LayoutError, "at least one option"):
+            wl.normalize_layout({"steps": [step("cv-job", [custom("Shift", "dropdown", options=["  "])])]}, None)
+
+    def test_unknown_type_is_refused(self):
+        with self.assertRaisesMessage(wl.LayoutError, "needs a type"):
+            wl.normalize_layout({"steps": [step("cv-job", [custom("Thing", "date")])]}, None)
+
+    def test_condition_on_a_custom_dropdown_must_use_its_options(self):
+        trigger = custom("Shift", "dropdown", key="cf_shift", options=["Day", "Night"])
+        first, _ = wl.normalize_layout({"steps": [step("cv-job", [trigger])]}, None)
+        follow = custom("Night allowance", condition={"field": "cf_shift", "values": ["Weekend"]})
+        with self.assertRaisesMessage(wl.LayoutError, "does not offer: Weekend"):
+            wl.normalize_layout({"steps": [step("cv-job", [cv_step(first)["items"][0], follow])]}, first)
+
+        follow["condition"]["values"] = ["Night"]
+        layout, _ = wl.normalize_layout({"steps": [step("cv-job", [cv_step(first)["items"][0], follow])]}, first)
+        self.assertEqual(cv_step(layout)["items"][1]["condition"], {"field": "cf_shift", "values": ["Night"]})
+
+    def test_condition_on_a_field_added_in_the_same_publish_follows_its_new_key(self):
+        layout, _ = wl.normalize_layout({"steps": [step("cv-job", [
+            custom("Shift", "dropdown", key="new_1", options=["Day", "Night"]),
+            custom("Night allowance", condition={"field": "new_1", "values": ["Night"]}),
+        ])]}, None)
+        items = cv_step(layout)["items"]
+        self.assertEqual(items[0]["key"], "cf_shift")
+        self.assertEqual(items[1]["condition"]["field"], "cf_shift")
+
+    def test_a_published_custom_step_keeps_its_slug_and_table(self):
+        first, _ = wl.normalize_layout({"steps": [step("tmp-1", [custom("Laptop")], label="Equipment", builtin=False)]}, None)
+        renamed = json.loads(json.dumps(first))
+        renamed["steps"][0]["label"] = "Kit"
+        second, _ = wl.normalize_layout(renamed, first)
+        self.assertEqual(second["steps"][0]["slug"], first["steps"][0]["slug"])
+        self.assertEqual(second["steps"][0]["table"], "Wizard_Custom_equipment")
+
+    def test_condition_must_point_at_a_dropdown_in_the_wizard(self):
+        with self.assertRaisesMessage(wl.LayoutError, "not in the wizard"):
+            wl.normalize_layout({"steps": [step("cv-job", [custom("X", condition={"field": "cf_missing", "values": ["a"]})])]}, None)
+        first, _ = wl.normalize_layout({"steps": [step("cv-job", [custom("Plain")])]}, None)
+        with self.assertRaisesMessage(wl.LayoutError, "only depend on a dropdown"):
+            wl.normalize_layout({"steps": [step("cv-job", [
+                cv_step(first)["items"][0], custom("Y", condition={"field": "cf_plain", "values": ["a"]}),
+            ])]}, first)
+
+    def test_condition_on_a_builtin_dropdown_needs_its_answer_path(self):
+        builtin = {"key": "ild.employmentStatus", "builtin": True, "hidden": False}
+        with self.assertRaisesMessage(wl.LayoutError, "where its answer is"):
+            wl.normalize_layout({"steps": [step("ilr-details", [builtin, custom(
+                "Employer size", condition={"field": "ild.employmentStatus", "values": ["In paid employment"]})])]}, None)
+        layout, _ = wl.normalize_layout({"steps": [step("ilr-details", [builtin, custom(
+            "Employer size", condition={"field": "ild.employmentStatus", "values": ["In paid employment"],
+                                        "path": "ilrDetails.employmentStatus"})])]}, None)
+        self.assertEqual(layout["steps"][0]["items"][1]["condition"]["path"], "ilrDetails.employmentStatus")
+
+    def test_builtin_items_keep_only_layout_settings(self):
+        layout, plan = wl.normalize_layout({"steps": [step("personal-details", [
+            {"key": "pd.address", "builtin": True, "hidden": True, "required": False, "table": "x", "label": "y"},
+        ])]}, None)
+        self.assertEqual(layout["steps"][0]["items"][0], {"key": "pd.address", "builtin": True, "hidden": True, "required": False})
+        self.assertEqual(plan, {})
+
+    def test_edited_wording_is_kept_and_blank_edits_dropped(self):
+        layout, plan = wl.normalize_layout({
+            "steps": [step("introduction", [])],
+            "texts": {"block.introduction.body": "## Hello\n**Welcome**", "pd.address.label": "  "},
+        }, None)
+        self.assertEqual(layout["texts"], {"block.introduction.body": "## Hello\n**Welcome**"})
+        self.assertEqual(plan, {})
+        no_edits, _ = wl.normalize_layout({"steps": [step("introduction", [])], "texts": {}}, None)
+        self.assertNotIn("texts", no_edits)
+
+    def test_edited_wording_shape_is_checked(self):
+        for texts, message in (
+            (["x"], "must be an object"),
+            ({"bad key!": "x"}, "invalid key"),
+            ({"pd.address.label": 5}, "must be text"),
+            ({"pd.address.label": "x" * (wl.MAX_TEXT_LENGTH + 1)}, "characters or fewer"),
+        ):
+            with self.assertRaisesMessage(wl.LayoutError, message):
+                wl.normalize_layout({"steps": [step("introduction", [])], "texts": texts}, None)
+
+    def test_duplicate_item_is_refused(self):
+        item = {"key": "pd.address", "builtin": True, "hidden": False}
+        with self.assertRaisesMessage(wl.LayoutError, "appears twice"):
+            wl.normalize_layout({"steps": [step("personal-details", [item, dict(item)])]}, None)
+
+
+class ApplyPlanTests(SimpleTestCase):
+    def test_adds_columns_and_the_upsert_index_without_dropping_anything(self):
+        cursor = FakeCursor()
+        wl.apply_plan(cursor, {
+            "Wizard_Cv_Job": {"index": "wizard_cv_job_learner_uniq", "create": False, "columns": {"Custom_years": "numeric"}},
+            "Wizard_Custom_equipment": {"index": "wizard_custom_equipment_learner_uniq", "create": True, "columns": {"Custom_laptop": "text"}},
+        })
+        sql = [s for s, _ in cursor.executed]
+        self.assertIn('ALTER TABLE enrolment."Wizard_Cv_Job" ADD COLUMN IF NOT EXISTS "Custom_years" numeric', sql)
+        self.assertTrue(any(s.startswith('CREATE TABLE IF NOT EXISTS enrolment."Wizard_Custom_equipment"') for s in sql))
+        self.assertFalse(any(s.startswith('CREATE TABLE IF NOT EXISTS enrolment."Wizard_Cv_Job"') for s in sql))
+        self.assertTrue(all("DROP" not in s.upper() for s in sql))
+
+    def test_refuses_an_unsafe_identifier(self):
+        with self.assertRaises(wl.LayoutError):
+            wl.apply_plan(FakeCursor(), {'Wizard_x"; DROP TABLE y; --': {"index": "i", "create": False, "columns": {}}})
+        with self.assertRaises(wl.LayoutError):
+            wl.apply_plan(FakeCursor(), {"Wizard_Cv_Job": {"index": "i", "create": False, "columns": {'Custom_a" text; --': "text"}}})
+
+
+LAYOUT = {"steps": [
+    step("ilr-details", [
+        {"key": "ild.employmentStatus", "builtin": True, "hidden": False},
+        {"key": "cf_employer_size", "builtin": False, "hidden": False, "label": "Employer size", "type": "number",
+         "table": "Wizard_Ilr_Learner_Details", "column": "Custom_employer_size",
+         "condition": {"field": "ild.employmentStatus", "values": ["In paid employment"], "path": "ilrDetails.employmentStatus"}},
+    ]),
+    step("cv-job", [
+        {"key": "cf_shift", "builtin": False, "hidden": False, "label": "Shift", "type": "dropdown", "options": ["Day", "Night"],
+         "table": "Wizard_Cv_Job", "column": "Custom_shift"},
+        {"key": "cf_night_note", "builtin": False, "hidden": False, "label": "Night note", "type": "text",
+         "table": "Wizard_Cv_Job", "column": "Custom_night_note", "condition": {"field": "cf_shift", "values": ["Night"]}},
+        {"key": "cf_old", "builtin": False, "hidden": True, "label": "Old", "type": "text",
+         "table": "Wizard_Cv_Job", "column": "Custom_old"},
+        {"key": "cf_cert", "builtin": False, "hidden": False, "label": "Certificate", "type": "upload",
+         "table": "Wizard_Cv_Job", "column": "Custom_cert"},
+    ]),
+]}
+
+
+class ProjectCustomFieldsTests(SimpleTestCase):
+    def _project(self, draft, answers=None, layout=LAYOUT):
+        cursor = FakeCursor()
+        with patch.object(wl, "connections", FakeConnections(cursor)):
+            wl.project_custom_fields("apprenticeship", 41, draft, answers=answers, layout=layout)
+        return cursor.executed
+
+    def test_single_line_and_multi_line_answers_have_separate_limits(self):
+        layout = {"steps": [step("cv-job", [
+            custom("Short", "single_line", key="cf_short", table="Wizard_Cv_Job", column="Custom_short"),
+            custom("Long", "multi_line", key="cf_long", table="Wizard_Cv_Job", column="Custom_long"),
+        ])]}
+        executed = self._project({"custom": {"cf_short": "s" * 600, "cf_long": "l" * 10_500}}, layout=layout)
+        self.assertEqual(executed[0][1], ["apprenticeship", 41, "s" * 500, "l" * 10_000])
+
+    def test_radio_and_checkbox_answers_are_projected_with_validation(self):
+        layout = {"steps": [step("cv-job", [
+            custom("Preferred route", "radio", key="cf_route", options=["Online", "In person"], table="Wizard_Cv_Job", column="Custom_route"),
+            custom("Subjects completed", "checkbox", key="cf_subjects", options=["English", "Maths"], table="Wizard_Cv_Job", column="Custom_subjects"),
+        ])]}
+        executed = self._project({"custom": {
+            "cf_route": "In person",
+            "cf_subjects": ["Maths", "English", "Maths", "Invalid"],
+        }}, layout=layout)
+        self.assertEqual(executed[0][1], ["apprenticeship", 41, "In person", '["Maths", "English"]'])
+
+        invalid = self._project({"custom": {"cf_route": "Postal", "cf_subjects": ["Invalid"]}}, layout=layout)
+        self.assertEqual(invalid[0][1], ["apprenticeship", 41, None, None])
+
+    def test_upserts_each_tables_answers(self):
+        executed = self._project({
+            "ilrDetails": {"employmentStatus": "In paid employment"},
+            "custom": {"cf_employer_size": " 250 ", "cf_shift": "Night", "cf_night_note": "Weekends"},
+        })
+        by_table = {sql.split('enrolment."')[1].split('"')[0]: (sql, params) for sql, params in executed}
+        sql, params = by_table["Wizard_Cv_Job"]
+        self.assertIn('ON CONFLICT ("Learner_kind", "Learner_id") DO UPDATE SET', sql)
+        self.assertEqual(params, ["apprenticeship", 41, "Night", "Weekends"])
+        self.assertEqual(by_table["Wizard_Ilr_Learner_Details"][1], ["apprenticeship", 41, Decimal("250")])
+
+    def test_answers_to_questions_not_shown_are_cleared(self):
+        executed = self._project({
+            "ilrDetails": {"employmentStatus": "Not in paid employment"},
+            "custom": {"cf_employer_size": "250", "cf_shift": "Day", "cf_night_note": "stale"},
+        })
+        params = {sql.split('enrolment."')[1].split('"')[0]: p for sql, p in executed}
+        self.assertEqual(params["Wizard_Ilr_Learner_Details"], ["apprenticeship", 41, None])
+        self.assertEqual(params["Wizard_Cv_Job"], ["apprenticeship", 41, "Day", None])
+
+    def test_removed_fields_uploads_and_absent_keys_are_left_alone(self):
+        executed = self._project({"custom": {"cf_old": "new value", "cf_cert": [{"id": "x"}], "cf_unknown": "?"}})
+        self.assertEqual(executed, [])
+
+    def test_bad_number_and_unknown_dropdown_option_become_null(self):
+        executed = self._project({
+            "ilrDetails": {"employmentStatus": "In paid employment"},
+            "custom": {"cf_employer_size": "lots", "cf_shift": "Evening"},
+        })
+        params = {sql.split('enrolment."')[1].split('"')[0]: p for sql, p in executed}
+        self.assertEqual(params["Wizard_Ilr_Learner_Details"], ["apprenticeship", 41, None])
+        self.assertEqual(params["Wizard_Cv_Job"], ["apprenticeship", 41, None])
+
+    def test_no_custom_answers_means_no_query(self):
+        with patch.object(wl, "current_layout") as current:
+            wl.project_custom_fields("apprenticeship", 41, {"personalDetails": {}})
+        current.assert_not_called()
+
+
+class PublishViewTests(SimpleTestCase):
+    def setUp(self):
+        self.factory = RequestFactory()
+        for p in (
+            patch.dict(os.environ, {"ENROLMENT_API_REQUIRE_AUTH": "0"}),
+            patch.object(wl.transaction, "atomic", lambda **_: nullcontext()),
+            patch.object(wl, "_kind_column_exists", return_value=True),
+        ):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _put(self, body, cursor):
+        request = self.factory.put("/enrolment_api/wizard-layout/publish/", data=json.dumps(body), content_type="application/json")
+        with patch.object(wl, "connections", FakeConnections(cursor)):
+            return wl.publish_wizard_layout(request)
+
+    def test_publishes_a_new_version_with_its_columns(self):
+        now = datetime(2026, 10, 3, tzinfo=timezone.utc)
+        # to_regclass (exists), latest row (none yet), INSERT ... RETURNING
+        cursor = FakeCursor([("x",), None, (7, now)])
+        res = self._put({"baseVersion": None, "layout": {"steps": [step("cv-job", [custom("Years in role", "number")])]}}, cursor)
+        self.assertEqual(res.status_code, 200, res.content)
+        data = json.loads(res.content)
+        self.assertEqual(data["version"], 7)
+        self.assertEqual(cv_step(data["layout"])["items"][0]["column"], "Custom_years_in_role")
+        sql = [s for s, _ in cursor.executed]
+        self.assertTrue(any("ADD COLUMN IF NOT EXISTS \"Custom_years_in_role\" numeric" in s for s in sql))
+        self.assertTrue(any(s.startswith('INSERT INTO enrolment."Wizard_Form_Layouts"') for s in sql))
+
+    def test_refuses_when_someone_else_published_first(self):
+        cursor = FakeCursor([("x",), (5, {"steps": []}, None, "someone")])
+        res = self._put({"baseVersion": 4, "layout": {"steps": [step("cv-job", [])]}}, cursor)
+        self.assertEqual(res.status_code, 409)
+        # Main's layout-table compatibility bootstrap runs before the version
+        # check; a rejected publish must still write no version or answer schema.
+        self.assertFalse(any(s.startswith("INSERT") or
+                             ("ALTER TABLE" in s and '"Wizard_Form_Layouts"' not in s)
+                             for s, _ in cursor.executed))
+
+    def test_your_modules_captures_only_the_server_catalogue_on_explicit_publish(self):
+        now = datetime(2026, 11, 27, tzinfo=timezone.utc)
+        cursor = FakeCursor([('x',), None, (7, now)])
+        layout = {'steps': [step('your-modules', [{'key': 'block.yourModules', 'builtin': True, 'hidden': False}])],
+                  'yourModulesCatalogue': {'programmes': [{'id': 'forged-client-value'}]}}
+        snapshot = {'format': 1, 'programmes': [{'id': 'CHANGE_ME-server-catalogue'}]}
+        with patch('programme_suitability.your_modules.capture_catalogue', return_value=snapshot) as capture:
+            result = self._put({'baseVersion': None, 'layout': layout}, cursor)
+        self.assertEqual(result.status_code, 200, result.content)
+        capture.assert_called_once_with()
+        self.assertEqual(json.loads(result.content)['layout']['yourModulesCatalogue'], snapshot)
+        self.assertEqual(layout['yourModulesCatalogue']['programmes'][0]['id'], 'forged-client-value')
+        self.assertFalse(any('Wizard_Layout_Assignments' in sql and sql.startswith(('INSERT', 'UPDATE'))
+                             for sql, _ in cursor.executed))
+
+    def test_old_publication_does_not_capture_catalogue_or_gain_a_visible_step(self):
+        cursor = FakeCursor([('x',), None, (7, datetime(2026, 11, 27, tzinfo=timezone.utc))])
+        with patch('programme_suitability.your_modules.capture_catalogue') as capture:
+            result = self._put({'baseVersion': None, 'layout': {'steps': [step('skills-radar', [])]}}, cursor)
+        self.assertEqual(result.status_code, 200, result.content)
+        capture.assert_not_called()
+        self.assertNotIn('your-modules', [s['slug'] for s in json.loads(result.content)['layout']['steps']])
+
+    def test_invalid_layout_is_a_400_with_the_reason(self):
+        cursor = FakeCursor([("x",), None])
+        res = self._put({"baseVersion": None, "layout": {"steps": [step("cv-job", [custom("", "text")])]}}, cursor)
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("needs a label", json.loads(res.content)["error"])
+
+    def test_targeted_version_is_typed_and_does_not_assign_learners(self):
+        now = datetime(2026, 11, 8, tzinfo=timezone.utc)
+        previous = {"steps": [step("cv-job", [])]}
+        cursor = FakeCursor([
+            ("x",), (5, previous, now, "Admin"),
+            (5, previous, now, "Admin", "default", None, None, None, False),
+            (6, now),
+        ])
+        request = self.factory.put("/enrolment_api/wizard-layout/publish/", data=json.dumps({
+            "baseVersion": 5, "parentVersion": 5, "scope": "targeted", "name": "Commercial cohort",
+            "learnerKind": "commercial", "layout": previous,
+        }), content_type="application/json")
+        request._dont_enforce_csrf_checks = True
+        with patch.object(wl, "connections", FakeConnections(cursor)):
+            response = wl.publish_wizard_layout(request)
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(json.loads(response.content)["assigned"], 0)
+        self.assertFalse(any('INSERT INTO enrolment."Wizard_Layout_Assignments"' in sql for sql, _ in cursor.executed))
+        inserted = next(params for sql, params in cursor.executed if sql.startswith('INSERT INTO enrolment."Wizard_Form_Layouts"'))
+        self.assertEqual(inserted[-1], "commercial")
+
+    def test_legacy_version_is_readable_when_archived(self):
+        now = datetime(2026, 11, 8, tzinfo=timezone.utc)
+        cursor = FakeCursor([(3, '{"steps": []}', now, "Admin", "targeted", "Older", 2, "apprenticeship", True)])
+        row = wl.read_version(cursor, 3)
+        self.assertEqual(row[1], {"steps": []})
+        self.assertTrue(row[8])
+        self.assertNotIn('NOT COALESCE("Archived", false)', cursor.executed[0][0])
+
+    def test_current_default_is_filtered_by_learner_type(self):
+        now = datetime(2026, 11, 8, tzinfo=timezone.utc)
+        cursor = FakeCursor([("x",), (8, {"steps": []}, now, "Admin")])
+        current = wl.read_current(cursor, "commercial")
+        self.assertEqual(current[0], 8)
+        sql, params = cursor.executed[-1]
+        self.assertIn('"Learner_kind" = %s', sql)
+        self.assertIn('NULLS LAST', sql)
+        self.assertEqual(params, ["commercial", "commercial"])
+
+    def test_assignment_rejects_archived_and_wrong_type_versions(self):
+        now = datetime(2026, 11, 8, tzinfo=timezone.utc)
+        for saved_kind, archived in (("commercial", False), ("apprenticeship", True)):
+            with self.subTest(saved_kind=saved_kind, archived=archived):
+                cursor = FakeCursor([(3, {"steps": []}, now, "Admin", "targeted", "Older", 2, saved_kind, archived)])
+                request = self.factory.put("/enrolment_api/wizard-layout/assignments/", data=json.dumps({
+                    "learnerKind": "apprenticeship", "learnerIds": [41], "version": 3,
+                }), content_type="application/json")
+                request._dont_enforce_csrf_checks = True
+                with patch.object(wl, "connections", FakeConnections(cursor)), patch.object(wl, "_target_learners_exist", return_value=True):
+                    response = wl.assign_wizard_layout(request)
+                self.assertEqual(response.status_code, 400, response.content)
+                self.assertFalse(any('INSERT INTO enrolment."Wizard_Layout_Assignments"' in sql for sql, _ in cursor.executed))
+
+    def test_cannot_archive_the_current_default(self):
+        now = datetime(2026, 11, 8, tzinfo=timezone.utc)
+        cursor = FakeCursor([
+            ("x",), (7, {"steps": []}, now, "Admin", "default", None, None, "apprenticeship", False),
+        ])
+        request = self.factory.patch("/enrolment_api/wizard-layout/versions/7/", data=json.dumps({"archived": True}), content_type="application/json")
+        request._dont_enforce_csrf_checks = True
+        with patch.object(wl, "connections", FakeConnections(cursor)), patch.object(wl, "read_current", return_value=(7, {"steps": []}, now, "Admin")):
+            response = wl.wizard_layout_version(request, 7)
+        self.assertEqual(response.status_code, 409, response.content)
+        self.assertFalse(any(sql.startswith("UPDATE") for sql, _ in cursor.executed))
+
+
+class LayoutAccessTests(SimpleTestCase):
+    """The layout is readable by learners; publishing it is not."""
+
+    def setUp(self):
+        self.factory = RequestFactory()
+        p = patch.dict(os.environ, {"ENROLMENT_API_REQUIRE_AUTH": "1"})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _as_learner(self, request):
+        request.login_account = SimpleNamespace(is_active=True, role="learner", subject_id=41, subject_type="learner")
+        request.user = SimpleNamespace(is_authenticated=False)
+        return request
+
+    def test_learner_can_read_the_layout(self):
+        cursor = FakeCursor([(None,)])  # no layout table yet
+        with patch.object(wl, "connections", FakeConnections(cursor)), patch('learner_api.models.EnrolmentUser.all_learners') as learners:
+            # The authentication gate now checks current onboarding status.
+            # Keep this SimpleTestCase read CHANGE_ME rather than querying a DB.
+            learners.filter.return_value.values.return_value.first.return_value = {
+                'learner_type': 'apprenticeship', 'programme_status': 'Onboarding'}
+            res = wl.wizard_layout(self._as_learner(self.factory.get("/enrolment_api/wizard-layout/")))
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(json.loads(res.content)["layout"], None)
+
+    def test_version_detail_url_does_not_match_learner_layout_route(self):
+        match = resolve('/enrolment_api/wizard-layout/versions/7/', urlconf='enrollment_service.urls')
+        self.assertEqual(match.func, wl.wizard_layout_version)
+        self.assertEqual(match.kwargs, {'version': 7})
+
+    def test_learner_cannot_publish(self):
+        request = self._as_learner(self.factory.put("/enrolment_api/wizard-layout/publish/", data="{}", content_type="application/json"))
+        with patch.object(wl, "connections") as conns:
+            res = wl.publish_wizard_layout(request)
+        self.assertEqual(res.status_code, 404)
+        conns.__getitem__.assert_not_called()
+
+    def test_anonymous_cannot_read(self):
+        request = self.factory.get("/enrolment_api/wizard-layout/")
+        request.user = SimpleNamespace(is_authenticated=False)
+        self.assertEqual(wl.wizard_layout(request).status_code, 401)

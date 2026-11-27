@@ -1,0 +1,912 @@
+import { LoadingSkeleton } from '@/components/feature/LoadingSkeleton';
+import { DELIVERY_STATUS, PLAN_EDITABLE_STATUSES, isLearnerRow, combinedType, fillBlanks, mergeDirectoryRows, differs, rowTypes, matches, type DirectoryRow } from './page.helpers';
+import { WorkspaceMetricContent } from '@/components/ui/WorkspaceMetricContent';
+import { useId, useMemo, useRef, useState, useEffect, type ReactNode } from 'react';
+import { Building2, Columns2, ListFilter, MoreVertical, ShieldUser } from 'lucide-react';
+import { useLocation, useNavigate } from 'react-router-dom';
+import { EnrolmentWorkspaceShell as WorkspaceShell } from './presentation/EnrolmentWorkspaceShell';
+import { AppIcon } from '@/components/feature/AppIcon';
+import { SelectMenu } from '@/components/feature/SelectField';
+import { FloatingMenu } from '@/components/ui/FloatingMenu';
+import { EnrolmentHero as AdminPageHeader } from './presentation/EnrolmentPage';
+import design from './presentation/EnrolmentWorkspace.module.css';
+import { useAuth } from '@/hooks/useAuth';
+import { useListQueryState } from '@/hooks/useListQueryState';
+import { roleNavMap } from '@/mocks/navigation';
+import { fetchEnrolmentUsers, STATUS_OPTIONS, TYPE_OPTIONS, PROGRAMME_STATUS_OPTIONS } from '@/api/enrolmentUsers';
+import { fetchStaffUsers, type StaffUserRow } from '@/api/staffUsers';
+import { fetchProgrammes, fetchCohorts, fetchGroups } from '@/api/curriculum';
+import { listEmployers, type EmployerRow } from '@/api/employers';
+import { fetchAttendanceModes, type SavedAttendanceMode } from '@/api/attendanceLectures';
+import type { UserListRow, UsersFilter } from './types';
+import { Pagination, inputClass, btnPrimary, btnSecondary } from './components/ui';
+import { SendInvitationButton } from './components/SendInvitationButton';
+import { CopyInvitationLinkButton } from './components/CopyInvitationLinkButton';
+import { CreateUserModal } from './components/CreateUserModal';
+import { DownloadLearnerTemplateButton } from './components/DownloadLearnerTemplateButton';
+import { ExportDirectoryButton } from './components/ExportDirectoryButton';
+import { ImportLearnersModal } from './components/ImportLearnersModal';
+import { CreateStaffModal } from './components/CreateStaffModal';
+import { CreateEmployerModal } from './components/CreateEmployerModal';
+import { CreateOrganisationModal } from './components/CreateOrganisationModal';
+import { EditStaffModal } from './components/EditStaffModal';
+import { LearningPlanModal } from './components/LearningPlanModal';
+import { ShiftModuleModal } from './components/ShiftModuleModal';
+import { BulkAttendanceModeModal } from './components/BulkAttendanceModeModal';
+import { UserArchiveModal, type UserArchiveAction } from './components/UserArchiveModal';
+import archiveStyles from './components/UserArchive.module.css';
+import { TableBodySkeleton } from '@/components/feature/Skeletons';
+
+const enrolmentNav = roleNavMap.apprentice;
+const PAGE_SIZE = 8;
+// Shifting a learner between modules is for learners already being taught: they
+// have a plan and have started on it. Not Delivery — nothing has begun there, so
+// the plan itself is still the thing to edit — and not Withdrawn or Completed,
+// where there is no remaining delivery to move.
+const SHIFT_STATUSES: string[] = ['Active', 'On break'];
+type SummaryFilter = 'all' | 'learners' | 'admins' | 'employers' | 'active';
+
+function employerToRow(e: EmployerRow): DirectoryRow {
+  return {
+    id: e.id,
+    uuid: null,
+    name: e.name,
+    type: 'Employer',
+    email: e.email,
+    group: e.employerGroupNames.join(', '),
+    subscriptionStatus: '',
+    subscriptionVerified: false,
+    learningPlan: false,
+    programmeStatus: '',
+    source: 'employer',
+    // Kept whole so the edit modal can prefill without a refetch.
+    employer: e,
+  };
+}
+
+const EMPTY_FILTER: UsersFilter = {
+  userName: '', groups: [], email: '', statuses: [], type: 'all', programme: '', cohort: '',
+  programmeStatus: '', niNumber: '', caseOwner: 'any', referenceNumber: '', attendanceMode: '', page: 1, pageSize: PAGE_SIZE,
+};
+const DIRECTORY_QUERY_DEFAULTS = {
+  search: '', summary: 'all', view: 'users', page: 1, name: '', email: '', groups: '', statuses: '',
+  type: 'all', programme: '', cohort: '', programmeStatus: '', caseOwner: 'any', reference: '', attendanceMode: '',
+};
+const encodeFilterList = (values?: string[]) => (values || []).join('~');
+const decodeFilterList = (value: string) => value ? value.split('~').filter(Boolean) : [];
+const isArchived = (row: DirectoryRow) => isLearnerRow(row) && row.subscriptionStatus.trim().toLowerCase() === 'archived';
+
+function initials(name: string) {
+  return name.split(' ').filter(Boolean).map((w) => w[0]).slice(0, 2).join('').toUpperCase();
+}
+
+function MultiSelect({ label, placeholder, options, CHANGE_ME, onChange, disabled = false }: { label: string; placeholder: string; options: string[]; CHANGE_ME: string[]; onChange: (next: string[]) => void; disabled?: boolean }) {
+  const id = useId();
+  const toggle = (opt: string) => onChange(CHANGE_ME.includes(opt) ? CHANGE_ME.filter((s) => s !== opt) : [...CHANGE_ME, opt]);
+  return (
+    <div>
+      <label htmlFor={id} className="block text-[12px] font-semibold text-foreground-800 mb-1">{label}</label>
+      {/* Portalled so the filter card's rounded clipping never cuts the list off. */}
+      <FloatingMenu triggerId={id} disabled={disabled} align="start" matchWidth maxHeight={224} panelLabel={`${label} options`}
+        triggerClassName={`${inputClass} ${design.filterSelectTrigger} text-left flex items-center justify-between ${disabled ? 'cursor-not-allowed opacity-60' : 'cursor-pointer'}`}
+        panelClassName={`${design.shellFont} ${design.filterMultiMenu}`}
+        trigger={<>
+          <span className={CHANGE_ME.length ? 'text-foreground-900 truncate' : 'text-foreground-300'}>{CHANGE_ME.length ? CHANGE_ME.join(', ') : placeholder}</span>
+          <AppIcon className="ri-arrow-down-s-line text-foreground-400 shrink-0" />
+        </>}>
+        {options.length === 0 && <p className="px-3 py-1.5 text-[12px] text-foreground-300">No options</p>}
+        {options.map((opt) => (
+          <label key={opt} className="flex items-center gap-2 px-3 py-1.5 text-[12px] text-foreground-700 hover:bg-background-100 cursor-pointer">
+            <input type="checkbox" checked={CHANGE_ME.includes(opt)} onChange={() => toggle(opt)} className="accent-primary-500" />{opt}
+          </label>
+        ))}
+      </FloatingMenu>
+    </div>
+  );
+}
+
+function TextFilter({ label, value, onChange, placeholder }: { label: string; value: string; onChange: (v: string) => void; placeholder?: string }) {
+  return (
+    <div>
+      <label className="block text-[12px] font-semibold text-foreground-800 mb-1">{label}</label>
+      <input className={inputClass} placeholder={placeholder} value={value} onChange={(e) => onChange(e.target.value)} />
+    </div>
+  );
+}
+
+function SelectFilter({ label, value, options, onChange, disabled = false }: { label: string; value: string; options: { value: string; label: string }[]; onChange: (v: string) => void; disabled?: boolean }) {
+  const id = useId();
+  return (
+    <div>
+      <label htmlFor={id} className="block text-[12px] font-semibold text-foreground-800 mb-1">{label}</label>
+      <SelectMenu id={id} ariaLabel={label} value={value} options={options} onChange={onChange} disabled={disabled}
+        disabledHint={disabled ? options[0]?.label : undefined} size="sm" searchPlaceholder={`Search ${label.toLowerCase()}…`}
+        triggerClassName={design.filterSelectTrigger} menuClassName={`${design.shellFont} ${design.filterSelectMenu}`} />
+    </div>
+  );
+}
+
+function UserMetricCard({ icon, label, value, detail, onClick, active = false }: { icon: ReactNode; label: string; value: ReactNode; detail: string; onClick?: () => void; active?: boolean }) {
+  const surface = design.metricCard;
+  const content = <div className={design.metricBody}>
+    <span className={design.metricIcon} aria-hidden="true">{typeof icon === 'string' ? <AppIcon name={icon} size={18} /> : icon}</span>
+    <p className={design.metricLabel}>{label}</p>
+    <strong className={design.metricValue}>{value}</strong>
+    <p className={design.metricNote}>{detail}</p>
+  </div>;
+
+  return onClick ? <button type="button" onClick={onClick} aria-pressed={active} className={surface}>{content}</button> : <div className={surface}>{content}</div>;
+}
+
+function ActiveProgrammeCard({ active, total, onClick, CHANGE_ME = false }: { active: number; total: number; onClick?: () => void; CHANGE_ME?: boolean }) {
+  const percentage = total > 0 ? Math.round((active / total) * 100) : 0;
+
+  const content = (
+    <>
+      <div className="min-w-0">
+        <p className={design.metricLabel}>Active on programme</p>
+        <p className={`${design.metricValue} mt-2`}>{active}</p>
+        <p className={`${design.metricNote} mt-1`}>{percentage}% of learners</p>
+      </div>
+      <div className="flex shrink-0 items-center">
+        <div
+          className="flex h-14 w-14 items-center justify-center rounded-full"
+          style={{ background: `conic-gradient(var(--enrolment-primary, #5d2e88) ${percentage}%, var(--enrolment-ring-track, #ebeaf1) 0)` }}
+        >
+          <div className="flex h-10 w-10 items-center justify-center rounded-full bg-white text-[13px] font-semibold text-foreground-700">
+            {percentage}%
+          </div>
+        </div>
+      </div>
+    </>
+  );
+
+  const surface = `${design.metricCard} ${design.programmeMetric}`;
+  return onClick ? <button type="button" onClick={onClick} aria-pressed={CHANGE_ME} className={surface}>{content}</button> : <div className={surface}>{content}</div>;
+}
+
+/** Distinct non-empty values of one row column, sorted. */
+function distinct(from: DirectoryRow[], pick: (r: DirectoryRow) => string | undefined): string[] {
+  return Array.from(new Set(from.map(pick).filter(Boolean) as string[])).sort();
+}
+
+/** A learner with no saved attendance mode is on Live Sessions. */
+function rowAttendanceMode(modes: Record<string, SavedAttendanceMode>, row: Pick<DirectoryRow, 'id'>): 'live' | 'lazy' {
+  return modes[row.id]?.mode === 'lazy' ? 'lazy' : 'live';
+}
+
+export default function UsersListPage() {
+  const { isAdmin } = useAuth();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const { state: query, setValues: setQueryValues } = useListQueryState(DIRECTORY_QUERY_DEFAULTS);
+  const applied = useMemo<UsersFilter>(() => ({
+    ...EMPTY_FILTER,
+    userName: String(query.name), email: String(query.email),
+    groups: decodeFilterList(String(query.groups)), statuses: decodeFilterList(String(query.statuses)),
+    type: String(query.type) as UsersFilter['type'], programme: String(query.programme),
+    cohort: String(query.cohort), programmeStatus: String(query.programmeStatus),
+    caseOwner: String(query.caseOwner), referenceNumber: String(query.reference),
+    attendanceMode: String(query.attendanceMode) as UsersFilter['attendanceMode'],
+  }), [query.attendanceMode, query.caseOwner, query.cohort, query.email, query.groups, query.name, query.programme, query.programmeStatus, query.reference, query.statuses, query.type]);
+  const [draft, setDraft] = useState<UsersFilter>(applied);
+  const [filtersOpen, setFiltersOpen] = useState(false);
+  const quickSearch = String(query.search);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const page = Number(query.page);
+  const [createModalOpen, setCreateModalOpen] = useState(false);
+  const [importModalOpen, setImportModalOpen] = useState(false);
+  const [bulkOpen, setBulkOpen] = useState(false);
+  const [createAdminOpen, setCreateAdminOpen] = useState(false);
+  const [createTutorOpen, setCreateTutorOpen] = useState(false);
+  const [createEmployerOpen, setCreateEmployerOpen] = useState(false);
+  const [createOrgOpen, setCreateOrgOpen] = useState(false);
+
+  const [rows, setRows] = useState<DirectoryRow[]>([]);
+  const archiveView = query.view === 'archive';
+  const archivedCount = rows.filter(isArchived).length;
+  const directoryRows = useMemo(() => rows.filter(row => isArchived(row) === archiveView), [rows, archiveView]);
+  const [archiveAction, setArchiveAction] = useState<{ row: UserListRow; action: UserArchiveAction } | null>(null);
+  // Saved attendance modes keyed by learner id; a learner with no entry is on
+  // Live Sessions. null while loading; 'failed' shows a dash, not a guess.
+  const [attendanceModes, setAttendanceModes] = useState<Record<string, SavedAttendanceMode> | 'failed' | null>(null);
+  const summaryFilter = String(query.summary) as SummaryFilter;
+  // The curriculum lookups behind the programme -> cohort -> group filters. They
+  // come from curriculum.cohort_authoring_details, the same source the create
+  // form picks from, so a filter can only offer combinations that really exist.
+  const [programmes, setProgrammes] = useState<string[]>([]);
+  const [cohorts, setCohorts] = useState<string[]>([]);
+  const [cascadeGroups, setCascadeGroups] = useState<string[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  // The staff row currently being edited, if any.
+  const [editStaff, setEditStaff] = useState<StaffUserRow | null>(null);
+  // The learner whose details form is open. Staff and employers each have their
+  // own edit modal already; this is the learner's, and it is the same form that
+  // creates one.
+  const [editLearner, setEditLearner] = useState<UserListRow | null>(null);
+  // Likewise for employer contacts.
+  const [editEmployer, setEditEmployer] = useState<EmployerRow | null>(null);
+  // The learner whose learning plan is open, if any. Only offered once a learner
+  // reaches Delivery — before that their modules aren't settled.
+  const [planFor, setPlanFor] = useState<UserListRow | null>(null);
+  // The learner being shifted between modules, if any. Gated like editing the
+  // plan: it rewrites the plan, so it is a Delivery-stage action.
+  const [shiftFor, setShiftFor] = useState<UserListRow | null>(null);
+
+  // One directory for the whole enrolment section: every learner — both
+  // apprenticeship and commercial — comes from the single Enrolment_Users table
+  // in one call, each row carrying its own `learnerType`/`source`. Staff/admin
+  // accounts come from Staff_users, employer contacts from Employers.
+  //
+  // Only the learner call is allowed to fail the page: it's the bulk of the
+  // directory. The other two are swallowed so a missing table or a 502 on either
+  // one leaves the learners listed instead of blanking the whole screen.
+  // Without the skeleton the rows stay mounted, so a row's open panel (a
+  // just-issued set-password link) survives the reload.
+  const fetchRows = (showSkeleton: boolean) => {
+    if (showSkeleton) setLoading(true);
+    setError(null);
+    Promise.all([
+      fetchEnrolmentUsers(),
+      fetchStaffUsers().catch(() => [] as StaffUserRow[]),
+      listEmployers().then((r) => r.results).catch(() => [] as EmployerRow[]),
+    ])
+      .then(([learners, staff, employers]) => {
+        // Merged, not concatenated: somebody who is both staff and a learner
+        // has a record in two of these lists and would otherwise appear twice.
+        setRows(mergeDirectoryRows([
+          ...learners,
+          // Staff rows already arrive in UserListRow shape from to_staff_row.
+          ...staff.map((r) => ({ ...r, source: 'staff' as const })),
+          ...employers.map(employerToRow),
+        ]));
+      })
+      .catch((e: Error) => setError(e.message))
+      .finally(() => setLoading(false));
+  };
+  const load = () => fetchRows(true);
+  const refreshInPlace = () => fetchRows(false);
+
+  useEffect(load, []);
+
+  // Fetched beside the directory, not inside it: a failure only blanks this
+  // column. Reloaded after the bulk window so its changes show at once.
+  const loadAttendanceModes = () => {
+    fetchAttendanceModes()
+      .then((result) => setAttendanceModes(result.available ? result.modes : 'failed'))
+      .catch(() => setAttendanceModes('failed'));
+  };
+  useEffect(loadAttendanceModes, []);
+
+  useEffect(() => setDraft(applied), [applied]);
+
+  // A failed lookup isn't worth an error banner over the whole directory: the
+  // dropdown falls back to the programmes/cohorts the loaded rows already carry.
+  useEffect(() => {
+    let cancelled = false;
+    fetchProgrammes()
+      .then((rows) => { if (!cancelled) setProgrammes(rows); })
+      .catch(() => { if (!cancelled) setProgrammes([]); });
+    return () => { cancelled = true; };
+  }, []);
+
+  // Cohorts belong to a programme and groups to a cohort, so each level is
+  // refetched when its parent changes — and cleared first, so the list can never
+  // show a moment of the previous programme's cohorts.
+  useEffect(() => {
+    let cancelled = false;
+    setCohorts([]);
+    if (!draft.programme) return;
+    fetchCohorts(draft.programme)
+      .then((rows) => { if (!cancelled) setCohorts(rows); })
+      .catch(() => { if (!cancelled) setCohorts([]); });
+    return () => { cancelled = true; };
+  }, [draft.programme]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setCascadeGroups([]);
+    if (!draft.programme || !draft.cohort) return;
+    fetchGroups(draft.programme, draft.cohort)
+      .then((rows) => { if (!cancelled) setCascadeGroups(rows); })
+      .catch(() => { if (!cancelled) setCascadeGroups([]); });
+    return () => { cancelled = true; };
+  }, [draft.programme, draft.cohort]);
+
+  // The curriculum list is the source of truth, but rows created before a
+  // programme was renamed (or imported from elsewhere) can carry a name that
+  // isn't in it — union so those learners stay reachable from the filter.
+  const programmeOptions = useMemo(
+    () => Array.from(new Set([...programmes, ...distinct(rows, (r) => r.programme)])).sort(),
+    [programmes, rows],
+  );
+  // The case owners who actually own somebody, read off the loaded rows. This
+  // used to be a fixed list of four names in mocks/enrolment-console: two of
+  // them owned no learners at all, and every owner since was missing, so the
+  // filter could not reach most of the directory.
+  const caseOwnerOptions = useMemo(() => distinct(rows, (r) => r.caseOwner), [rows]);
+  const cohortOptions = useMemo(
+    () => Array.from(new Set([
+      ...cohorts,
+      ...distinct(draft.programme ? rows.filter((r) => !differs(r.programme, draft.programme!)) : [], (r) => r.cohort),
+    ])).sort(),
+    [cohorts, rows, draft.programme],
+  );
+  // Groups hang off a programme the same way cohorts do, so there is nothing to
+  // offer until one is chosen — and offering everything meant employers' company
+  // names (their stand-in for Group, see employerToRow) sat in the list beside
+  // real cohort groups. Below that the list narrows again: the curriculum's own
+  // groups once a cohort is picked, otherwise the groups of the rows still in
+  // scope for the programme.
+  const groupOptions = useMemo(() => {
+    if (!draft.programme) return [];
+    const inScope = rows.filter(
+      (r) => !differs(r.programme, draft.programme!)
+        && (!draft.cohort || !differs(r.cohort, draft.cohort)),
+    );
+    return Array.from(new Set([...cascadeGroups, ...distinct(inScope, (r) => r.group)])).sort();
+  }, [cascadeGroups, rows, draft.programme, draft.cohort]);
+  // Staff rows report their position (Curriculum team, Operations team, ...) as
+  // their type, so the filter list is derived from the loaded rows rather than
+  // the fixed TYPE_OPTIONS — otherwise staff would be unfilterable.
+  const typeOptions = useMemo(
+    // Each role offered separately, not the combined "Admin · User" string —
+    // that string is not a role anyone would filter by, and only one of the
+    // people it could match would ever need it.
+    () => Array.from(new Set([...TYPE_OPTIONS, ...rows.flatMap(rowTypes)])).sort(),
+    [rows],
+  );
+
+  const searchTerm = quickSearch.trim().toLowerCase();
+  const filtered = useMemo(() => directoryRows.filter((r) => {
+    if (searchTerm && ![r.name, r.email, r.group, r.programme]
+      .some((value) => (value ?? '').toLowerCase().includes(searchTerm))) return false;
+    if (!matches(r, applied)) return false;
+    // Kept out of matches(): the modes come from their own request. Until they
+    // load, or if they fail, no learner can be shown as matching either mode.
+    if (applied.attendanceMode && (!isLearnerRow(r) || attendanceModes === null || attendanceModes === 'failed'
+      || rowAttendanceMode(attendanceModes, r) !== applied.attendanceMode)) return false;
+    if (summaryFilter === 'learners') return isLearnerRow(r);
+    if (summaryFilter === 'admins') return r.source === 'staff';
+    if (summaryFilter === 'employers') return r.source === 'employer';
+    if (summaryFilter === 'active') return r.programmeStatus === 'Active';
+    return true;
+  }), [directoryRows, applied, summaryFilter, searchTerm, attendanceModes]);
+  // Creation checks every learner, while this table honours programme/status
+  // filters and the archive. Offer an CHANGE_ME route to an exact email match
+  // without silently discarding the user's filters or matching similar names.
+  const lookupEmail = (searchTerm || applied.email || '').trim().toLowerCase();
+  const hiddenEmailMatches = lookupEmail.includes('@') && filtered.length === 0
+    ? rows.filter(row => isLearnerRow(row) && row.email.trim().toLowerCase() === lookupEmail)
+    : [];
+  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  useEffect(() => {
+    if (!loading && !error && page > totalPages) setQueryValues({ page: totalPages });
+  }, [loading, error, page, totalPages, setQueryValues]);
+  const pageRows = filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+  const showingStart = filtered.length ? (page - 1) * PAGE_SIZE + 1 : 0;
+  const showingEnd = filtered.length ? Math.min(page * PAGE_SIZE, filtered.length) : 0;
+
+  // By source, like the two counts below it: a learner whose Type has been set
+  // to Referrer or Caseowner is still a learner, and dropping them out of this
+  // count made the three tiles stop adding up to the table.
+  const learners = directoryRows.filter(isLearnerRow).length;
+  // Counted by source, not "not a learner": employers are in the table too now,
+  // and lumping them under Admins would misreport both.
+  const admins = directoryRows.filter((r) => r.source === 'staff').length;
+  const employerCount = directoryRows.filter((r) => r.source === 'employer').length;
+  const active = directoryRows.filter((r) => r.programmeStatus === 'Active').length;
+
+  // Choosing a programme or cohort invalidates the levels below it, so a stale
+  // cohort/group can't survive into a search for a different programme.
+  const set = (patch: Partial<UsersFilter>) =>
+    setDraft((d) => ({
+      ...d,
+      ...('programme' in patch ? { cohort: '', groups: [] } : {}),
+      ...('cohort' in patch ? { groups: [] } : {}),
+      ...patch,
+    }));
+  const search = () => setQueryValues({
+    name: draft.userName || '', email: draft.email || '', groups: encodeFilterList(draft.groups),
+    statuses: encodeFilterList(draft.statuses), type: draft.type || 'all', programme: draft.programme || '',
+    cohort: draft.cohort || '', programmeStatus: draft.programmeStatus || '',
+    caseOwner: draft.caseOwner || 'any', reference: draft.referenceNumber || '',
+    attendanceMode: draft.attendanceMode || '',
+  }, { resetPage: true });
+  const updateQuickSearch = (value: string) => setQueryValues({ search: value }, { resetPage: true });
+  const reset = () => { setDraft(EMPTY_FILTER); setQueryValues({ ...DIRECTORY_QUERY_DEFAULTS, view: archiveView ? 'archive' : 'users' }); };
+  const selectSummary = (next: SummaryFilter) => setQueryValues({ summary: next }, { resetPage: true });
+  // Commercial and apprenticeship ids come from different tables and overlap,
+  // so every row action carries the row's source.
+  const q = (row: UserListRow) => (row.source === 'commercial' ? '?source=commercial' : '');
+  // Staff and employers live in their own tables and have no learner
+  // profile/wizard, so their rows aren't links — routing one to /users/<id>
+  // would read a learner record with a colliding id.
+  const isNonLearner = (row: UserListRow) => !isLearnerRow(row);
+
+  const openUser = (row: UserListRow) => {
+    if (isNonLearner(row)) return;
+    navigate(`/users/${row.id}${q(row)}`);
+  };
+
+  // Staff enter the same Dashboard that learners use as their home page.
+  const openLearnerPage = (row: UserListRow) => {
+    if (isNonLearner(row)) return;
+    const kind = row.source === 'commercial' ? 'commercial' : 'apprenticeship';
+    navigate(`/workspace/learner/${kind}/${row.id}`);
+  };
+
+  // Staff/admin rows have no profile page — editing their details in place is
+  // the only way to correct an email, phone or position after creation.
+  const openStaffEdit = (row: DirectoryRow) => setEditStaff(row as StaffUserRow);
+
+  // Patch the edited row in place rather than refetching the whole directory,
+  // so the table doesn't flash back to its loading state on every save.
+  const applyStaffUpdate = (updated: StaffUserRow) => {
+    setRows((prev) =>
+      prev.map((r) =>
+        r.source === 'staff' && r.id === updated.id ? { ...updated, source: 'staff' as const } : r,
+      ),
+    );
+  };
+
+  // Same in-place patch for a learner. `load()` follows behind, because the
+  // server derives things this row cannot: Subscription verified follows
+  // Status, and moving a learner's programme, cohort or group re-stamps their
+  // delivery window and can advance their programme status.
+  const applyLearnerUpdate = (updated: UserListRow) => {
+    setRows((prev) =>
+      prev.map((r) => (r.source === updated.source && r.id === updated.id ? { ...r, ...updated } : r)),
+    );
+    load();
+  };
+
+  const applyLearnerImport = (imported: UserListRow[]) => {
+    // Keep the saved rows in local state while refreshing server-derived fields.
+    setRows(previous => mergeDirectoryRows([...imported, ...previous]));
+    setQueryValues({ page: 1 });
+    load();
+  };
+
+  // Employers have no profile page either, so the row's Edit action is their
+  // only edit surface — same arrangement as staff.
+  const applyEmployerUpdate = (updated: EmployerRow) => {
+    setRows((prev) =>
+      prev.map((r) => (r.source === 'employer' && r.id === updated.id ? employerToRow(updated) : r)),
+    );
+  };
+
+  return (
+    <WorkspaceShell role="compliance" roleLabel={enrolmentNav.label} navItems={enrolmentNav.items} workspaceLabel={enrolmentNav.workspaceLabel} pageTitle="Users" pageSubtitle="Directory of learners, administrators and employers" hideBreadcrumbs showBackButton={false} directoryLayout>
+      <div className={`${design.page} ${design.users} admin-console-page enrolment-users-page min-w-0`}>
+        <AdminPageHeader
+          title="User Management"
+          breadcrumbLabel="Users"
+          description="Manage learners, administrators and employers across all programmes."
+          icon="ri-group-line"
+          eyebrow={isAdmin ? 'Administration' : 'Enrolment'}
+          metadata={<p className={design.directorySummary}><span>{rows.length} users</span>{typeOptions.length} user types · {programmeOptions.length} programmes · {caseOwnerOptions.length} case owners</p>}
+          actions={
+            <div className="flex flex-wrap items-start gap-2">
+              <button type="button" className={design.heroSecondary} onClick={() => setImportModalOpen(true)}>
+                <AppIcon className="ri-upload-2-line" />Upload learners
+              </button>
+            <div className="relative">
+              <FloatingMenu trigger={<><AppIcon className="ri-user-add-line" />Create user</>} triggerClassName={design.heroPrimary}
+                panelLabel="Create" panelClassName={`${design.shellFont} ${design.createMenu}`}>{close => {
+                  const pick = (open: (value: boolean) => void) => () => { close({ restoreFocus: false }); open(true); };
+                  return <>
+                    <button type="button" className="w-full cursor-pointer rounded-lg px-3 py-2 text-left text-[13px] text-foreground-700 hover:bg-background-100" onClick={pick(setCreateModalOpen)}><AppIcon className="ri-user-add-line mr-2 text-foreground-400" />Create user</button>
+                    <button type="button" className="w-full cursor-pointer rounded-lg px-3 py-2 text-left text-[13px] text-foreground-700 hover:bg-background-100" onClick={pick(setCreateAdminOpen)}><AppIcon className="ri-shield-user-line mr-2 text-foreground-400" />Create admin</button>
+                    <button type="button" className="w-full cursor-pointer rounded-lg px-3 py-2 text-left text-[13px] text-foreground-700 hover:bg-background-100" onClick={pick(setCreateTutorOpen)}><AppIcon className="ri-presentation-line mr-2 text-foreground-400" />Create tutor</button>
+                    <button type="button" className="w-full cursor-pointer rounded-lg px-3 py-2 text-left text-[13px] text-foreground-700 hover:bg-background-100" onClick={pick(setCreateEmployerOpen)}><AppIcon className="ri-briefcase-line mr-2 text-foreground-400" />Create employer profile</button>
+                    <button type="button" className="w-full cursor-pointer rounded-lg px-3 py-2 text-left text-[13px] text-foreground-700 hover:bg-background-100" onClick={pick(setCreateOrgOpen)}><AppIcon className="ri-building-line mr-2 text-foreground-400" />Create organisation profile</button>
+                  </>;
+                }}</FloatingMenu>
+            </div>
+            <div className={design.heroTools}>
+              <FloatingMenu label="Directory tools" trigger={<AppIcon name="ri-settings-3-line" aria-hidden="true" />} triggerClassName={design.heroToolsTrigger}
+                panelLabel="Directory tool actions" panelClassName={`${design.shellFont} ${design.heroToolsMenu}`}>{close => <>
+                <button type="button" className={btnSecondary} onClick={() => navigate('/users/wizard-builder')}><AppIcon name="ri-magic-line" />Edit apprenticeship wizard</button>
+                <button type="button" className={btnSecondary} onClick={() => navigate('/users/eligibility-builder')}><AppIcon name="ri-task-line" />Edit eligibility form</button>
+                <DownloadLearnerTemplateButton />
+                {/* The attendance mode endpoint rejects writes from other roles. */}
+                {isAdmin && <button type="button" className={btnSecondary} onClick={() => { close({ restoreFocus: false }); setBulkOpen(true); }} disabled={loading}><AppIcon name="ri-checkbox-multiple-line" />Bulk actions</button>}
+              </>}</FloatingMenu>
+            </div>
+            </div>
+          }
+        />
+
+        <div role="group" aria-label="Directory view" className={archiveStyles.views}>
+          <button type="button" aria-pressed={!archiveView}
+            onClick={() => setQueryValues({ ...DIRECTORY_QUERY_DEFAULTS, view: 'users' })}>
+            <AppIcon name="ri-group-line" aria-hidden="true" />Users ({rows.length - archivedCount})
+          </button>
+          <button type="button" aria-pressed={archiveView}
+            onClick={() => setQueryValues({ ...DIRECTORY_QUERY_DEFAULTS, view: 'archive' })}>
+            <AppIcon name="ri-archive-line" aria-hidden="true" />Archive ({archivedCount})
+          </button>
+        </div>
+
+        <div aria-label="User totals" className={design.metrics}>
+          <UserMetricCard icon="ri-group-line" label="Total users" value={directoryRows.length} detail={archiveView ? 'Archived learners' : 'Across all roles'} active={summaryFilter === 'all'} onClick={() => selectSummary('all')} />
+          <UserMetricCard icon="ri-graduation-cap-line" label="Learners" value={learners} detail={`${directoryRows.length ? Math.round((learners / directoryRows.length) * 100) : 0}% of total`} active={summaryFilter === 'learners'} onClick={() => selectSummary('learners')} />
+          <UserMetricCard icon={<ShieldUser size={18} />} label="Admins" value={admins} detail={`${directoryRows.length ? Math.round((admins / directoryRows.length) * 100) : 0}% of total`} active={summaryFilter === 'admins'} onClick={() => selectSummary('admins')} />
+          <UserMetricCard icon={<Building2 size={18} />} label="Employers" value={employerCount} detail={`${directoryRows.length ? Math.round((employerCount / directoryRows.length) * 100) : 0}% of total`} active={summaryFilter === 'employers'} onClick={() => selectSummary('employers')} />
+          <ActiveProgrammeCard active={active} total={directoryRows.length} CHANGE_ME={summaryFilter === 'active'} onClick={() => selectSummary('active')} />
+        </div>
+
+        {/* Filter card */}
+        <div className={design.filterPanel}>
+          <div className={design.filterBar}>
+            <button type="button" className={design.filterToggle} aria-expanded={filtersOpen} aria-controls="users-filter-fields" onClick={() => setFiltersOpen(value => !value)}><ListFilter size={16} aria-hidden="true" />Filters</button>
+            <p>Showing {filtered.length} of {directoryRows.length} users</p>
+          </div>
+          <div id="users-filter-fields" hidden={!filtersOpen} className="border-t border-foreground-100 p-4 md:p-5">
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+            <TextFilter label="Name" placeholder="Search by name..." value={draft.userName ?? ''} onChange={(v) => set({ userName: v })} />
+            {/* Programme -> cohort -> group, same gate as the Cohort filter: a
+                group only means something inside a programme. */}
+            <MultiSelect
+              label="Group"
+              placeholder={
+                !draft.programme
+                  ? 'Select a programme first'
+                  : draft.cohort
+                    ? 'Select groups in this cohort'
+                    : 'Select groups in this programme'
+              }
+              options={groupOptions}
+              CHANGE_ME={draft.groups ?? []}
+              onChange={(v) => set({ groups: v })}
+              disabled={!draft.programme}
+            />
+            <TextFilter label="Email" placeholder="Enter email" value={draft.email ?? ''} onChange={(v) => set({ email: v })} />
+            <MultiSelect label="Status" placeholder="Select statuses" options={STATUS_OPTIONS} CHANGE_ME={draft.statuses ?? []} onChange={(v) => set({ statuses: v })} />
+            <SelectFilter label="Type" value={draft.type ?? 'all'} onChange={(v) => set({ type: v as UsersFilter['type'] })} options={[{ value: 'all', label: 'All types' }, ...typeOptions.map((t) => ({ value: t, label: t }))]} />
+            <SelectFilter label="Programme" value={draft.programme ?? ''} onChange={(v) => set({ programme: v })} options={[{ value: '', label: 'All programmes' }, ...programmeOptions.map((p) => ({ value: p, label: p }))]} />
+            {/* Single-select on purpose: the group lookup takes one programme and
+                one cohort, so this is what narrows the Group list below. */}
+            <SelectFilter
+              label="Cohort"
+              value={draft.cohort ?? ''}
+              onChange={(v) => set({ cohort: v })}
+              disabled={!draft.programme}
+              options={draft.programme
+                ? [{ value: '', label: 'All cohorts' }, ...cohortOptions.map((c) => ({ value: c, label: c }))]
+                : [{ value: '', label: 'Select a programme first' }]}
+            />
+            <SelectFilter label="Programme status" value={draft.programmeStatus ?? ''} onChange={(v) => set({ programmeStatus: v })} options={[{ value: '', label: 'All programme statuses' }, ...PROGRAMME_STATUS_OPTIONS.map((s) => ({ value: s, label: s }))]} />
+            <TextFilter label="NI number" value={draft.niNumber ?? ''} onChange={(v) => set({ niNumber: v })} />
+            <SelectFilter label="Case owner" value={draft.caseOwner ?? 'any'} onChange={(v) => set({ caseOwner: v })} options={[{ value: 'any', label: 'All case owners' }, ...caseOwnerOptions.map((c) => ({ value: c, label: c }))]} />
+            <TextFilter label="Reference number" value={draft.referenceNumber ?? ''} onChange={(v) => set({ referenceNumber: v })} />
+            <SelectFilter label="Attendance mode" value={draft.attendanceMode ?? ''} onChange={(v) => set({ attendanceMode: v as UsersFilter['attendanceMode'] })} options={[{ value: '', label: 'All attendance modes' }, { value: 'live', label: 'Live Sessions' }, { value: 'lazy', label: 'Recorded' }]} />
+          </div>
+          <div className="mt-5 flex items-center justify-end gap-4 lg:col-span-4">
+            <button type="button" className="text-[12px] font-medium text-foreground-600 transition hover:text-primary-700" onClick={reset}>Clear all</button>
+            <button type="button" className={btnPrimary} onClick={search}><AppIcon className="ri-filter-3-line" />Apply filters</button>
+          </div>
+          </div>
+        </div>
+
+        {/* Results table */}
+        <div className={`${design.userTable} ${design.dataPanel} admin-cool-table`}>
+          <div className={`${design.directoryToolbar} flex flex-wrap items-center justify-between gap-3 px-4 py-3 md:px-5`}>
+            <div className="flex items-center gap-3">
+              <span className="flex h-9 w-9 items-center justify-center rounded-xl border border-primary-100 bg-primary-50 text-primary-600"><AppIcon name="ri-user-line" aria-hidden="true" /></span>
+              <div className="flex items-center gap-2">
+                <h2 className="text-[15px] font-semibold text-foreground-900">{archiveView ? 'Archive' : 'Users'} ({filtered.length})</h2>
+              </div>
+            </div>
+            <div role="search" aria-label="User directory" className="relative order-last w-full sm:order-none sm:ml-auto sm:w-[17rem]">
+              <label htmlFor="users-search" className="sr-only">Search users</label>
+              <AppIcon className="ri-search-line pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-foreground-400" />
+              <input
+                ref={searchInputRef}
+                id="users-search"
+                type="search"
+                value={quickSearch}
+                onChange={(event) => updateQuickSearch(event.target.value)}
+                placeholder="Search name, email, group or programme..."
+                aria-controls="users-directory-table"
+                className={`${inputClass} pl-9 pr-9 [&::-webkit-search-cancel-button]:appearance-none`}
+              />
+              {quickSearch && (
+                <button
+                  type="button"
+                  aria-label="Clear search"
+                  onClick={() => { updateQuickSearch(''); searchInputRef.current?.focus(); }}
+                  className="absolute right-1 top-1/2 flex h-8 w-8 -translate-y-1/2 items-center justify-center rounded-md text-foreground-400 hover:bg-background-100 hover:text-primary-600 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary-400"
+                >
+                  <AppIcon className="ri-close-line" />
+                </button>
+              )}
+            </div>
+            <div className="flex items-center gap-2">
+              <button type="button" className="hidden items-center gap-1.5 rounded-lg border border-foreground-100 px-3 py-2 text-[12px] font-medium text-foreground-600 transition hover:border-primary-200 hover:text-primary-700 sm:inline-flex"><Columns2 size={14} aria-hidden="true" />Columns</button>
+              <ExportDirectoryButton rows={filtered} attendanceModes={attendanceModes} disabled={loading || Boolean(error)} />
+            </div>
+          </div>
+          <div className="overflow-x-auto">
+            <table id="users-directory-table" role="table" className="w-full text-[13px]">
+              <thead role="rowgroup">
+                <tr role="row" className="border-b border-foreground-200/70 bg-background-100/50">
+                  {['User', 'Type', 'Email', 'Group', 'Programme', 'Cohort', 'Case owner', 'Subscription status', 'Learning plan', 'Programme status', 'Attendance mode', 'Actions'].map((h) => (
+                    <th key={h} className="text-left py-3 px-3 text-[11px] font-semibold text-foreground-500 uppercase tracking-wider whitespace-nowrap">{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody role="rowgroup">
+                {/* Skeleton rows, not a spinner in a merged cell: the table keeps
+                    its column widths and height, so the header stops jumping when
+                    the first page of users lands. */}
+                {loading && <TableBodySkeleton rows={6} columns={12} />}
+                {!loading && error && (
+                  <tr><td colSpan={12} className="py-10 text-center text-[13px]">
+                    <p className="text-red-600 mb-2"><AppIcon className="ri-error-warning-line mr-1.5" />{error}</p>
+                    <button className={btnSecondary} onClick={load}><AppIcon className="ri-refresh-line" />Retry</button>
+                  </td></tr>
+                )}
+                {!loading && !error && pageRows.map((row, i) => {
+                  const isLearner = isLearnerRow(row);
+                  const isStaff = row.source === 'staff';
+                  const isEmployer = row.source === 'employer';
+                  // Neither has a learner record, so their name never routes to
+                  // one. Staff open their edit modal in place; an employer opens
+                  // their own side page, which is where their learners and the
+                  // documents they must sign live.
+                  const openInPlace = isStaff
+                    ? () => openStaffEdit(row)
+                    : isEmployer
+                      ? () => navigate(`/employers/${row.id}`, { state: { employerReturnTo: `${location.pathname}${location.search}${location.hash}` } })
+                      : null;
+                  return (
+                  <tr role="row" key={`${row.source ?? 'apprenticeship'}-${row.id}`} className={`border-b border-foreground-100 hover:bg-primary-50/30 transition-smooth ${i % 2 === 1 ? 'bg-background-100/20' : ''}`}>
+                    <td role="cell" data-label="User" className="py-2.5 px-3">
+                      {openInPlace ? (
+                        <button onClick={openInPlace} className="flex items-center gap-2.5 cursor-pointer group text-left">
+                          <span className="w-8 h-8 rounded-lg flex items-center justify-center text-[11px] font-semibold shrink-0 bg-secondary-100 text-secondary-700">{initials(row.name)}</span>
+                          <span className={design.userIdentity}><span className={design.userName}>{row.name}</span><span className={design.userType}>{row.type}</span></span>
+                        </button>
+                      ) : (
+                        <button onClick={() => openUser(row)} className="flex items-center gap-2.5 cursor-pointer group text-left">
+                          <span className={`w-8 h-8 rounded-lg flex items-center justify-center text-[11px] font-semibold shrink-0 ${isLearner ? 'bg-primary-100 text-primary-700' : 'bg-secondary-100 text-secondary-700'}`}>{initials(row.name)}</span>
+                          <span className={design.userIdentity}><span className={design.userName}>{row.name}</span><span className={design.userType}>{row.type}</span></span>
+                        </button>
+                      )}
+                    </td>
+                    <td role="cell" data-label="Type" className="sr-only">
+                      <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full border ${isLearner ? 'bg-primary-50 text-primary-700 border-primary-200/50' : 'bg-secondary-50 text-secondary-700 border-secondary-200/50'}`}>{row.type}</span>
+                    </td>
+                    <td role="cell" data-label="Email" className="py-2.5 px-3 text-foreground-600 max-w-[220px] break-words"><span className={design.userEmail} title={row.email}>{row.email}</span>{row.reference && <span className={design.userReference}>{row.reference}</span>}</td>
+                    <td role="cell" data-label="Group" className="py-2.5 px-3 text-foreground-600">{row.group}</td>
+                    {/* Learners only: staff, admins and employers have no
+                        programme, so a dash is more honest than an empty cell. */}
+                    <td role="cell" data-label="Programme" className="py-2.5 px-3 text-foreground-600 max-w-[180px] break-words">
+                      {isLearner && row.programme
+                        ? row.programme
+                        : <span className="text-foreground-300">—</span>}
+                    </td>
+                    {/* Learners only, same as Programme: the cohort hangs off
+                        the programme, so a row without one has no cohort. */}
+                    <td role="cell" data-label="Cohort" className="py-2.5 px-3 text-foreground-600 whitespace-nowrap">
+                      {isLearner && row.cohort
+                        ? row.cohort
+                        : <span className="text-foreground-300">—</span>}
+                    </td>
+                    <td role="cell" data-label="Case owner" className="py-2.5 px-3 text-foreground-600">{isLearner ? row.caseOwner || '—' : '—'}</td>
+                    <td role="cell" data-label="Subscription status" className="py-2.5 px-3 whitespace-nowrap">
+                      <span className={design.subscription} data-verified={row.subscriptionVerified}>
+                        {row.subscriptionStatus && <span className={design.rowDot} role="img" aria-label={row.subscriptionVerified ? 'Verified' : 'Unverified'} />}
+                        {row.subscriptionStatus}
+                      </span>
+                    </td>
+                    <td role="cell" data-label="Learning plan" className="py-2.5 px-3 text-center">
+                      <FloatingMenu label={`More actions for ${row.name}`} panelLabel={`Actions for ${row.name}`}
+                        trigger={<MoreVertical size={16} aria-hidden="true" />} triggerClassName={design.rowMoreTrigger}
+                        panelClassName={`${design.shellFont} ${design.rowMoreMenu}`}>{close => <>
+                        <button type="button" className={btnSecondary} onClick={() => { close({ restoreFocus: false }); (openInPlace ?? (() => openUser(row)))(); }}><AppIcon name="ri-user-line" aria-hidden="true" />Open record</button>
+                        {isLearner && (archiveView ? <>
+                          <button type="button" className={btnSecondary} onClick={() => { close(); setArchiveAction({ row, action: 'restore' }); }}><AppIcon name="ri-arrow-go-back-line" aria-hidden="true" />Restore user</button>
+                          <button type="button" className={`${btnSecondary} text-red-600`} onClick={() => { close(); setArchiveAction({ row, action: 'delete' }); }}><AppIcon name="ri-delete-bin-line" aria-hidden="true" />Delete permanently</button>
+                        </> : <button type="button" className={btnSecondary} onClick={() => { close(); setArchiveAction({ row, action: 'archive' }); }}><AppIcon name="ri-archive-line" aria-hidden="true" />Move to archive</button>)}
+                        {isLearner && PLAN_EDITABLE_STATUSES.includes(row.programmeStatus || '') ? (
+                          <button
+                            onClick={() => { close({ restoreFocus: false }); setPlanFor(row); }}
+                            title={`${row.hasLearningPlan ? 'Edit' : 'Add'} ${row.name}'s learning plan`}
+                            className="inline-flex max-w-full items-center gap-1 rounded-lg border border-foreground-200 px-2 py-1 text-[11px] font-medium text-foreground-600 transition-smooth hover:border-primary-300 hover:bg-primary-50/60 hover:text-primary-700 cursor-pointer whitespace-nowrap"
+                          >
+                            <AppIcon className={`ri-${row.hasLearningPlan ? 'edit' : 'add'}-line shrink-0 text-[12px]`} />
+                            <span className="truncate">{row.hasLearningPlan ? 'Edit learning plan' : 'Add learning plan'}</span>
+                          </button>
+                        ) : isLearner && row.learningPlan ? (
+                          // Past planning — the plan is fixed, so this opens the
+                          // same modal read-only rather than routing to the
+                          // learner's record, which is not their plan.
+                          <button
+                            onClick={() => { close({ restoreFocus: false }); setPlanFor(row); }}
+                            title={`View ${row.name}'s learning plan`}
+                            className="text-primary-600 hover:underline cursor-pointer"
+                          >
+                            Learning plan
+                          </button>
+                        ) : null}
+                        {/* Which modules a learner takes is settled in the plan;
+                            moving them off one part-way through delivery is a
+                            separate job, so it is a separate action — and only
+                            once they are being taught. */}
+                        {isLearner && row.hasLearningPlan
+                          && SHIFT_STATUSES.includes(row.programmeStatus || '') && (
+                          <button
+                            onClick={() => { close({ restoreFocus: false }); setShiftFor(row); }}
+                            title={`Shift ${row.name} from one module to another`}
+                            className="inline-flex items-center gap-1.5 rounded-lg border border-foreground-200 px-2.5 py-1 text-[12px] font-medium text-foreground-600 transition-smooth hover:border-primary-300 hover:bg-primary-50/60 hover:text-primary-700 cursor-pointer whitespace-nowrap"
+                          >
+                            <AppIcon className="ri-arrow-left-right-line" />
+                            Shift module
+                          </button>
+                        )}
+                        {/* Creating somebody no longer emails them, so the
+                            invitation is sent from here (or from Accounts once
+                            they have an account row). Hidden once they have
+                            signed in — at that point a password reset is the
+                            applicable action, not an invitation. */}
+                        {!archiveView && !row.hasSignedIn && (
+                          <SendInvitationButton
+                            subjectType={isStaff ? 'staff' : isEmployer ? 'employer' : 'learner'}
+                            subjectId={Number(row.id)}
+                            name={row.name}
+                            email={row.email}
+                            onSent={load}
+                          />
+                        )}
+                        {/* For learners whose employer blocks our email: staff
+                            send the same single-use link another way. */}
+                        {!archiveView && !row.hasSignedIn && isLearner && (
+                          <CopyInvitationLinkButton subjectId={Number(row.id)} name={row.name} onIssued={refreshInPlace} />
+                        )}
+                      </>}</FloatingMenu>
+                    </td>
+                    <td role="cell" data-label="Programme status" className="py-2.5 px-3">{isLearner && row.programmeStatus ? <span className={design.programmeStatus} data-status={row.programmeStatus} title={`Programme status: ${row.programmeStatus}`}><span className={design.rowDot} aria-hidden="true" /><span>{row.programmeStatus}</span></span> : null}</td>
+                    <td role="cell" data-label="Attendance mode" className="py-2.5 px-3 whitespace-nowrap">
+                      {!isLearner || attendanceModes === 'failed'
+                        ? <span className="text-foreground-300">—</span>
+                        : attendanceModes === null
+                          ? <span className="text-foreground-300">…</span>
+                          : rowAttendanceMode(attendanceModes, row) === 'lazy'
+                            ? <span className={design.attendance} data-mode="recorded"><span className={design.rowDot} aria-hidden="true" />Recorded</span>
+                            : <span className={design.attendance} data-mode="live"><span className={design.rowDot} aria-hidden="true" />Live Sessions</span>}
+                    </td>
+                    <td role="cell" data-label="Actions" className="py-2.5 px-3 text-center">
+                      {openInPlace ? (
+                        <span className="flex items-center justify-center gap-2">
+                          <button
+                            onClick={openInPlace}
+                            title={isEmployer ? `Open ${row.name}'s employer page` : `Edit ${row.name}'s details`}
+                            className={`${isEmployer ? design.viewAction : ''} inline-flex items-center gap-1.5 rounded-lg border border-foreground-200 px-2.5 py-1 text-[12px] font-medium text-foreground-600 transition-smooth hover:border-primary-300 hover:bg-primary-50/60 hover:text-primary-700 cursor-pointer whitespace-nowrap`}
+                          >
+                            {isEmployer
+                              ? 'View'
+                              : <><AppIcon name="ri-pencil-line" aria-hidden="true" /><span className="sr-only">Edit</span></>}
+                          </button>
+                          {/* An employer's own details are still editable — the
+                              primary action is now their page, so this is a
+                              secondary link rather than the main button. */}
+                          {isEmployer && row.employer && (
+                            <button
+                              onClick={() => setEditEmployer(row.employer!)}
+                              title={`Edit ${row.name}'s details`}
+                              className="text-[12px] text-foreground-400 hover:text-primary-600 hover:underline cursor-pointer whitespace-nowrap"
+                            >
+                              <AppIcon name="ri-pencil-line" aria-hidden="true" /><span className="sr-only">Edit</span>
+                            </button>
+                          )}
+                        </span>
+                      ) : isLearner ? (
+                        <span className="flex items-center justify-center gap-2">
+                          <button
+                            onClick={() => openLearnerPage(row)}
+                            title={`Open ${row.name}'s learner page`}
+                            className={`${design.viewAction} inline-flex items-center gap-1.5 rounded-lg border border-foreground-200 px-2.5 py-1 text-[12px] font-medium text-foreground-600 transition-smooth hover:border-primary-300 hover:bg-primary-50/60 hover:text-primary-700 cursor-pointer whitespace-nowrap`}
+                          >
+                            View
+                          </button>
+                          {/* The columns of this table — group, programme and
+                              both statuses — are fields on the learner record,
+                              so they are corrected in the record's own form
+                              rather than in the cells. Secondary to View, which
+                              is where the learner's work lives. */}
+                          <button
+                            onClick={() => setEditLearner(row)}
+                            title={`Edit ${row.name}'s details, placement and status`}
+                            className="text-[12px] text-foreground-400 hover:text-primary-600 hover:underline cursor-pointer whitespace-nowrap"
+                          >
+                            <AppIcon name="ri-pencil-line" aria-hidden="true" /><span className="sr-only">Edit</span>
+                          </button>
+                        </span>
+                      ) : null}
+                    </td>
+                  </tr>
+                  );
+                })}
+                {!loading && !error && pageRows.length === 0 && <tr><td colSpan={12} className="py-10 text-center text-[13px] text-foreground-400">{archiveView && archivedCount === 0 ? 'No archived users.' : rows.length === 0 ? 'No users yet. Use “Create” to add the first learner.' : applied.attendanceMode && attendanceModes === 'failed' ? 'Attendance modes could not be loaded, so the attendance mode filter cannot be applied.' : applied.attendanceMode && attendanceModes === null ? <LoadingSkeleton label="Loading attendance modes…" variant="text" /> : 'No users match your filters.'}
+                  {hiddenEmailMatches.map(row => (
+                    <div key={`${row.source}:${row.id}`} className="mx-auto mt-3 max-w-lg rounded-xl border border-primary-200 bg-primary-50 px-4 py-3 text-foreground-700">
+                      <p>{row.name || 'This learner'} already exists{isArchived(row) ? ' in the archive' : ' outside the current filters'}.
+                        {' '}{row.programme ? `Programme: ${row.programme}.` : 'No programme is assigned.'}</p>
+                      <button type="button" className="mt-2 font-semibold text-primary-700 underline" onClick={() => setQueryValues({
+                        ...DIRECTORY_QUERY_DEFAULTS, view: isArchived(row) ? 'archive' : 'users', search: row.email.trim(),
+                      })}>Show existing learner</button>
+                    </div>
+                  ))}
+                </td></tr>}
+              </tbody>
+            </table>
+          </div>
+          <div className="flex flex-col items-center justify-between gap-3 border-t border-foreground-100 px-5 py-2.5 sm:flex-row">
+            <p className="text-[11px] text-foreground-500">Showing {showingStart} to {showingEnd} of {filtered.length} users</p>
+            <Pagination page={page} totalPages={totalPages} onChange={nextPage => setQueryValues({ page: nextPage }, { replace: false })} />
+            <label className="hidden items-center gap-2 text-[11px] text-foreground-500 sm:flex">
+              Rows per page
+              <select className="rounded-lg border border-foreground-200 bg-background-50 px-2 py-1 text-[11px] text-foreground-700" value={PAGE_SIZE} aria-label="Rows per page" onChange={() => undefined}>
+                <option value={PAGE_SIZE}>{PAGE_SIZE}</option>
+              </select>
+            </label>
+          </div>
+        </div>
+      </div>
+
+      {createModalOpen && <CreateUserModal onClose={() => setCreateModalOpen(false)} onCreated={load} />}
+      {importModalOpen && <ImportLearnersModal onClose={() => setImportModalOpen(false)} onImported={applyLearnerImport} />}
+      {bulkOpen && <BulkAttendanceModeModal rows={rows.filter(row => !isArchived(row))} onClose={() => { setBulkOpen(false); loadAttendanceModes(); }} />}
+      {archiveAction && <UserArchiveModal row={archiveAction.row} action={archiveAction.action} onClose={() => setArchiveAction(null)} onSaved={load} />}
+      {createAdminOpen && <CreateStaffModal variant="admin" onClose={() => setCreateAdminOpen(false)} onCreated={load} />}
+      {createTutorOpen && <CreateStaffModal variant="tutor" onClose={() => setCreateTutorOpen(false)} onCreated={load} />}
+      {editStaff && <EditStaffModal row={editStaff} onClose={() => setEditStaff(null)} onSaved={applyStaffUpdate} />}
+      {/* The create form again, in edit mode — one form per record, so the
+          fields cannot drift apart between adding a learner and correcting one. */}
+      {editLearner && (
+        <CreateUserModal
+          editing={editLearner}
+          onClose={() => setEditLearner(null)}
+          onCreated={load}
+          onSaved={applyLearnerUpdate}
+        />
+      )}
+      {shiftFor && (
+        <ShiftModuleModal
+          learnerId={shiftFor.id}
+          learnerName={shiftFor.name}
+          onClose={() => setShiftFor(null)}
+          onSaved={load}
+        />
+      )}
+      {planFor && (
+        <LearningPlanModal
+          learnerId={planFor.id}
+          learnerName={planFor.name}
+          readOnly={!PLAN_EDITABLE_STATUSES.includes(planFor.programmeStatus || '')}
+          // An active learner already has progress against these modules, so
+          // the modal warns before a removal orphans it.
+          hasStarted={planFor.programmeStatus !== DELIVERY_STATUS}
+          onClose={() => setPlanFor(null)}
+          onSaved={load}
+        />
+      )}
+      {/* Organisations are companies rather than people, so they don't belong in
+          a directory of users — creating one just confirms and closes. Employers
+          are people and do get listed. */}
+      {createEmployerOpen && <CreateEmployerModal onClose={() => setCreateEmployerOpen(false)} onCreated={load} />}
+      {createOrgOpen && <CreateOrganisationModal onClose={() => setCreateOrgOpen(false)} onCreated={() => {}} />}
+      {editEmployer && (
+        <CreateEmployerModal
+          row={editEmployer}
+          onClose={() => setEditEmployer(null)}
+          onCreated={applyEmployerUpdate}
+        />
+      )}
+    </WorkspaceShell>
+  );
+}

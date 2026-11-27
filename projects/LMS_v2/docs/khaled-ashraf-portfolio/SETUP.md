@@ -1,0 +1,43 @@
+# Setup
+
+Start from the sanitized original README when available. The entries below are extracted from this specific source snapshot.
+
+## Environment
+
+Supply your own development or sandbox service configuration. Environment templates contain placeholder values. Runtime credentials and production data are excluded.
+
+No tracked environment template was detected. Identify configuration variables in the source before running.
+
+## JavaScript / TypeScript
+
+### `frontend`
+
+Package manager metadata: `not specified`.
+
+| Existing script | Command in manifest |
+| --- | --- |
+| `npm run build` | `vite build` |
+| `npm run dev` | `vite` |
+| `npm run lint` | `eslint src --ext ts,tsx --report-unused-disable-directives --max-warnings 0` |
+| `npm run test` | `vitest run` |
+
+### `mobile`
+
+Package manager metadata: `not specified`.
+
+| Existing script | Command in manifest |
+| --- | --- |
+| `npm run start` | `expo start --max-workers 2` |
+| `npm run typecheck` | `tsc --noEmit` |
+| `npm run test` | `node --test tests/*.test.mjs` |
+
+
+## Python requirement files
+
+- `backend/mobile_integration_tests/requirements.txt`
+- `backend/requirements-local-ai.txt`
+- `backend/requirements.txt`
+
+## External integrations
+
+Consult the source configuration for databases, identity providers, email, storage, payments, and other APIs. Select local or sandbox targets before running startup hooks, migrations, seeds, or integration tests. No external-service credentials are provided in this copy.

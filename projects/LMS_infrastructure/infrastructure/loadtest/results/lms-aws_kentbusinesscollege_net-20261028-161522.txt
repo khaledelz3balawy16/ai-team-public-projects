@@ -1,0 +1,1 @@
+time="2026-10-28T16:15:23+03:00" level=info msg="signed in as role=admin subject=staff; 1 API paths per iteration" source=console

@@ -1,0 +1,265 @@
+import hashlib
+import json
+import logging
+import secrets
+import urllib.error
+import urllib.request
+
+from django.conf import settings
+from django.contrib.auth import authenticate, get_user_model
+from django.db.models import Count, Q, Sum
+from django.db.models.functions import Coalesce
+from django.shortcuts import get_object_or_404
+from rest_framework import status
+from rest_framework.authtoken.models import Token
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.permissions import AllowAny
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from .models import DoctorSession
+from .pagination import LecturePagination
+from .serializers import LectureDetailSerializer, LectureListSerializer, attach_ready_clip_assets
+from .services import (
+    clip_category,
+    filtered_lectures,
+    v5_lectures,
+    with_clip_production_status,
+    with_positive_clips_length,
+    with_slim_positive_clips,
+)
+from .utils import decode_session_id, normalize_clips, timestamp_to_seconds, timestamped_sharepoint_url
+
+WATCH_PREROLL_SECONDS = 60
+logger = logging.getLogger(__name__)
+
+
+def environment_dashboard_user(username, password):
+    configured_username = settings.DASHBOARD_USERNAME
+    configured_password = settings.DASHBOARD_PASSWORD
+    if not configured_username or not configured_password:
+        return None
+    if not (
+        secrets.compare_digest(str(username), configured_username)
+        and secrets.compare_digest(str(password), configured_password)
+    ):
+        return None
+
+    dashboard_email = (
+        f"dashboard-{hashlib.sha256(configured_username.encode()).hexdigest()[:24]}"
+        "@local.invalid"
+    )
+    user, created = get_user_model().objects.get_or_create(
+        username=configured_username,
+        defaults={
+            "email": dashboard_email,
+            "is_active": True,
+            "is_staff": False,
+        },
+    )
+    if created:
+        user.set_unusable_password()
+        user.save(update_fields=["password"])
+    return user if user.is_active else None
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def login_view(request):
+    username = request.data.get("username", "")
+    password = request.data.get("password", "")
+    user = environment_dashboard_user(username, password)
+    if user is None:
+        user = authenticate(request, username=username, password=password)
+    if user is None or not user.is_active:
+        return Response(
+            {"code": "invalid_credentials", "detail": "Invalid username or password."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    token, _ = Token.objects.get_or_create(user=user)
+    return Response({
+        "token": token.key,
+        "user": {"username": user.get_username(), "is_staff": user.is_staff},
+    })
+
+
+@api_view(["POST"])
+def logout_view(request):
+    if request.auth:
+        request.auth.delete()
+    return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+@api_view(["GET"])
+def me_view(request):
+    return Response({
+        "username": request.user.get_username(),
+        "is_staff": request.user.is_staff,
+    })
+
+
+class SummaryView(APIView):
+    def get(self, request):
+        # With a category chosen, "positive moments" counts that category only.
+        queryset = with_positive_clips_length(filtered_lectures(request.query_params),
+                                              clip_category(request.query_params))
+        available = queryset.exclude(recording_url__isnull=True).exclude(recording_url="").count()
+        totals = queryset.aggregate(
+            processed=Count("session_id"),
+            with_clips=Count("session_id", filter=Q(positive_clips_length__gt=0)),
+            total_clips=Coalesce(Sum("positive_clips_length"), 0),
+            # Clip PRODUCTION, which is a different question from clip
+            # DETECTION: a lecture can hold five positive moments and no cut
+            # media at all. The Positive Moments page must be able to say so
+            # rather than implying the clips exist.
+            with_ready_clips=Count("session_id", filter=Q(has_ready_clips=True)),
+            ready_clips=Coalesce(Sum("ready_clips_count"), 0),
+        )
+        processed = totals["processed"]
+        with_clips = totals["with_clips"]
+        return Response({
+            "processed_lectures": processed,
+            "lectures_with_positive_clips": with_clips,
+            "lectures_without_positive_clips": processed - with_clips,
+            "total_positive_clips": totals["total_clips"],
+            "recordings_available": available,
+            "recordings_missing": processed - available,
+            "lectures_with_ready_clips": totals["with_ready_clips"],
+            "ready_clips": totals["ready_clips"],
+        })
+
+
+class LectureListView(APIView):
+    def get(self, request):
+        queryset = with_slim_positive_clips(filtered_lectures(request.query_params))
+        paginator = LecturePagination()
+        page = paginator.paginate_queryset(queryset, request)
+        data = LectureListSerializer(page, many=True).data
+        return paginator.get_paginated_response(data)
+
+
+def lecture_from_key(session_key):
+    try:
+        session_id = decode_session_id(session_key)
+    except ValueError:
+        return None
+    return get_object_or_404(
+        with_clip_production_status(v5_lectures()),
+        session_id=session_id,
+    )
+
+
+class LectureDetailView(APIView):
+    def get(self, request, session_key):
+        lecture = lecture_from_key(session_key)
+        if lecture is None:
+            return Response(
+                {"code": "invalid_session_id", "detail": "The lecture identifier is invalid."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        return Response(LectureDetailSerializer(lecture).data)
+
+
+class WatchMomentView(APIView):
+    def get(self, request, session_key, clip_index):
+        lecture = lecture_from_key(session_key)
+        if lecture is None:
+            return Response(
+                {"code": "invalid_session_id", "detail": "The lecture identifier is invalid."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        if not lecture.recording_url:
+            return Response({
+                "code": "recording_not_available",
+                "detail": "The recording link has not been stored yet.",
+            }, status=status.HTTP_409_CONFLICT)
+        clips = normalize_clips(lecture.positive_clips)
+        if clip_index < 0 or clip_index >= len(clips):
+            return Response({
+                "code": "invalid_clip_index",
+                "detail": "The requested positive moment does not exist.",
+            }, status=status.HTTP_404_NOT_FOUND)
+        seconds = timestamp_to_seconds(clips[clip_index].get("start"))
+        if seconds is None:
+            return Response({
+                "code": "invalid_clip_timestamp",
+                "detail": "This positive moment does not have a valid start timestamp.",
+            }, status=status.HTTP_422_UNPROCESSABLE_CONTENT)
+        playback_seconds = max(0, seconds - WATCH_PREROLL_SECONDS)
+        return Response({
+            "url": timestamped_sharepoint_url(lecture.recording_url, playback_seconds)
+        })
+
+
+def _cue(value):
+    """A cue number from the request: an int (or a whole float), never a bool."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value
+
+
+class ClipRequestView(APIView):
+    """
+    Ask the n8n "clip on demand" flow to cut ONE positive moment.
+
+    The moment is identified by session_id + start_cue + end_cue, and the
+    pair must belong to this lecture: the values sent to n8n are the stored
+    ones, not whatever the browser posted. n8n answers as soon as it has
+    accepted the job, so a success here means "requested", not "ready"; the
+    finished clip appears in qa_positive_clip_assets and on the page.
+    """
+
+    def post(self, request, session_key):
+        lecture = lecture_from_key(session_key)
+        if lecture is None:
+            return Response({"code": "invalid_session_id",
+                             "detail": "The lecture identifier is invalid."},
+                            status=status.HTTP_404_NOT_FOUND)
+        start_cue, end_cue = _cue(request.data.get("start_cue")), _cue(request.data.get("end_cue"))
+        if start_cue is None or end_cue is None:
+            return Response({"code": "invalid_cues",
+                             "detail": "start_cue and end_cue must be numbers."},
+                            status=status.HTTP_400_BAD_REQUEST)
+        clips = attach_ready_clip_assets(lecture.session_id, normalize_clips(lecture.positive_clips))
+        matches = [clip for clip in clips
+                   if _cue(clip.get("start_cue")) == start_cue and _cue(clip.get("end_cue")) == end_cue]
+        if len(matches) != 1:
+            return Response({"code": "clip_not_found",
+                             "detail": "This positive moment is not part of the lecture."},
+                            status=status.HTTP_404_NOT_FOUND)
+        (clip,) = matches
+        if clip["clip_asset"]:
+            return Response({"code": "clip_already_produced",
+                             "detail": "This clip has already been produced.",
+                             "clip_asset": clip["clip_asset"]},
+                            status=status.HTTP_409_CONFLICT)
+        payload = {"session_id": lecture.session_id,
+                   "start_cue": clip["start_cue"], "end_cue": clip["end_cue"]}
+        try:
+            send_clip_request(payload)
+        except ClipRequestFailed:
+            return Response({"code": "clip_request_failed",
+                             "detail": "The clip service did not accept the request. Try again."},
+                            status=status.HTTP_502_BAD_GATEWAY)
+        return Response({"status": "requested"}, status=status.HTTP_202_ACCEPTED)
+
+
+class ClipRequestFailed(Exception):
+    pass
+
+
+def send_clip_request(payload):
+    """POST the identity to n8n. Its reply body is not needed and not logged."""
+    req = urllib.request.Request(
+        settings.CLIP_ON_DEMAND_WEBHOOK_URL, data=json.dumps(payload).encode(), method="POST",
+        headers={"Content-Type": "application/json", "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as response:
+            if not 200 <= response.status < 300:
+                raise ClipRequestFailed(response.status)
+    except urllib.error.HTTPError as exc:
+        logger.warning("clip on demand refused: HTTP %s", exc.code)
+        raise ClipRequestFailed(exc.code) from None
+    except (urllib.error.URLError, OSError) as exc:
+        logger.warning("clip on demand unreachable: %s", type(exc).__name__)
+        raise ClipRequestFailed(type(exc).__name__) from None

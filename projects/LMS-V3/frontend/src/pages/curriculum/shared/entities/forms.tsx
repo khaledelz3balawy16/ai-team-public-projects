@@ -1,0 +1,1229 @@
+// ============================================================================
+// The create/edit forms for Programmes, Cohorts and Groups.
+//
+// Both the global page (Curriculum -> Cohorts) and the contextual workspace
+// (Programme -> its Cohorts, Cohort -> its Groups) open the *same* component, so
+// there is one form, one validation rule set and one save path per entity. Each
+// one writes through the canonical endpoint in `lib/curriculumApi`; none of the
+// date, holiday or parent-link rules are reimplemented here.
+// ============================================================================
+
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { clockLabel, normalizedClock } from '../../teams-meetings/calendarTime';
+import { useNavigate } from 'react-router-dom';
+import { showCurriculumAlert } from '@/components/feature/CurriculumSweetAlert';
+import {
+  createCurriculumCohort,
+  createCurriculumGroup,
+  createCurriculumProgramme,
+  previewCohortEndDate,
+  updateCurriculumCohort,
+  updateCurriculumGroup,
+  updateCurriculumProgramme,
+  type CurriculumCohort,
+  type CurriculumCohortEndDatePreview,
+  type CurriculumGroup,
+  type CurriculumHoliday,
+  type CurriculumProgramme,
+  type StaleTeamsCalendar,
+  guardedInput,
+} from '@/lib/curriculumApi';
+import { cleanText, cohortWeekCapacity, cohortsForProgramme, formatDateLabel, normaliseKey, programmeIdentity, programmeSelectValue, sameFormValues, sameIdentifier, weekendDateNotice } from './model';
+import {
+  CoEditNotice,
+  ColorControl,
+  EntityDrawer,
+  FormField,
+  SelectControl,
+  TextAreaControl,
+  TextControl,
+  WeekdayControl,
+  type FormChainStep,
+} from './ui';
+import { confirmTeamsCalendarUpdate } from './teamsCalendarNotice';
+import { useFormFieldMerge, useFormSeedGuard, useRecordGuard, useRecordRebaseRetry } from './useDrawerState';
+import { AppIcon } from '@/components/feature/AppIcon';
+import { DatePickerField } from '@/components/feature/DatePickerField';
+
+// The names these fields go by on screen. A notice that says "you both changed
+// the programmeId" is our vocabulary, not the reader's.
+const COHORT_FIELD_LABELS: Record<string, string> = {
+  name: 'cohort name',
+  programmeId: 'programme',
+  startDate: 'start date',
+  durationMonths: 'duration',
+  practicalEndDate: 'practical end date',
+  epaMonths: 'EPA months',
+  apprenticeshipEndOverride: 'apprenticeship end date',
+  color: 'colour',
+  excludedHolidayIds: 'holiday selection',
+};
+
+const PROGRAMME_FIELD_LABELS: Record<string, string> = {
+  name: 'programme name',
+  level: 'level',
+  description: 'description',
+  color: 'colour',
+};
+
+const GROUP_FIELD_LABELS: Record<string, string> = {
+  name: 'group name',
+  programmeId: 'programme',
+  cohortId: 'cohort',
+  coach: 'coach',
+  capacity: 'capacity',
+  color: 'colour',
+  startDate: 'start date',
+  endDate: 'end date',
+};
+
+// --------------------------------------------------------------- programme
+
+/**
+ * Programme-level information only. A programme is independently saveable — it
+ * does not require a cohort, group or module to exist. Its cohorts, groups and
+ * modules are added afterwards, each from the one form that record type has.
+ */
+export function ProgrammeFormDrawer({
+  open,
+  programme,
+  chain,
+  onClose,
+  onSaved,
+}: {
+  open: boolean;
+  programme?: CurriculumProgramme | null;
+  /** Set when the structure wizard is driving this form as one step of a chain. */
+  chain?: FormChainStep;
+  onClose: () => void;
+  /**
+   * Handed the programme a create just made, so the caller can carry straight on
+   * to the KSB source it still needs. Absent on an edit.
+   */
+  onSaved: (result?: { programme: CurriculumProgramme }) => unknown | Promise<unknown>;
+}) {
+  const [name, setName] = useState('');
+  const [level, setLevel] = useState('');
+  const [description, setDescription] = useState('');
+  const [color, setColor] = useState('#6941c6');
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // What the drawer opened with. Comparing the live values against it tells an
+  // untouched form from one holding answers that a save has not taken yet.
+  const baseline = useRef<Record<string, unknown>>({});
+
+  const liveValues = { name, level, description, color };
+  const dirty = !sameFormValues(liveValues, baseline.current);
+  const liveRef = useRef<Record<string, unknown>>(liveValues);
+  liveRef.current = liveValues;
+  const coEdit = useFormFieldMerge(baseline, liveRef, PROGRAMME_FIELD_LABELS);
+  // The server refuses a save built on a version somebody else has already
+  // replaced, and hands the stored programme back for the merge below.
+  const guard = useRecordGuard<CurriculumProgramme>(
+    'programme',
+    // Undefined while the drawer is creating one: there is no stored record to
+    // be stale against, so there is no token to read and nothing to guard.
+    programme ? programmeIdentity(programme) : undefined,
+    open,
+  );
+  // `programme` gets a new identity on every background refresh of the list
+  // behind this drawer, and this effect depends on it. Without the guard the
+  // refresh re-seeded the fields from the stored record and threw away whatever
+  // was half-typed -- the drawer "resetting itself" mid-edit, with no write
+  // from anyone involved.
+  const allowSeed = useFormSeedGuard(dirty);
+
+  useEffect(() => {
+    const verdict = allowSeed(open, cleanText(programme?.id) || cleanText(programme?.sourceId) || 'new-programme');
+    if (!verdict) return;
+    // A refused save hands back the stored programme; folding that in is the
+    // same operation as folding in one a background refresh brought.
+    const record = guard.stored || programme;
+    const initial = {
+      name: cleanText(record?.name),
+      level: cleanText(record?.level).replace(/\D/g, ''),
+      description: cleanText(record?.description),
+      color: record?.color || '#6941c6',
+    };
+    if (verdict === 'seed') {
+      baseline.current = initial;
+      setError(null);
+      setSaving(false);
+    }
+    setName(coEdit.take(verdict, 'name', initial.name));
+    setLevel(coEdit.take(verdict, 'level', initial.level));
+    setDescription(coEdit.take(verdict, 'description', initial.description));
+    setColor(coEdit.take(verdict, 'color', initial.color));
+    coEdit.publish();
+  }, [allowSeed, coEdit, guard.stored, open, programme]);
+
+  const submit = async () => {
+    if (!name.trim()) { setError('Give the programme a name.'); return; }
+    setSaving(true);
+    setError(null);
+    try {
+      // standard/owner/status/requiredOtjh are deliberately not sent: the input
+      // type is a Partial and the backend leaves an omitted key untouched, so
+      // dropping the fields from the form cannot clear a stored value.
+      const payload = {
+        name: name.trim(),
+        level: level.trim() ? `LVL-${level.trim()}` : '',
+        description: description.trim(),
+        color,
+      };
+      let created: CurriculumProgramme | null = null;
+      if (programme) {
+        const outcome = await guard.save(
+          expectedRevision => updateCurriculumProgramme(programmeIdentity(programme), guardedInput(payload, expectedRevision)),
+        );
+        // Somebody saved first. Their programme is merging into this form now,
+        // and the retry sends the result; nothing has been written yet.
+        if (!outcome.saved) return;
+      } else created = (await createCurriculumProgramme(payload)).programme || null;
+      // In a chain the record is handed straight back: the wizard moves to the
+      // next step and says what was created once, at the end of the run.
+      if (chain?.chained) {
+        await onSaved(created ? { programme: created } : undefined);
+        return;
+      }
+      onClose();
+      const refreshed = Promise.resolve(onSaved(created ? { programme: created } : undefined))
+        .catch(() => undefined);
+      await showCurriculumAlert({
+        title: programme ? 'Programme updated' : 'Programme created',
+        // A cohort used to be named as the next step, which is the wrong one:
+        // nothing beneath a programme can be mapped or measured until it has a
+        // KSB source, so that is what the reader is sent to do. Left unsaid, the
+        // programme sits there looking finished and the omission only surfaces
+        // later, on the KSB mapping page, as an empty screen.
+        text: programme
+          ? `${payload.name} is saved.`
+          : `${payload.name} is saved. It has no KSB source yet — modules under it have nothing to map against and its coverage cannot be measured until one is applied.`,
+        timer: programme ? 2200 : undefined,
+      });
+      await refreshed;
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'The programme could not be saved.');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // See the cohort drawer: the retry has to send what the merge produced, which
+  // only exists after the render the merge caused.
+  const submitRef = useRef(submit);
+  submitRef.current = submit;
+  useRecordRebaseRetry(guard.rebase, submitRef);
+
+  return (
+    <EntityDrawer
+      open={open}
+      title={programme ? 'Edit programme' : 'Add programme'}
+      subtitle={chain
+        ? 'Programme-level details only. The cohort, group and module that go under it are the steps after this one.'
+        : 'Programme-level details only. Cohorts, groups and modules are added later, from their own pages.'}
+      banner={chain?.banner}
+      onClose={onClose}
+      onSubmit={submit}
+      closeConfirm={chain?.closeConfirm}
+      submitLabel={chain?.submitLabel || (programme ? 'Save programme' : 'Create programme')}
+      cancelLabel={chain?.cancelLabel}
+      extraAction={chain?.extraAction}
+      backAction={chain?.backAction}
+      width={chain?.width}
+      saving={saving}
+      error={error}
+      dirty={dirty}
+    >
+      <CoEditNotice notices={coEdit.notices} onDismiss={coEdit.dismiss} />
+      <FormField label="Programme name" required>
+        <TextControl value={name} onChange={setName} placeholder="e.g. Data Analyst" />
+      </FormField>
+      <FormField label="Level" hint={level ? `Will show as Level ${level}` : 'Numbers only, e.g. 4'}>
+        <TextControl value={level} onChange={value => setLevel(value.replace(/\D/g, ''))} placeholder="e.g. 4" inputMode="numeric" />
+      </FormField>
+      <FormField label="Description">
+        <TextAreaControl value={description} onChange={setDescription} placeholder="What this programme covers" />
+      </FormField>
+      <FormField label="Colour">
+        <ColorControl value={color} onChange={setColor} />
+      </FormField>
+    </EntityDrawer>
+  );
+}
+
+// ------------------------------------------------------------------ cohort
+
+export interface CohortFormDefaults {
+  programmeId?: string;
+}
+
+export function CohortFormDrawer({
+  open,
+  cohort,
+  defaults,
+  programmes,
+  holidays,
+  chain,
+  onClose,
+  onSaved,
+}: {
+  open: boolean;
+  /** Present when editing; absent when creating. */
+  cohort?: CurriculumCohort | null;
+  defaults?: CohortFormDefaults;
+  programmes: CurriculumProgramme[];
+  holidays: CurriculumHoliday[];
+  /** Set when the structure wizard is driving this form as one step of a chain. */
+  chain?: FormChainStep;
+  onClose: () => void;
+  /**
+   * Handed the record the save wrote, so the list can paint it before the
+   * background refresh gets back — see `EntityTable`'s highlightKey.
+   */
+  onSaved: (result?: { cohort: CurriculumCohort }) => unknown | Promise<unknown>;
+}) {
+  const [name, setName] = useState('');
+  const [programmeId, setProgrammeId] = useState('');
+  const [startDate, setStartDate] = useState('');
+  const [durationMonths, setDurationMonths] = useState('12');
+  const [practicalEndDate, setPracticalEndDate] = useState('');
+  // True once the practical end date has been typed or picked by hand. It goes
+  // back to false the moment the start date or duration changes, so the field
+  // follows the calculation again unless the user nudges it a second time.
+  const [practicalEndIsManual, setPracticalEndIsManual] = useState(false);
+  const [epaMonths, setEpaMonths] = useState('');
+  const [apprenticeshipEndOverride, setApprenticeshipEndOverride] = useState('');
+  const [color, setColor] = useState('#6d28d9');
+  // The holidays a human has unticked, from the period's own list below. Every
+  // holiday is selected until someone turns one off, matching the "every
+  // England bank holiday in this period applies" rule this replaces.
+  const [excludedHolidayIds, setExcludedHolidayIds] = useState<string[]>([]);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [preview, setPreview] = useState<CurriculumCohortEndDatePreview | null>(null);
+  // What the drawer opened with, for the unsaved-changes check further down.
+  const baseline = useRef<Record<string, unknown>>({});
+
+  // Only an authored practical end date counts as an edit: in automatic mode the
+  // field mirrors whatever the backend preview returns, which is not something
+  // the user typed and must not make an untouched drawer ask before it closes.
+  const authoredPracticalEnd = practicalEndIsManual ? practicalEndDate : '';
+  const liveValues = {
+    name,
+    programmeId,
+    startDate,
+    durationMonths,
+    practicalEndDate: authoredPracticalEnd,
+    epaMonths,
+    apprenticeshipEndOverride,
+    color,
+    excludedHolidayIds: [...excludedHolidayIds].sort(),
+  };
+  const dirty = !sameFormValues(liveValues, baseline.current);
+  // Read by the merge below at the moment a colleague's save arrives, rather
+  // than put in the seeding effect's dependencies where it would re-run the
+  // whole thing on every keystroke.
+  const liveRef = useRef<Record<string, unknown>>(liveValues);
+  liveRef.current = liveValues;
+  const coEdit = useFormFieldMerge(baseline, liveRef, COHORT_FIELD_LABELS);
+  // The server refuses a save built on a version somebody else has already
+  // replaced, and hands the stored cohort back for the merge below to fold
+  // this reader's outstanding changes into. Polling still decides how soon a
+  // colleague's change appears; it no longer decides whether it survives.
+  const guard = useRecordGuard<CurriculumCohort>('cohort', cohort?.id, open);
+  // `programmes` is in the seeding effect's dependencies and gets a new identity
+  // on every background refresh; without this the list landing mid-edit reset the
+  // form. See useFormSeedGuard.
+  const allowSeed = useFormSeedGuard(dirty);
+
+  useEffect(() => {
+    const verdict = allowSeed(open, cleanText(cohort?.id) || 'new-cohort');
+    if (!verdict) return;
+    // On a merge the drawer is already open on this cohort with edits in it, so
+    // the two refusals below would be answering a question nobody asked.
+    if (verdict === 'seed') {
+      setError(null);
+      setSaving(false);
+    }
+    // A refused save hands back the stored cohort. Folding that in is the same
+    // operation as folding in one a poll brought, so it goes through the same
+    // merge rather than a second path that could disagree with it.
+    const record = guard.stored || cohort;
+    if (record) {
+      // A stored cohort already carries a practical end date, and it may have
+      // been authored rather than calculated. Treat it as manual so reopening
+      // the drawer cannot quietly move it back onto the duration rule.
+      const storedPracticalEnd = record.practicalEndDate || record.endDate || '';
+      const initial = {
+        name: record.name || '',
+        programmeId: programmeSelectValue(programmes, cleanText(record.programmeId) || cleanText(record.programme)),
+        startDate: record.startDate || '',
+        durationMonths: record.durationMonths == null ? '' : String(record.durationMonths),
+        practicalEndDate: storedPracticalEnd,
+        epaMonths: record.epaMonths == null ? '' : String(record.epaMonths),
+        apprenticeshipEndOverride: record.apprenticeshipEndOverride || '',
+        color: record.color || '#6d28d9',
+        excludedHolidayIds: [...new Set((record.excludedHolidayIds || []).map(normaliseKey).filter(Boolean))].sort(),
+      };
+      if (verdict === 'seed') baseline.current = initial;
+      // `take` decides each field: the stored value when this reader has not
+      // touched it, theirs when they have, and theirs plus a sentence when both
+      // of them changed it. On a plain seed every one of these is the stored
+      // value, which is what it always was.
+      const mergedPracticalEnd = coEdit.take(verdict, 'practicalEndDate', initial.practicalEndDate);
+      setName(coEdit.take(verdict, 'name', initial.name));
+      setProgrammeId(coEdit.take(verdict, 'programmeId', initial.programmeId));
+      setStartDate(coEdit.take(verdict, 'startDate', initial.startDate));
+      setDurationMonths(coEdit.take(verdict, 'durationMonths', initial.durationMonths));
+      setPracticalEndDate(mergedPracticalEnd);
+      setPracticalEndIsManual(Boolean(mergedPracticalEnd));
+      setEpaMonths(coEdit.take(verdict, 'epaMonths', initial.epaMonths));
+      setApprenticeshipEndOverride(coEdit.take(verdict, 'apprenticeshipEndOverride', initial.apprenticeshipEndOverride));
+      setColor(coEdit.take(verdict, 'color', initial.color));
+      setExcludedHolidayIds(coEdit.take(verdict, 'excludedHolidayIds', initial.excludedHolidayIds));
+      coEdit.publish();
+      return;
+    }
+    const initial = {
+      name: '',
+      programmeId: programmeSelectValue(programmes, defaults?.programmeId)
+        || (programmes.length === 1 ? programmeIdentity(programmes[0]) : ''),
+      startDate: '',
+      durationMonths: '12',
+      practicalEndDate: '',
+      epaMonths: '',
+      apprenticeshipEndOverride: '',
+      color: '#6d28d9',
+      excludedHolidayIds: [] as string[],
+    };
+    baseline.current = initial;
+    setName(initial.name);
+    setProgrammeId(initial.programmeId);
+    setStartDate(initial.startDate);
+    setDurationMonths(initial.durationMonths);
+    setPracticalEndDate(initial.practicalEndDate);
+    setPracticalEndIsManual(false);
+    setEpaMonths(initial.epaMonths);
+    setApprenticeshipEndOverride(initial.apprenticeshipEndOverride);
+    setColor(initial.color);
+    setExcludedHolidayIds(initial.excludedHolidayIds);
+  }, [allowSeed, coEdit, cohort, defaults?.programmeId, guard.stored, open, programmes]);
+
+  // `authoredPracticalEnd` above is also what the preview is given: in automatic
+  // mode the backend works the practical end out from the start date and
+  // duration, and the field below mirrors whatever comes back.
+
+  // The practical end / EPA / apprenticeship end dates come from the backend's
+  // own calculation, so the preview cannot drift from what a save will store.
+  useEffect(() => {
+    if (!open || !startDate || (!durationMonths && !authoredPracticalEnd)) { setPreview(null); return undefined; }
+    let active = true;
+    const timer = setTimeout(() => {
+      previewCohortEndDate({
+        startDate,
+        durationMonths: Number(durationMonths) || 0,
+        practicalEndDate: authoredPracticalEnd || null,
+        epaMonths: epaMonths === '' ? null : Number(epaMonths),
+        apprenticeshipEndOverride: apprenticeshipEndOverride || null,
+      })
+        .then(result => {
+          if (!active) return;
+          setPreview(result);
+          if (!authoredPracticalEnd) {
+            setPracticalEndDate(result.calculatedEndDate || result.practicalEndDate || result.endDate || '');
+          }
+        })
+        .catch(() => { if (active) setPreview(null); });
+    }, 250);
+    return () => { active = false; clearTimeout(timer); };
+  }, [apprenticeshipEndOverride, authoredPracticalEnd, durationMonths, epaMonths, open, startDate]);
+
+  // Both end dates are shown as the real date the cohort carries, not as blank
+  // "override" boxes: the delivery team reads them off the screen, and moving
+  // one a day either way is a normal edit rather than an exception.
+  const calculatedPracticalEnd = preview?.calculatedEndDate || '';
+  const apprenticeshipEndDate = apprenticeshipEndOverride || preview?.apprenticeshipEndDate || '';
+  const showPracticalEndReset = practicalEndIsManual && Boolean(calculatedPracticalEnd) && calculatedPracticalEnd !== practicalEndDate;
+
+  // Not a refusal -- a weekend start is still saved -- just the same heads-up the
+  // module drawer gives: Saturday and Sunday are holidays in England, so a cohort
+  // starting on one has no delivery on its own first day. Ticked holidays are not
+  // checked here on purpose: they move module sessions, never the cohort's dates.
+  const startDateNotice = useMemo(() => weekendDateNotice(startDate), [startDate]);
+
+  // Changing what feeds the calculation hands the practical end date back to it.
+  const changeStartDate = (value: string) => { setStartDate(value); setPracticalEndIsManual(false); };
+  const changeDurationMonths = (value: string) => { setDurationMonths(value); setPracticalEndIsManual(false); };
+  const changePracticalEndDate = (value: string) => {
+    setPracticalEndDate(value);
+    setPracticalEndIsManual(Boolean(value));
+  };
+  const resetPracticalEndDate = () => {
+    setPracticalEndIsManual(false);
+    setPracticalEndDate(calculatedPracticalEnd);
+  };
+
+  // The cohort period the holidays below are measured against: start date ->
+  // the practical end from the contracted duration. Holidays are read off that
+  // fixed window, then used later by module session planning when a generated
+  // session clashes with one of them.
+  const periodStart = startDate;
+  const periodEnd = preview?.baseEndDate || practicalEndDate || preview?.practicalEndDate || preview?.endDate || cohort?.practicalEndDate || cohort?.endDate || '';
+  const periodLabel = periodStart && periodEnd ? `${formatDateLabel(periodStart)} – ${formatDateLabel(periodEnd)}` : '';
+
+  // Every bank holiday inside the period is offered as a checkbox, ticked by
+  // default. The same inclusive overlap the backend applies in
+  // `holidays_within_period`, so this is exactly the candidate list the drawer
+  // and the save agree on.
+  const periodHolidays = useMemo(() => {
+    if (!periodStart || !periodEnd) return [] as CurriculumHoliday[];
+    return holidays
+      .filter(holiday => {
+        const holidayStart = cleanText(holiday.startDate);
+        const holidayEnd = cleanText(holiday.endDate) || holidayStart;
+        return Boolean(holidayStart) && holidayStart <= periodEnd && holidayEnd >= periodStart;
+      })
+      .sort((left, right) => cleanText(left.startDate).localeCompare(cleanText(right.startDate)));
+  }, [holidays, periodEnd, periodStart]);
+
+  const excludedHolidaySet = useMemo(
+    () => new Set(excludedHolidayIds.map(normaliseKey)),
+    [excludedHolidayIds],
+  );
+  // The holidays that actually apply -- what module session planning skips,
+  // and what "Weeks in this cohort" below measures. Unticking one does not
+  // move the cohort's own contract dates; it only stops that day from
+  // clashing with a module's delivery.
+  const selectedPeriodHolidays = useMemo(
+    () => periodHolidays.filter(holiday => !excludedHolidaySet.has(normaliseKey(holiday.id))),
+    [excludedHolidaySet, periodHolidays],
+  );
+
+  // Sent with the save and stored on the cohort: the ticked ids, alongside
+  // excludedHolidayIds for the ones turned off.
+  const holidayIds = useMemo(() => selectedPeriodHolidays.map(holiday => String(holiday.id)), [selectedPeriodHolidays]);
+
+  const toggleHoliday = (holidayId: string | number) => {
+    const key = normaliseKey(holidayId);
+    setExcludedHolidayIds(current => (
+      current.some(id => normaliseKey(id) === key)
+        ? current.filter(id => normaliseKey(id) !== key)
+        : [...current, key]
+    ));
+  };
+  const selectAllHolidays = () => setExcludedHolidayIds([]);
+  const clearAllHolidays = () => setExcludedHolidayIds(periodHolidays.map(holiday => normaliseKey(holiday.id)));
+
+  const programmeOptions = useMemo(
+    () => programmes.map(programme => ({ value: programmeIdentity(programme), label: programme.name })),
+    [programmes],
+  );
+
+  // The floor and the ceiling on how many weeks this cohort has to deliver in.
+  // The period itself never moves, so the two numbers bracket the same window:
+  // every week of it, and the weeks left once each week holding a *selected*
+  // bank holiday is taken out -- an unticked one costs nothing here either.
+  const weekCapacity = useMemo(
+    () => cohortWeekCapacity(periodStart, periodEnd, selectedPeriodHolidays),
+    [periodEnd, selectedPeriodHolidays, periodStart],
+  );
+
+  const submit = async () => {
+    if (!name.trim()) { setError('Give the cohort a name.'); return; }
+    if (!programmeId) { setError('Choose the programme this cohort belongs to.'); return; }
+    if (!startDate) { setError('Set the cohort start date.'); return; }
+
+    const programme = programmes.find(item => sameIdentifier(programmeIdentity(item), programmeId))
+      || programmes.find(item => sameIdentifier(item.name, programmeId));
+    setSaving(true);
+    setError(null);
+    try {
+      const payload = {
+        name: name.trim(),
+        programme: programme?.name || programmeId,
+        programmeId: programme ? programmeIdentity(programme) : programmeId,
+        startDate,
+        // Only an authored practical end date is sent. In automatic mode the
+        // backend derives it from the start date and duration, which cannot go
+        // stale behind the debounced preview the way this field can.
+        endDate: authoredPracticalEnd || undefined,
+        durationMonths: Number(durationMonths) || undefined,
+        epaMonths: epaMonths === '' ? null : Number(epaMonths),
+        apprenticeshipEndOverride: apprenticeshipEndOverride || null,
+        color,
+        holidayIds,
+        excludedHolidayIds,
+      };
+      // What the list should show straight away. A create gets the stored row
+      // back from the endpoint; an edit merges the payload over the record the
+      // drawer opened on, with the dates the preview has already worked out.
+      let saved: CurriculumCohort | null = null;
+      if (cohort) {
+        const outcome = await guard.save(
+          expectedRevision => updateCurriculumCohort(cohort.id, guardedInput(payload, expectedRevision)),
+        );
+        // Somebody saved first. Their cohort is now merging into this form, and
+        // the retry below sends the result; nothing has been written yet.
+        if (!outcome.saved) return;
+        saved = {
+          ...cohort,
+          name: payload.name,
+          programme: payload.programme,
+          programmeId: payload.programmeId,
+          startDate,
+          durationMonths: payload.durationMonths ?? cohort.durationMonths,
+          endDate: practicalEndDate || cohort.endDate,
+          practicalEndDate: practicalEndDate || cohort.practicalEndDate,
+          epaMonths: payload.epaMonths,
+          apprenticeshipEndDate: apprenticeshipEndDate || cohort.apprenticeshipEndDate,
+          apprenticeshipEndOverride: apprenticeshipEndOverride || '',
+          color,
+          holidayIds,
+          excludedHolidayIds,
+        };
+      } else {
+        saved = (await createCurriculumCohort(payload)).cohort || null;
+      }
+      // See the programme form: in a chain the wizard owns closing and confirming.
+      if (chain?.chained) {
+        await onSaved(saved ? { cohort: saved } : undefined);
+        return;
+      }
+      onClose();
+      // The refresh runs behind the confirmation rather than in front of it: it
+      // takes seconds, and holding the message back until it returned is what
+      // made a finished save look like nothing had happened.
+      const refreshed = Promise.resolve(onSaved(saved ? { cohort: saved } : undefined))
+        .catch(() => undefined);
+      await showCurriculumAlert({
+        title: cohort ? 'Cohort updated' : 'Cohort created',
+        text: `${payload.name} is saved against ${payload.programme}.`,
+        timer: 1800,
+      });
+      await refreshed;
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'The cohort could not be saved.');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // The retry has to send what the merge produced, and that only exists after
+  // the render the merge caused -- so the rebase calls whichever `submit` the
+  // current render built, never the one that was refused.
+  const submitRef = useRef(submit);
+  submitRef.current = submit;
+  useRecordRebaseRetry(guard.rebase, submitRef);
+
+  return (
+    <EntityDrawer
+      open={open}
+      title={cohort ? 'Edit cohort' : 'Add cohort'}
+      subtitle="A cohort belongs to one programme. Its practical end, EPA window and apprenticeship end date use the same rules as the rest of the LMS."
+      banner={chain?.banner}
+      onClose={onClose}
+      onSubmit={submit}
+      closeConfirm={chain?.closeConfirm}
+      submitLabel={chain?.submitLabel || (cohort ? 'Save cohort' : 'Create cohort')}
+      cancelLabel={chain?.cancelLabel}
+      extraAction={chain?.extraAction}
+      backAction={chain?.backAction}
+      width={chain?.width}
+      saving={saving}
+      error={error}
+      dirty={dirty}
+    >
+      <CoEditNotice notices={coEdit.notices} onDismiss={coEdit.dismiss} />
+      <FormField label="Programme" required>
+        <SelectControl value={programmeId} onChange={setProgrammeId} options={programmeOptions} placeholder="Select a programme" />
+      </FormField>
+      <FormField label="Cohort name" required>
+        <TextControl value={name} onChange={setName} placeholder="e.g. September 2026" />
+      </FormField>
+      <div className="grid gap-4 sm:grid-cols-2">
+        <DatePickerField
+          label="Start date"
+          required
+          value={startDate}
+          onChange={changeStartDate}
+          warning={startDateNotice || undefined}
+        />
+        <FormField label="Duration (months)">
+          <TextControl type="number" min={1} max={72} value={durationMonths} onChange={changeDurationMonths} />
+        </FormField>
+        <div>
+          <DatePickerField
+            label="Practical end date"
+            value={practicalEndDate}
+            onChange={changePracticalEndDate}
+            min={startDate || undefined}
+            helper={showPracticalEndReset
+              ? 'Set by hand. Clear the field to go back to the calculated date.'
+              : 'The start date plus the contracted duration, less a day. Selected holidays do not move this cohort date.'}
+          />
+          {showPracticalEndReset && (
+            <button
+              type="button"
+              onClick={resetPracticalEndDate}
+              className="mt-1 text-[11px] font-bold text-primary-700 transition-smooth hover:text-primary-800 hover:underline"
+            >
+              Reset to {formatDateLabel(calculatedPracticalEnd)}
+            </button>
+          )}
+        </div>
+        <FormField label="EPA period (months)" hint="Blank means none recorded, which is not the same as zero.">
+          <TextControl type="number" min={0} max={24} value={epaMonths} onChange={setEpaMonths} />
+        </FormField>
+        <div>
+          <DatePickerField
+            label="Apprenticeship end date"
+            value={apprenticeshipEndDate}
+            onChange={setApprenticeshipEndOverride}
+            min={practicalEndDate || startDate || undefined}
+            helper={apprenticeshipEndOverride
+              ? 'Set by hand. Clear the field to go back to the calculated date.'
+              : apprenticeshipEndDate
+                ? 'The practical end date plus the EPA period. Pick another date to override it.'
+                : 'Set an EPA period, or pick the date this apprenticeship ends.'}
+          />
+          {apprenticeshipEndOverride && preview?.apprenticeshipEndDate && preview.apprenticeshipEndDate !== apprenticeshipEndOverride && (
+            <button
+              type="button"
+              onClick={() => setApprenticeshipEndOverride('')}
+              className="mt-1 text-[11px] font-bold text-primary-700 transition-smooth hover:text-primary-800 hover:underline"
+            >
+              Reset to {formatDateLabel(preview.apprenticeshipEndDate)}
+            </button>
+          )}
+        </div>
+      </div>
+
+      <div className="rounded-xl border border-primary-100 bg-primary-50/60 p-3.5">
+        <p className="text-[10px] font-bold uppercase tracking-wider text-primary-700">Contract dates</p>
+        {startDate && (practicalEndDate || apprenticeshipEndDate) ? (
+          <div className="mt-2 space-y-1.5 text-[12px] text-foreground-700">
+            <p><span className="font-bold">Practical:</span> {formatDateLabel(startDate)} – {formatDateLabel(practicalEndDate)}</p>
+            <p><span className="font-bold">Apprenticeship:</span> {formatDateLabel(startDate)} – {formatDateLabel(apprenticeshipEndDate)}</p>
+            {weekCapacity.totalWeeks > 0 && (
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="text-[11px] font-bold">Weeks:</span>
+                <span className="inline-flex items-center gap-1 rounded-full border border-primary-200 bg-primary-100 px-2 py-0.5 text-[11px] font-bold text-primary-800">
+                  {weekCapacity.totalWeeks} min
+                </span>
+                {weekCapacity.holidayWeeks > 0 && (
+                  <>
+                    <span className="inline-flex items-center gap-1 rounded-full border border-amber-200 bg-amber-100 px-2 py-0.5 text-[11px] font-bold text-amber-800">
+                      +{weekCapacity.holidayDays} {weekCapacity.holidayDays === 1 ? 'day' : 'days'} holiday (~{weekCapacity.holidayWeeks} {weekCapacity.holidayWeeks === 1 ? 'week' : 'weeks'})
+                    </span>
+                    <span className="inline-flex items-center gap-1 rounded-full border border-foreground-200 bg-white px-2 py-0.5 text-[11px] font-bold text-foreground-800">
+                      ~{weekCapacity.maxWeeks} max
+                    </span>
+                  </>
+                )}
+                {!weekCapacity.holidayWeeks && (
+                  <span className="text-[11px] text-foreground-500">no holidays in this period</span>
+                )}
+              </div>
+            )}
+            {holidayIds.length > 0 && (
+              <p className="text-[11px] text-foreground-500">
+                These holidays are saved for module scheduling. If a module session clashes with one, that module plan is extended; these cohort contract dates stay fixed.
+              </p>
+            )}
+            {(preview?.warnings || []).map(warning => (
+              <p key={warning} className="text-[11px] font-semibold text-amber-700">{warning}</p>
+            ))}
+          </div>
+        ) : (
+          <p className="mt-2 text-[12px] text-foreground-500">Set a start date and duration to see the cohort's dates.</p>
+        )}
+      </div>
+
+      <FormField label="Colour">
+        <ColorControl value={color} onChange={setColor} />
+      </FormField>
+
+      <FormField
+        as="group"
+        label={periodLabel ? `Holidays in this cohort's period (${periodLabel})` : 'Holidays'}
+        hint={periodLabel
+          ? `Every holiday inside ${periodLabel} applies to this cohort by default — England's bank holidays and the college's own closure periods alike. Untick one to keep it from clashing with module sessions; when a ticked one lands on a generated session, that session is skipped and the module end date extends by the clash. Either way, the cohort's practical and apprenticeship end dates stay fixed.`
+          : "Set the start date and duration. Every holiday inside the cohort's own period — bank holidays and the college's own closures — is then ticked by default: a clashing module session is skipped and the affected module end date extends, while cohort dates stay fixed."}
+      >
+        <HolidayPeriodList
+          holidays={periodHolidays}
+          hasCalendar={holidays.length > 0}
+          periodLabel={periodLabel}
+          excludedIds={excludedHolidaySet}
+          onToggle={toggleHoliday}
+          onSelectAll={selectAllHolidays}
+          onClearAll={clearAllHolidays}
+        />
+      </FormField>
+
+      {weekCapacity.totalWeeks > 0 && (
+        <div className="rounded-xl border border-background-200 bg-background-100 p-3.5">
+          <p className="text-[10px] font-bold uppercase tracking-wider text-foreground-500">Weeks in this cohort</p>
+          <div className="mt-2 grid grid-cols-3 gap-2 text-center">
+            <div className="rounded-lg border border-primary-200 bg-primary-50 px-2 py-2">
+              <p className="text-lg font-heading font-bold text-primary-700">{weekCapacity.totalWeeks}</p>
+              <p className="text-[10px] font-bold uppercase tracking-wide text-primary-700">Minimum</p>
+            </div>
+            <div className={`rounded-lg border px-2 py-2 ${weekCapacity.holidayWeeks ? 'border-amber-200 bg-amber-50' : 'border-background-200 bg-background-50'}`}>
+              <p className={`text-lg font-heading font-bold ${weekCapacity.holidayWeeks ? 'text-amber-700' : 'text-foreground-300'}`}>~{weekCapacity.holidayWeeks}</p>
+              <p className={`text-[10px] font-bold uppercase tracking-wide ${weekCapacity.holidayWeeks ? 'text-amber-700' : 'text-foreground-400'}`}>
+                Holiday weeks{weekCapacity.holidayDays > 0 ? ` (${weekCapacity.holidayDays}d exact)` : ''}
+              </p>
+            </div>
+            <div className="rounded-lg border border-background-200 bg-background-50 px-2 py-2">
+              <p className="text-lg font-heading font-bold text-foreground-900">{weekCapacity.holidayWeeks ? '~' : ''}{weekCapacity.maxWeeks}</p>
+              <p className="text-[10px] font-bold uppercase tracking-wide text-foreground-400">Maximum</p>
+            </div>
+          </div>
+          <div className="mt-2.5 flex flex-wrap items-center gap-1.5 text-[11px] leading-5 text-foreground-500">
+            <span className="inline-flex items-center gap-1 rounded-full bg-primary-100 px-2 py-0.5 font-bold text-primary-800">{weekCapacity.totalWeeks} weeks</span>
+            <span>before any holiday{periodLabel ? ` (${periodLabel})` : ''}.</span>
+            {weekCapacity.holidayWeeks ? (
+              <>
+                <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 font-bold text-amber-800">
+                  {weekCapacity.holidayDays} {weekCapacity.holidayDays === 1 ? 'holiday day' : 'holiday days'} (~{weekCapacity.holidayWeeks} {weekCapacity.holidayWeeks === 1 ? 'week' : 'weeks'})
+                </span>
+                <span>push a clashing module out by that much, up to roughly</span>
+                <span className="inline-flex items-center gap-1 rounded-full bg-foreground-900 px-2 py-0.5 font-bold text-white">~{weekCapacity.maxWeeks} weeks</span>
+                <span>— the cohort's own contract dates stay fixed either way.</span>
+              </>
+            ) : (
+              <span>No holiday falls inside this period, so nothing pushes a module out.</span>
+            )}
+          </div>
+        </div>
+      )}
+    </EntityDrawer>
+  );
+}
+
+/** The weekday a holiday starts on -- the thing that decides which delivery day it takes out. */
+function holidayWeekday(value: string): string {
+  const parsed = new Date(`${cleanText(value)}T00:00:00Z`);
+  if (Number.isNaN(parsed.getTime())) return '';
+  return parsed.toLocaleDateString('en-GB', { weekday: 'short', timeZone: 'UTC' });
+}
+
+/**
+ * The holidays a cohort's own dates put inside its delivery period, each one a
+ * checkbox: ticked applies to the cohort, unticked does not. Both kinds are
+ * here -- England's bank holidays and the college's own closure periods -- and
+ * they behave identically, because a closed delivery day is a closed delivery
+ * day. Every holiday is ticked by default, so an untouched cohort behaves
+ * exactly as it always did.
+ */
+function HolidayPeriodList({
+  holidays,
+  hasCalendar,
+  periodLabel,
+  excludedIds,
+  onToggle,
+  onSelectAll,
+  onClearAll,
+}: {
+  /** Already narrowed to the cohort's period, in date order. */
+  holidays: CurriculumHoliday[];
+  /** False when no holidays could be read at all -- a different problem from a quiet period. */
+  hasCalendar: boolean;
+  /** Human-readable period, empty when the period is not known yet. */
+  periodLabel: string;
+  /** Normalised ids of the holidays currently unticked. */
+  excludedIds: Set<string>;
+  onToggle: (holidayId: string | number) => void;
+  onSelectAll: () => void;
+  onClearAll: () => void;
+}) {
+  if (!hasCalendar) {
+    return (
+      <p className="rounded-lg border border-background-200 bg-background-100 px-3 py-2.5 text-[12px] text-foreground-500">
+        No holidays could be read. Bank holidays are mirrored from GOV.UK; closure periods are added on the Holidays page.
+      </p>
+    );
+  }
+
+  if (!holidays.length) {
+    return (
+      <p className="rounded-lg border border-background-200 bg-background-100 px-3 py-2.5 text-[12px] text-foreground-500">
+        {periodLabel
+          ? `No holidays fall inside ${periodLabel}.`
+          : "Set the start date and duration to see the holidays inside this cohort's period."}
+      </p>
+    );
+  }
+
+  const selectedCount = holidays.length - excludedIds.size;
+
+  return (
+    <div className="space-y-2">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="text-[11px] font-semibold text-foreground-500">
+          {holidays.length} {holidays.length === 1 ? 'holiday' : 'holidays'} in this period
+          {selectedCount !== holidays.length ? ` — ${selectedCount} selected` : ''}
+        </p>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={onSelectAll}
+            disabled={excludedIds.size === 0}
+            className="text-[11px] font-bold text-primary-700 transition-smooth hover:text-primary-800 hover:underline disabled:cursor-not-allowed disabled:text-foreground-300 disabled:no-underline"
+          >
+            Select all
+          </button>
+          <span className="text-[11px] text-foreground-300">·</span>
+          <button
+            type="button"
+            onClick={onClearAll}
+            disabled={selectedCount === 0}
+            className="text-[11px] font-bold text-primary-700 transition-smooth hover:text-primary-800 hover:underline disabled:cursor-not-allowed disabled:text-foreground-300 disabled:no-underline"
+          >
+            Clear all
+          </button>
+        </div>
+      </div>
+      <div className="max-h-56 space-y-1.5 overflow-y-auto rounded-lg border border-background-200 bg-background-50 p-2">
+        {holidays.map(holiday => {
+          const weekday = holidayWeekday(holiday.startDate);
+          const checked = !excludedIds.has(normaliseKey(holiday.id));
+          return (
+            <label
+              key={String(holiday.id)}
+              className="flex w-full cursor-pointer items-center gap-2 rounded-lg border border-transparent px-2.5 py-2 text-left transition-smooth hover:bg-background-100"
+            >
+              <input
+                type="checkbox"
+                checked={checked}
+                onChange={() => onToggle(holiday.id)}
+                className="h-3.5 w-3.5 shrink-0 rounded border-background-300 text-primary-600 focus:ring-primary-500"
+              />
+              <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ backgroundColor: holiday.color || '#91d64c' }} />
+              <span className={`min-w-0 flex-1 ${checked ? '' : 'opacity-50'}`}>
+                <span className="flex min-w-0 items-center gap-1.5">
+                  <span className="truncate text-[12px] font-semibold text-foreground-900">{holiday.label}</span>
+                  {/* Only ever 'Substitute day': the real date fell on a weekend and the holiday moved. */}
+                  {cleanText(holiday.notes) && (
+                    <span className="shrink-0 rounded-full bg-amber-100 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide text-amber-700">
+                      {holiday.notes}
+                    </span>
+                  )}
+                </span>
+                <span className="block text-[11px] text-foreground-400">
+                  {weekday ? `${weekday} ` : ''}{formatDateLabel(holiday.startDate)}
+                </span>
+              </span>
+            </label>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ------------------------------------------------------------------- group
+
+export interface GroupFormDefaults {
+  programmeId?: string;
+  cohortId?: string;
+}
+
+/** Return a clock value a fixed number of minutes after the supplied time. */
+function clockAfterMinutes(value: unknown, minutes: number): string {
+  try {
+    const [hour, minute] = normalizedClock(value).split(':').map(Number);
+    const total = (hour * 60 + minute + minutes) % (24 * 60);
+    return `${String(Math.floor(total / 60)).padStart(2, '0')}:${String(total % 60).padStart(2, '0')}`;
+  } catch {
+    return '';
+  }
+}
+
+export function GroupFormDrawer({
+  open,
+  group,
+  defaults,
+  programmes,
+  cohorts,
+  coachNames,
+  lockCohort = false,
+  chain,
+  onClose,
+  onSaved,
+}: {
+  open: boolean;
+  group?: CurriculumGroup | null;
+  defaults?: GroupFormDefaults;
+  programmes: CurriculumProgramme[];
+  cohorts: CurriculumCohort[];
+  coachNames: string[];
+  /** True inside a Cohort workspace, where the parent is not up for debate. */
+  lockCohort?: boolean;
+  /** Set when the structure wizard is driving this form as one step of a chain. */
+  chain?: FormChainStep;
+  onClose: () => void;
+  /** Handed the record the save wrote, so the list can paint it immediately. */
+  onSaved: (result?: { group: CurriculumGroup }) => unknown | Promise<unknown>;
+}) {
+  const [name, setName] = useState('');
+  const [programmeId, setProgrammeId] = useState('');
+  const [cohortId, setCohortId] = useState('');
+  const [coach, setCoach] = useState('');
+  const [weekDays, setWeekDays] = useState('');
+  const [startTime, setStartTime] = useState('09:00');
+  const [endTime, setEndTime] = useState('11:00');
+  const [color, setColor] = useState('#2563eb');
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  // Held for the Teams notice below, which offers to take the reader to the
+  // calendar the delivery days they just changed have left behind.
+  const navigate = useNavigate();
+  // What the drawer opened with, for the unsaved-changes check below.
+  const baseline = useRef<Record<string, unknown>>({});
+
+  // The delivery slot travels as one value as well as three. A colleague moving
+  // the group to Thursdays while this reader moves it to 14:00 must not settle
+  // as "Thursdays at 14:00" -- that is a slot neither of them chose, and the
+  // Teams calendar would go and book it. So the three are merged together and
+  // one of the two versions wins whole.
+  const schedule = { weekDays, startTime, endTime };
+  const liveValues = { name, programmeId, cohortId, coach, weekDays, startTime, endTime, color, schedule };
+  const dirty = !sameFormValues(liveValues, baseline.current);
+  const liveRef = useRef<Record<string, unknown>>(liveValues);
+  liveRef.current = liveValues;
+  const coEdit = useFormFieldMerge(baseline, liveRef, GROUP_FIELD_LABELS);
+  // The server refuses a save built on a version somebody else has already
+  // replaced, and hands the stored group back for the merge below. It matters
+  // most here: the slot is what the Teams calendar is built from, so putting a
+  // colleague's day change back would move real meetings.
+  const guard = useRecordGuard<CurriculumGroup>('group', group?.id, open);
+  // `cohorts` is a dependency of the seeding effect and gets a new identity on
+  // every background refresh; without this a reload landing mid-edit reset the
+  // form. See useFormSeedGuard.
+  const allowSeed = useFormSeedGuard(dirty);
+
+  useEffect(() => {
+    const verdict = allowSeed(open, cleanText(group?.id) || 'new-group');
+    if (!verdict) return;
+    // On a merge the drawer is already open on this group with edits in it, so
+    // the two refusals below would be answering a question nobody asked.
+    if (verdict === 'seed') {
+      setError(null);
+      setSaving(false);
+    }
+    // A refused save hands back the stored group; folding that in is the same
+    // operation as folding in one a poll brought.
+    const record = guard.stored || group;
+    if (record) {
+      const parent = cohorts.find(cohort => normaliseKey(cohort.id) === normaliseKey(record.cohortId));
+      const initial = {
+        name: record.name || '',
+        programmeId: programmeSelectValue(
+          programmes,
+          cleanText(parent?.programmeId) || cleanText(record.programmeId) || cleanText(record.programme),
+        ),
+        cohortId: cleanText(record.cohortId),
+        coach: normaliseKey(record.coach) === 'unassigned' ? '' : cleanText(record.coach),
+        weekDays: cleanText(record.weekDays),
+        startTime: cleanText(record.startTime) || '09:00',
+        endTime: cleanText(record.endTime) || '11:00',
+        color: record.color || '#2563eb',
+      };
+      const storedSchedule = { weekDays: initial.weekDays, startTime: initial.startTime, endTime: initial.endTime };
+      if (verdict === 'seed') baseline.current = { ...initial, schedule: storedSchedule };
+      const mergedSchedule = coEdit.take(verdict, 'schedule', storedSchedule);
+      setName(coEdit.take(verdict, 'name', initial.name));
+      setProgrammeId(coEdit.take(verdict, 'programmeId', initial.programmeId));
+      setCohortId(coEdit.take(verdict, 'cohortId', initial.cohortId));
+      setCoach(coEdit.take(verdict, 'coach', initial.coach));
+      // The slot was decided once, above. Its three fields are set from
+      // whichever version won, and the baseline for them is moved onto what is
+      // stored -- never onto the winning value, which would tell the dirty
+      // check this reader has no unsaved changes.
+      setWeekDays(mergedSchedule.weekDays);
+      setStartTime(mergedSchedule.startTime);
+      setEndTime(mergedSchedule.endTime);
+      coEdit.sync(verdict, storedSchedule);
+      setColor(coEdit.take(verdict, 'color', initial.color));
+      coEdit.publish();
+      return;
+    }
+    const parent = cohorts.find(cohort => normaliseKey(cohort.id) === normaliseKey(defaults?.cohortId));
+    const initial = {
+      name: '',
+      programmeId: programmeSelectValue(programmes, cleanText(parent?.programmeId) || defaults?.programmeId),
+      cohortId: defaults?.cohortId || '',
+      coach: '',
+      weekDays: '',
+      startTime: '09:00',
+      endTime: '11:00',
+      color: '#2563eb',
+    };
+    baseline.current = { ...initial, schedule: { weekDays: initial.weekDays, startTime: initial.startTime, endTime: initial.endTime } };
+    setName(initial.name);
+    setProgrammeId(initial.programmeId);
+    setCohortId(initial.cohortId);
+    setCoach(initial.coach);
+    setWeekDays(initial.weekDays);
+    setStartTime(initial.startTime);
+    setEndTime(initial.endTime);
+    setColor(initial.color);
+  }, [allowSeed, coEdit, cohorts, defaults?.cohortId, defaults?.programmeId, group, guard.stored, open, programmes]);
+
+  const programmeOptions = useMemo(
+    () => programmes.map(programme => ({ value: programmeIdentity(programme), label: programme.name })),
+    [programmes],
+  );
+  const availableCohorts = useMemo(
+    () => cohortsForProgramme(cohorts, programmes, programmeId),
+    [cohorts, programmeId, programmes],
+  );
+
+  const handleStartTimeChange = (value: string) => {
+    setStartTime(value);
+    const automaticEndTime = clockAfterMinutes(value, 120);
+    if (automaticEndTime) setEndTime(automaticEndTime);
+  };
+
+  const submit = async () => {
+    if (!name.trim()) { setError('Give the group a name.'); return; }
+    if (!cohortId) { setError('Choose the cohort this group belongs to.'); return; }
+
+    setSaving(true);
+    setError(null);
+    try {
+      // Only cohortId is sent as a parent. The backend reads the programme off
+      // the cohort, which is what keeps Programme -> Cohort -> Group intact.
+      const payload = { name: name.trim(), cohortId, coach, weekDays, startTime, endTime, color };
+      // Status is deliberately absent: a group's status is not shown anywhere, and
+      // the group PATCH only writes it when the key is present, so leaving it out
+      // keeps whatever is stored.
+      let saved: CurriculumGroup | null = null;
+      // The delivery slot is the group's, and every module under it runs to it --
+      // so a change here moves dates the Teams calendars were built from. The
+      // save says which ones, for the notice below.
+      let staleTeamsCalendars: StaleTeamsCalendar[] = [];
+      if (group) {
+        const outcome = await guard.save(
+          expectedRevision => updateCurriculumGroup(group.id, guardedInput(payload, expectedRevision)),
+        );
+        // Somebody saved first. Their group is merging into this form now, and
+        // the retry sends the result; nothing has been written yet, so no
+        // calendar has been left behind to warn about either.
+        if (!outcome.saved) return;
+        staleTeamsCalendars = outcome.result?.teamsCalendarsToUpdate || [];
+        saved = { ...group, ...payload };
+      } else {
+        saved = (await createCurriculumGroup(payload)).group || null;
+      }
+      // See the programme form: in a chain the wizard owns closing and confirming.
+      if (chain?.chained) {
+        await onSaved(saved ? { group: saved } : undefined);
+        return;
+      }
+      onClose();
+      // As with the cohort drawer: confirm now, refresh behind it.
+      const refreshed = Promise.resolve(onSaved(saved ? { group: saved } : undefined))
+        .catch(() => undefined);
+      // The warning replaces the plain confirmation rather than following it: a
+      // save that has left a calendar behind should not first say it went fine.
+      const warned = await confirmTeamsCalendarUpdate({
+        calendars: staleTeamsCalendars,
+        savedText: `${payload.name} is saved.`,
+        navigate,
+        // The slot this save just wrote. The week count is left to the server:
+        // the group PATCH re-derives each module's session count from its own
+        // weeks and the new delivery days before this runs.
+        sessionTimes: { startTime, endTime },
+      });
+      if (!warned) {
+        await showCurriculumAlert({
+          title: group ? 'Group updated' : 'Group created',
+          text: `${payload.name} is saved against its cohort.`,
+          timer: 1800,
+        });
+      }
+      await refreshed;
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'The group could not be saved.');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // See the cohort drawer: the retry has to send what the merge produced.
+  const submitRef = useRef(submit);
+  submitRef.current = submit;
+  useRecordRebaseRetry(guard.rebase, submitRef);
+
+  return (
+    <EntityDrawer
+      open={open}
+      title={group ? 'Edit group' : 'Add group'}
+      subtitle="Programme only narrows the cohort list. The group is stored against the cohort."
+      banner={chain?.banner}
+      onClose={onClose}
+      onSubmit={submit}
+      closeConfirm={chain?.closeConfirm}
+      submitLabel={chain?.submitLabel || (group ? 'Save group' : 'Create group')}
+      cancelLabel={chain?.cancelLabel}
+      extraAction={chain?.extraAction}
+      backAction={chain?.backAction}
+      width={chain?.width}
+      saving={saving}
+      error={error}
+      dirty={dirty}
+    >
+      <CoEditNotice notices={coEdit.notices} onDismiss={coEdit.dismiss} />
+      {!lockCohort && (
+        <>
+          <FormField label="Programme" hint="Filters the cohorts below.">
+            <SelectControl
+              value={programmeId}
+              onChange={value => { setProgrammeId(value); setCohortId(''); }}
+              options={programmeOptions}
+              placeholder="All programmes"
+            />
+          </FormField>
+          <FormField label="Cohort" required>
+            <SelectControl
+              value={cohortId}
+              onChange={setCohortId}
+              options={availableCohorts.map(cohort => ({ value: cohort.id, label: `${cohort.name} · ${cohort.programme}` }))}
+              placeholder={availableCohorts.length ? 'Select a cohort' : 'No cohorts for this programme'}
+            />
+          </FormField>
+        </>
+      )}
+      <FormField label="Group name" required>
+        <TextControl value={name} onChange={setName} placeholder="e.g. Group A" />
+      </FormField>
+      <FormField label="Coach">
+        <SelectControl
+          value={coach}
+          onChange={setCoach}
+          options={coachNames.map(coachName => ({ value: coachName, label: coachName }))}
+          placeholder="Unassigned"
+        />
+      </FormField>
+      <FormField label="Delivery days">
+        <WeekdayControl value={weekDays} onChange={setWeekDays} />
+      </FormField>
+      <div className="grid gap-4 sm:grid-cols-2">
+        <FormField label="Start time" hint={clockLabel(startTime)}>
+          <TextControl type="time" value={startTime} onChange={handleStartTimeChange} />
+        </FormField>
+        <FormField label="End time" hint={clockLabel(endTime)}>
+          <TextControl type="time" value={endTime} onChange={setEndTime} />
+        </FormField>
+      </div>
+      <FormField label="Colour">
+        <ColorControl value={color} onChange={setColor} />
+      </FormField>
+    </EntityDrawer>
+  );
+}

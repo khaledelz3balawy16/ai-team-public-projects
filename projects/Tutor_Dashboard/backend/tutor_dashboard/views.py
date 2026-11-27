@@ -1,0 +1,2973 @@
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.response import Response
+from rest_framework import status
+from rest_framework.permissions import AllowAny
+from django.db.models import Count, Avg, Sum, Max, Q
+from django.db import connection
+from datetime import datetime
+from collections import Counter, defaultdict
+from functools import lru_cache
+import hashlib
+import os
+import re
+import html
+import json
+import time
+import uuid
+from accounts.models import DoctorProfile
+from academics.models import Group, Module
+from sessions.models import Session
+
+
+_TUTOR_DASHBOARD_CACHE = {}
+CHECKLIST_EXCLUDED_CODES = {'SAFEGUARDING'}
+CHECKLIST_TOTAL_POINTS = 11
+CHECKLIST_PARTIALLY_ACHIEVED_MIN = 8
+# Confirmed ownership for QA titles that omit the scheduled tutor's name.
+# Match exact normalized titles; similarly named cohorts keep their own owner.
+QA_SUBJECT_OWNER_OVERRIDES = {
+    'ai in marketing': 'Sharon Shields',
+    'ai in project control 2026': 'Amgad Badewi',
+}
+
+
+def _get_tutor_dashboard_cache(cache_key, loader, ttl_seconds=120):
+    now = time.time()
+    cached = _TUTOR_DASHBOARD_CACHE.get(cache_key)
+    if cached and cached['expires_at'] > now:
+        return cached['value']
+
+    value = loader()
+    _TUTOR_DASHBOARD_CACHE[cache_key] = {
+        'expires_at': now + ttl_seconds,
+        'value': value,
+    }
+    return value
+
+
+def _load_table_columns(schema, table):
+    def _loader():
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = %s AND table_name = %s
+                """,
+                [schema, table],
+            )
+            return [row[0] for row in cursor.fetchall()]
+
+    return _get_tutor_dashboard_cache(
+        ('table_columns', schema, table),
+        _loader,
+        ttl_seconds=300,
+    )
+
+
+def _load_all_qa_session_rows():
+    qa_schema = os.getenv('QA_TABLE_SCHEMA', 'public')
+    qa_table = os.getenv('QA_TABLE_NAME', 'qa_doctors_sessions')
+    quote = connection.ops.quote_name
+    qa_table_q = f'{quote(qa_schema)}.{quote(qa_table)}'
+
+    def _loader():
+        # Keep transcript/clip payloads out of dashboard reads. The session report
+        # loads those session-level details separately when requested.
+        columns_available = _load_table_columns(qa_schema, qa_table)
+        wanted = (
+            'session_id', 'meeting_id', 'trainer', 'date', 'subject', 'hg_subject',
+            'lms_module', 'LMS_Module', 'module', 'duration', 'cancelled_session',
+            'met_count', 'partial_count', 'not_met_count', 'safeguarding_status',
+            'safegarding_status', 'Engagement', 'lms_students_count', 'lms_students',
+            'engaged_speaker_count', 'engaged_speakers_count', 'engaged_speakers',
+        )
+        selected_columns = ', '.join(quote(col) for col in wanted if col in columns_available)
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT {selected_columns}
+                FROM {qa_table_q}
+                ORDER BY date DESC NULLS LAST
+                """
+            )
+            rows = cursor.fetchall()
+            columns = [col[0] for col in cursor.description]
+        result = {}
+        for values in rows:
+            row = dict(zip(columns, values))
+            key = _session_key(row)
+            if not key:
+                raise ValueError('QA session is missing its session_id')
+            if key in result and result[key] != row:
+                raise ValueError('Conflicting QA records share a session_id')
+            result[key] = row
+        return list(result.values())
+
+    return _get_tutor_dashboard_cache(
+        ('qa_session_rows', qa_schema, qa_table),
+        _loader,
+        ttl_seconds=60,
+    )
+
+
+def _normalize_name(value):
+    return re.sub(r'[^a-z0-9]+', '', (value or '').lower())
+
+
+def _pick_column(columns, env_value, candidates):
+    if env_value and env_value in columns:
+        return env_value
+
+    by_normalized = {_normalize_name(col): col for col in columns}
+    for candidate in candidates:
+        matched = by_normalized.get(_normalize_name(candidate))
+        if matched:
+            return matched
+    return None
+
+
+def _canonical_person_name(value):
+    text = (value or '').lower()
+    text = re.sub(r'\b(dr|doctor|prof|professor)\.?\b', ' ', text)
+    text = re.sub(r'[^a-z0-9\s]+', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+def _normalize_person_tokens(value):
+    canonical = _canonical_person_name(value)
+    return [t for t in canonical.split() if t]
+
+
+
+@lru_cache(maxsize=4096)
+def _normalize_doctor_identity(value):
+    canonical = _canonical_person_name(value)
+    alias_map = {
+        'ray reed': 'ray mead',
+        'ray meed': 'ray mead',
+    }
+    return alias_map.get(canonical, canonical)
+def _simplify_qa_trainer_name(value):
+    text = (value or '').strip()
+    # Keep only the leading person-like part and drop notes like:
+    # "Dr. Fredah Mwiti (covered mainly by Omar Elshafey)"
+    # or "Nathan - Marketing Technology ..."
+    text = re.sub(r'\(.*?\)', '', text)
+    text = re.split(r'\s+-\s+', text, maxsplit=1)[0]
+    # If multiple trainers appear in one cell, keep only the first person.
+    text = re.split(r'\s+\band\b\s+|&|/|,', text, maxsplit=1, flags=re.IGNORECASE)[0]
+    return text.strip()
+
+
+def _extract_covering_doctor_name(raw_trainer, owner_doctor, doctor_names):
+    """
+    Try to detect who covered the session when trainer text is mixed/annotated.
+    Returns a doctor display name if different from owner, else empty string.
+    """
+    text = str(raw_trainer or '').strip()
+    if not text:
+        return ''
+
+    # 1) Prefer names inside parenthesis, e.g. "Dr. Ray (Amgad Badewi)"
+    for note in re.findall(r'\((.*?)\)', text):
+        candidate = _best_matching_doctor_from_text(note, doctor_names)
+        if candidate and not _is_doctor_name_match(owner_doctor, candidate):
+            return candidate
+
+    # 2) Handle mixed trainer cells like "X and Y", "X & Y", "X/Y"
+    split_parts = re.split(r'\s+\band\b\s+|&|/', re.sub(r'\(.*?\)', '', text), flags=re.IGNORECASE)
+    for part in split_parts:
+        candidate = _best_matching_doctor_from_text(part, doctor_names)
+        if candidate and not _is_doctor_name_match(owner_doctor, candidate):
+            return candidate
+
+    # 3) Fallback to simplified trainer name.
+    simplified = _simplify_qa_trainer_name(text)
+    candidate = _best_matching_doctor_from_text(simplified, doctor_names)
+    if candidate and not _is_doctor_name_match(owner_doctor, candidate):
+        return candidate
+
+    # 4) If trainer is a real different name but not in doctor list,
+    # still show it as covered by that trainer.
+    if simplified and not _is_doctor_name_match(owner_doctor, simplified):
+        return simplified
+
+    return ''
+
+
+def _doctor_match_score(doctor_name, text):
+    doctor_tokens = [t for t in _normalize_doctor_identity(doctor_name).split() if t]
+    if not doctor_tokens:
+        return 0
+
+    text_tokens = set(_tokenize_text(_normalize_doctor_identity(text)))
+    # A surname alone is not an identity. First-name abbreviations are accepted
+    # only when the caller finds a unique best candidate.
+    if all(token in text_tokens for token in doctor_tokens):
+        return 10 + len(doctor_tokens)
+    return 1 if doctor_tokens[0] in text_tokens else 0
+
+def _best_matching_doctor_from_text(text, doctor_names):
+    text_value = str(text or '')
+    best_name = None
+    best_score = 0
+    tied = False
+    for name in doctor_names:
+        score = _doctor_match_score(name, text_value)
+        if score > best_score:
+            best_score = score
+            best_name = name
+            tied = False
+        elif score == best_score and score > 0:
+            tied = True
+    return best_name if best_score > 0 and not tied else None
+
+
+def _explicit_row_owner_doctor(row, doctor_names):
+    """
+    Resolve explicitly identified ownership for a QA row:
+    1) If doctor name exists in subject OR LMS module, use that owner.
+    2) Use confirmed subject ownership for titles without a doctor name.
+    3) Honor a trainer annotation explicitly naming who they are covering for.
+    """
+    subject_text = str(row.get('subject') or row.get('hg_subject') or '').strip()
+    lms_text = str(row.get('lms_module') or row.get('LMS_Module') or row.get('module') or '').strip()
+
+    owner_from_subject = _best_matching_doctor_from_text(subject_text, doctor_names) if subject_text else None
+    owner_from_lms = _best_matching_doctor_from_text(lms_text, doctor_names) if lms_text else None
+
+    # Subject or LMS explicitly names a doctor -> use that (no trainer fallback).
+    if owner_from_subject:
+        return owner_from_subject
+    if owner_from_lms:
+        return owner_from_lms
+
+    for title in (subject_text, lms_text):
+        owner_name = QA_SUBJECT_OWNER_OVERRIDES.get(_normalize_module_for_match(title))
+        if owner_name:
+            # Preserve the display name used by doctor filters without confusing
+            # tutors who share a surname (for example, Sharon and Nathan Shields).
+            return next(
+                (name for name in doctor_names
+                 if _normalize_doctor_identity(name) == _normalize_doctor_identity(owner_name)),
+                owner_name,
+            )
+
+    covering_for = re.search(r'covering\s+for\s+([^)/]+)', str(row.get('trainer') or ''), re.I)
+    if covering_for:
+        return _best_matching_doctor_from_text(covering_for.group(1), doctor_names)
+    return None
+
+
+def _infer_row_owner_doctor(row, doctor_names, cohort_owners=None):
+    owner = _explicit_row_owner_doctor(row, doctor_names)
+    if owner:
+        return owner
+    cohort_key = _normalize_module_for_match(_clean_subject_for_group(row.get('subject')))
+    if cohort_owners and cohort_key in cohort_owners:
+        return cohort_owners[cohort_key]
+    trainer = _simplify_qa_trainer_name(str(row.get('trainer') or ''))
+    if _is_placeholder_trainer_name(trainer):
+        return None
+    return _best_matching_doctor_from_text(trainer, doctor_names)
+
+
+def _stable_dimension_id(kind, value):
+    # 48 bits fit exactly in JavaScript numbers; IDs do not shift on new imports.
+    return int(hashlib.sha256(f'{kind}:{value}'.encode('utf-8')).hexdigest()[:12], 16) or 1
+
+
+def _as_bool(value):
+    return str(value or '').strip().lower() in {'1', 'true', 'yes', 'y', 't'}
+
+
+def _session_key(row):
+    return str(row.get('session_id') or row.get('meeting_id') or '').strip()
+
+
+def _build_session_attributions(rows, doctor_names):
+    """Resolve ownership over the complete source, before date/group filtering.
+
+    Never infer ownership by majority: a shared unnamed subject can have several
+    independent tutors. Only explicit ownership or a single known tutor permits
+    inheriting an owner for an otherwise unassigned/cancelled row.
+    """
+    candidates = defaultdict(set)
+    for row in rows:
+        key = _normalize_module_for_match(_clean_subject_for_group(row.get('subject')))
+        owner = _infer_row_owner_doctor(row, doctor_names)
+        if key and owner:
+            candidates[key].add(owner)
+    cohort_owners = {key: next(iter(names)) for key, names in candidates.items() if len(names) == 1}
+    result = {}
+    for row in rows:
+        owner = _infer_row_owner_doctor(row, doctor_names, cohort_owners)
+        raw_trainer = str(row.get('trainer') or '').strip()
+        primary = _best_matching_doctor_from_text(_simplify_qa_trainer_name(raw_trainer), doctor_names)
+        cancelled = _as_bool(row.get('cancelled_session'))
+        undelivered = cancelled or _is_placeholder_trainer_name(_simplify_qa_trainer_name(raw_trainer))
+        effective = None
+        if not undelivered:
+            # "X (covering for Y)" describes X delivering, not Y covering X.
+            if re.search(r'covering\s+for|co.facilitat|skills coach', raw_trainer, re.I):
+                effective = primary
+            else:
+                covering = _extract_covering_doctor_name(raw_trainer, owner, doctor_names)
+                effective = covering or primary
+        covered = bool(owner and effective and owner != effective)
+        key = _normalize_module_for_match(_clean_subject_for_group(row.get('subject')))
+        visible_to = {name for name in (owner, effective) if name}
+        # Keep unassigned cancellations visible to their cohort's tutors without
+        # crediting them or inventing a scheduled owner.
+        if undelivered and not owner:
+            visible_to.update(candidates.get(key, set()))
+        result[_session_key(row)] = {
+            'owner_doctor': owner,
+            'effective_doctor': effective,
+            'covered_by': effective if covered else '',
+            'is_covered_session': covered,
+            'cancelled_session': cancelled,
+            'is_delivered': bool(effective) and not undelivered,
+            'visible_to': visible_to,
+        }
+    return result
+def _is_doctor_name_match(kbc_name, qa_trainer_name):
+    left_tokens = [t for t in _normalize_doctor_identity(kbc_name).split() if t]
+    right_tokens = [t for t in _normalize_doctor_identity(_simplify_qa_trainer_name(qa_trainer_name)).split() if t]
+    if not left_tokens or not right_tokens:
+        return False
+
+    left_norm = ''.join(left_tokens)
+    right_norm = ''.join(right_tokens)
+    if left_norm == right_norm:
+        return True
+
+    # Accept prefix-token matches to support abbreviated trainer names
+    # like "Dr. Ray" vs "Dr. Ray Reed".
+    shorter, longer = (left_tokens, right_tokens) if len(left_tokens) <= len(right_tokens) else (right_tokens, left_tokens)
+    return len(shorter) >= 1 and longer[: len(shorter)] == shorter
+def _public_doctor_display_name(name):
+    text = str(name or '').strip()
+    if re.match(r'^dr\.?\s+ray(\s+reed)?$', text, flags=re.IGNORECASE):
+        return 'Dr. Ray Meed'
+    return text
+def _load_qa_trainers():
+    qa_schema = os.getenv('QA_TABLE_SCHEMA', 'public')
+    qa_table = os.getenv('QA_TABLE_NAME', 'qa_doctors_sessions')
+    qa_table_q = f'"{qa_schema}"."{qa_table}"'
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            f"""
+            SELECT DISTINCT TRIM(CAST(trainer AS text)) AS trainer_name
+            FROM {qa_table_q}
+            WHERE COALESCE(TRIM(CAST(trainer AS text)), '') <> ''
+            """
+        )
+        return [row[0] for row in cursor.fetchall() if row[0]]
+
+
+def _load_qa_trainers_with_counts():
+    return list(Counter(
+        str(row.get('trainer') or '').strip()
+        for row in _load_all_qa_session_rows()
+        if str(row.get('trainer') or '').strip()
+    ).items())
+
+
+def _is_placeholder_trainer_name(value):
+    normalized = re.sub(r'\s+', ' ', str(value or '').strip()).lower()
+    return normalized in {
+        'session not delivered',
+        'not delivered',
+        'session cancelled',
+        'session canceled',
+        'cancelled',
+        'canceled',
+    }
+
+
+def _pick_preferred_qa_trainer_display_name(trainer_variants_with_counts):
+    candidates = []
+    for trainer_name, sessions_count in trainer_variants_with_counts:
+        simplified = re.sub(r'\s+', ' ', _simplify_qa_trainer_name(trainer_name)).strip()
+        if not simplified:
+            continue
+
+        has_title = 1 if re.match(r'^(dr|doctor|prof|professor)\.?\s+', simplified, flags=re.IGNORECASE) else 0
+        token_count = len(_normalize_person_tokens(simplified))
+        candidates.append((has_title, token_count, int(sessions_count or 0), len(simplified), simplified))
+
+    if not candidates:
+        return ''
+
+    candidates.sort(key=lambda x: (x[0], x[1], x[2], x[3]), reverse=True)
+    return candidates[0][4]
+
+
+def _pick_qa_doctor_merge_target(source_name, doctor_candidates):
+    source_tokens = _normalize_person_tokens(source_name)
+    if not source_tokens:
+        return None
+
+    longer_matches = []
+    for candidate_name, sessions_count in doctor_candidates:
+        if candidate_name == source_name:
+            continue
+
+        candidate_tokens = _normalize_person_tokens(candidate_name)
+        if len(candidate_tokens) <= len(source_tokens):
+            continue
+        if not _is_doctor_name_match(source_name, candidate_name):
+            continue
+
+        longer_matches.append((len(candidate_tokens), int(sessions_count or 0), len(candidate_name), candidate_name))
+
+    if not longer_matches:
+        return None
+
+    # Single-token short names such as "Dr Mohamed" are ambiguous unless
+    # there is only one fuller matching trainer name in QA.
+    if len(source_tokens) == 1 and len(longer_matches) != 1:
+        return None
+
+    longer_matches.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+    return longer_matches[0][3]
+
+
+def _build_dashboard_doctor_names():
+    qa_trainers_with_counts = _load_qa_trainers_with_counts()
+    trainer_variants_by_identity = defaultdict(dict)
+
+    for trainer_name, sessions_count in qa_trainers_with_counts:
+        simplified = re.sub(r'\s+', ' ', _simplify_qa_trainer_name(trainer_name)).strip()
+        if not simplified or _is_placeholder_trainer_name(simplified):
+            continue
+
+        identity_key = _normalize_doctor_identity(simplified)
+        if not identity_key:
+            continue
+
+        variants = trainer_variants_by_identity[identity_key]
+        variants[simplified] = variants.get(simplified, 0) + int(sessions_count or 0)
+
+    doctors_by_name = {}
+    for variants in trainer_variants_by_identity.values():
+        if not variants:
+            continue
+
+        preferred_name = _public_doctor_display_name(_pick_preferred_qa_trainer_display_name(variants.items()))
+        if not preferred_name:
+            continue
+
+        doctors_by_name[preferred_name] = doctors_by_name.get(preferred_name, 0) + sum(int(count or 0) for count in variants.values())
+
+    canonical_name_by_name = {}
+
+    def _resolve_canonical_name(name):
+        cached = canonical_name_by_name.get(name)
+        if cached:
+            return cached
+
+        target_name = _pick_qa_doctor_merge_target(name, doctors_by_name.items())
+        if not target_name:
+            canonical_name_by_name[name] = name
+            return name
+
+        canonical_name = _resolve_canonical_name(target_name)
+        canonical_name_by_name[name] = canonical_name
+        return canonical_name
+
+    merged_doctors = defaultdict(int)
+    for doctor_name, sessions_count in doctors_by_name.items():
+        canonical_name = _resolve_canonical_name(doctor_name)
+        merged_doctors[canonical_name] += int(sessions_count or 0)
+
+    doctors = sorted(merged_doctors.keys(), key=lambda name: name.lower())
+    return {_stable_dimension_id('doctor', _normalize_doctor_identity(name)): name for name in doctors}
+
+
+def _load_dashboard_doctor_names():
+    # Derive dimensions from the same cached source snapshot as the sessions.
+    return _build_dashboard_doctor_names()
+
+
+def _load_dashboard_doctor_dimensions():
+    """
+    Build tutor filter doctors from QA trainer names so the doctor dropdown/search
+    reflects the actual trainer values present in qa_doctors_sessions.
+    """
+    doctor_by_id = _load_dashboard_doctor_names()
+    groups_by_doctor_id = _load_qa_subject_groups_by_doctor(doctor_by_id)
+    modules_by_group_id = defaultdict(list)
+    seen = defaultdict(set)
+    for groups in groups_by_doctor_id.values():
+        for group in groups:
+            for module in group.get('modules', []):
+                if module['id'] not in seen[group['id']]:
+                    modules_by_group_id[group['id']].append(module)
+                    seen[group['id']].add(module['id'])
+    return doctor_by_id, groups_by_doctor_id, modules_by_group_id
+
+
+def _pick_preferred_doctor_display_name(kbc_name, qa_trainers_with_counts):
+    """
+    Pick the most representative QA trainer name for a doctor name coming from KBC.
+    Prefers candidates with stronger token overlap, richer full names, and higher frequency.
+    """
+    kbc_tokens = set(_normalize_person_tokens(kbc_name))
+    if not kbc_tokens:
+        return kbc_name
+
+    candidates = []
+    for trainer_name, sessions_count in qa_trainers_with_counts:
+        simplified = _simplify_qa_trainer_name(trainer_name)
+        trainer_tokens = set(_normalize_person_tokens(simplified))
+        if not trainer_tokens:
+            continue
+
+        overlap = len(kbc_tokens.intersection(trainer_tokens))
+        if overlap == 0:
+            continue
+
+        exact_like = 1 if _is_doctor_name_match(kbc_name, simplified) else 0
+        token_count = len(trainer_tokens)
+        candidates.append((exact_like, overlap, token_count, sessions_count, simplified))
+
+    if not candidates:
+        return kbc_name
+
+    candidates.sort(key=lambda x: (x[0], x[1], x[2], x[3]), reverse=True)
+    return candidates[0][4]
+
+
+def _load_shared_doctor_display_map(kbc_doctor_names):
+    """
+    Return mapping {kbc_name: preferred_display_name} for doctors that are shared
+    between KBC LMS_Tutor Name and QA trainer.
+    """
+    qa_trainers_with_counts = _load_qa_trainers_with_counts()
+    qa_trainers = [name for name, _ in qa_trainers_with_counts]
+
+    shared_map = {}
+    for kbc_name in sorted({n for n in kbc_doctor_names if n}):
+        if not any(_is_doctor_name_match(kbc_name, trainer_name) for trainer_name in qa_trainers):
+            continue
+        shared_map[kbc_name] = _pick_preferred_doctor_display_name(kbc_name, qa_trainers_with_counts)
+
+    return shared_map
+
+
+def _build_qa_subject_groups_by_doctor(doctor_by_id):
+    row_dicts = _load_all_qa_session_rows()
+    subjects_by_doctor = defaultdict(dict)
+    doctor_names = list(doctor_by_id.values())
+    doctor_id_by_name = {doctor_name: doctor_id for doctor_id, doctor_name in doctor_by_id.items()}
+    attributions = _build_session_attributions(row_dicts, doctor_names)
+    for row in row_dicts:
+        cleaned_subject = _clean_subject_for_group(row.get('subject'))
+        if not cleaned_subject:
+            continue
+        subject_key = _normalize_module_for_match(cleaned_subject)
+        module_name = str(row.get('lms_module') or row.get('LMS_Module') or row.get('module') or cleaned_subject).strip()
+        module_id = _stable_dimension_id('module', _normalize_module_for_match(module_name))
+        for doctor_name in attributions[_session_key(row)]['visible_to']:
+            doctor_id = doctor_id_by_name.get(doctor_name)
+            if not doctor_id:
+                continue
+            group = subjects_by_doctor[doctor_id].setdefault(subject_key, {
+                'id': _stable_dimension_id('group', subject_key),
+                'name': cleaned_subject, 'students_count': 0, 'modules': {},
+            })
+            group['students_count'] = max(group['students_count'], int(row.get('lms_students_count') or 0))
+            group['modules'][module_id] = {'id': module_id, 'name': module_name, 'code': ''}
+    return {
+        doctor_id: [
+            {**group, 'modules': sorted(group['modules'].values(), key=lambda module: module['name'].lower())}
+            for group in sorted(subjects.values(), key=lambda group: group['name'].lower())
+        ]
+        for doctor_id, subjects in subjects_by_doctor.items()
+    }
+
+
+def _load_qa_subject_groups_by_doctor(doctor_by_id):
+    return _build_qa_subject_groups_by_doctor(doctor_by_id)
+
+
+def _filter_doctors_with_qa_trainers(doctor_names):
+    try:
+        qa_trainers = _load_qa_trainers()
+    except Exception:
+        return doctor_names
+
+    matched = []
+    for doctor_name in doctor_names:
+        if any(_is_doctor_name_match(doctor_name, trainer_name) for trainer_name in qa_trainers):
+            matched.append(doctor_name)
+    return matched
+
+
+def _load_kbc_dimensions():
+    if connection.vendor != 'CHANGE_MEql':
+        raise RuntimeError('KBC endpoints require PostgreSQL/Neon. Set USE_SQLITE=False and configure DB_* env vars.')
+
+    schema = os.getenv('KBC_TABLE_SCHEMA', 'public')
+    table = os.getenv('KBC_TABLE_NAME', 'kbc_users_data')
+    doctor_override = os.getenv('KBC_DOCTOR_COLUMN')
+    group_override = os.getenv('KBC_GROUP_COLUMN')
+    module_override = os.getenv('KBC_MODULE_COLUMN')
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = %s AND table_name = %s
+            """,
+            [schema, table],
+        )
+        table_columns = [row[0] for row in cursor.fetchall()]
+
+    if not table_columns:
+        raise RuntimeError(f'Table {schema}.{table} not found or not accessible')
+
+    doctor_col = _pick_column(
+        table_columns,
+        doctor_override,
+        [
+            'LMS_Tutor name',
+            'LMS_Tutor Name',
+            'lms_tutor_name',
+            'lms_tutorname',
+            'LMS__Tutor Name',
+            'lms__tutorname',
+        ],
+    )
+    group_col = _pick_column(
+        table_columns,
+        group_override,
+        ['group', 'group_name', 'groupname', 'cohort', 'section', 'batch', 'class'],
+    )
+    module_col = _pick_column(
+        table_columns,
+        module_override,
+        [
+            'lms__matchedmodule',
+            'LMS__MatchedModule',
+            'lms__module_text',
+            'LMS__Course',
+            'module',
+            'module_name',
+            'modulename',
+            'course',
+            'subject',
+            'activity',
+        ],
+    )
+
+    missing = []
+    if not doctor_col:
+        missing.append('doctor column')
+    if not group_col:
+        missing.append('group column')
+    if not module_col:
+        missing.append('module column')
+
+    if missing:
+        raise RuntimeError(
+            f"Could not resolve {', '.join(missing)} in {schema}.{table}. "
+            "Set KBC_DOCTOR_COLUMN, KBC_GROUP_COLUMN, and KBC_MODULE_COLUMN."
+        )
+
+    doctor_q = f'"{doctor_col}"'
+    group_q = f'"{group_col}"'
+    module_q = f'"{module_col}"'
+    table_q = f'"{schema}"."{table}"'
+
+    sql = f"""
+        SELECT DISTINCT
+            TRIM(CAST({doctor_q} AS text)) AS doctor_name,
+            TRIM(CAST({group_q} AS text)) AS group_name,
+            TRIM(CAST({module_q} AS text)) AS module_name
+        FROM {table_q}
+        WHERE COALESCE(TRIM(CAST({doctor_q} AS text)), '') <> ''
+          AND COALESCE(TRIM(CAST({group_q} AS text)), '') <> ''
+          AND COALESCE(TRIM(CAST({module_q} AS text)), '') <> ''
+    """
+
+    with connection.cursor() as cursor:
+        cursor.execute(sql)
+        rows = cursor.fetchall()
+
+    source_doctors = sorted({row[0] for row in rows if row[0]})
+    try:
+        source_to_display = _load_shared_doctor_display_map(source_doctors)
+    except Exception:
+        source_to_display = {}
+
+    # Prefer shared QA display names when available, but keep KBC doctors as a
+    # fallback so the dashboard does not go blank when QA mappings are missing.
+    doctors = sorted({source_to_display.get(name, name) for name in source_doctors if name})
+    doctor_by_id = {idx: name for idx, name in enumerate(doctors, start=1)}
+    doctor_id_by_name = {name: idx for idx, name in doctor_by_id.items()}
+
+    doctor_group_pairs = sorted(
+        {
+            (source_to_display.get(row[0], row[0]), row[1])
+            for row in rows
+            if row[0] and row[1]
+        }
+    )
+    group_by_id = {idx: pair for idx, pair in enumerate(doctor_group_pairs, start=1)}
+
+    groups_by_doctor_id = defaultdict(list)
+    for group_id, (doctor_name, group_name) in group_by_id.items():
+        doctor_id = doctor_id_by_name.get(doctor_name)
+        if doctor_id:
+            groups_by_doctor_id[doctor_id].append(
+                {'id': group_id, 'name': group_name, 'students_count': 0}
+            )
+
+    modules_by_group_id = defaultdict(list)
+    for group_id, (doctor_name, group_name) in group_by_id.items():
+        modules = sorted(
+            {
+                row[2]
+                for row in rows
+                if source_to_display.get(row[0], row[0]) == doctor_name and row[1] == group_name and row[2]
+            }
+        )
+        modules_by_group_id[group_id] = [
+            {'id': idx, 'name': module_name, 'code': None}
+            for idx, module_name in enumerate(modules, start=1)
+        ]
+
+    return doctor_by_id, groups_by_doctor_id, modules_by_group_id
+
+
+def _resolve_selected_names(doctor_id, group_id, module_id):
+    doctor_by_id, groups_by_doctor_id, modules_by_group_id = _load_kbc_dimensions()
+
+    doctor_key = int(doctor_id)
+    group_key = int(group_id)
+    module_key = int(module_id)
+
+    doctor_name = doctor_by_id.get(doctor_key)
+    if not doctor_name:
+        raise ValueError('Doctor not found')
+
+    group_name = None
+    for doctor_groups in groups_by_doctor_id.values():
+        for grp in doctor_groups:
+            if int(grp['id']) == group_key:
+                group_name = grp['name']
+                break
+        if group_name:
+            break
+    if not group_name:
+        raise ValueError('Group not found')
+
+    module_name = None
+    for mod in modules_by_group_id.get(group_key, []):
+        if int(mod['id']) == module_key:
+            module_name = mod['name']
+            break
+    if not module_name:
+        raise ValueError('Module not found')
+
+    return doctor_name, group_name, module_name
+
+
+def _module_subject_patterns(module_name):
+    cleaned = re.sub(r'\s+', ' ', (module_name or '').strip())
+    patterns = [cleaned] if cleaned else []
+
+    # Remove optional leading code prefix like "G1 -"
+    no_prefix = re.sub(r'^[A-Za-z0-9]+\s*-\s*', '', cleaned).strip()
+    if no_prefix and no_prefix not in patterns:
+        patterns.append(no_prefix)
+
+    return patterns
+
+
+def _clean_subject_for_group(value):
+    """
+    Normalize subject text for group dropdown/filtering:
+    - collapse whitespace / decode HTML entities
+    - if subject starts with "A and B - ...", keep first owner "A - ..."
+    - keep plain subjects even when their titles contain "and"
+    """
+    text = html.unescape(str(value or ''))
+    text = re.sub(r'\s+', ' ', text).strip()
+    if not text:
+        return ''
+
+    if ' - ' in text:
+        prefix, rest = text.split(' - ', 1)
+        if re.search(r'\band\b', prefix, flags=re.IGNORECASE):
+            first_owner = re.split(r'\band\b', prefix, flags=re.IGNORECASE)[0].strip(' -')
+            text = f'{first_owner} - {rest.strip()}'
+        return text.strip()
+
+    return text
+
+
+def _extract_subject_prefix(value):
+    text = re.sub(r'\s+', ' ', (value or '').strip())
+    if not text:
+        return ''
+    first_part = re.split(r'\s*-\s*', text, maxsplit=1)[0].strip()
+    if re.match(r'^[A-Za-z]+\d+$', first_part):
+        return first_part.upper()
+    return ''
+
+
+def _tokenize_text(value):
+    text = html.unescape((value or '').lower())
+    return re.findall(r'[a-z]{3,}', text)
+
+
+def _module_subject_tokens(module_name):
+    tokens = _tokenize_text(module_name)
+    if not tokens:
+        return []
+
+    # Add acronym token, e.g. "project management professional" -> "pmp"
+    acronym = ''.join(token[0] for token in tokens if len(token) >= 3)
+    all_tokens = set(tokens)
+    if len(acronym) >= 3:
+        all_tokens.add(acronym)
+
+    return sorted(all_tokens, key=len, reverse=True)
+
+
+def _normalize_module_for_match(value):
+    text = html.unescape(str(value or ''))
+    text = re.sub(r'\s+', ' ', text).strip().lower()
+    return text
+
+
+def _load_attendance_counts_by_date_module(date_values):
+    """
+    Load attended students counts from attendance storage.
+    Returns: {(date, normalized_module): count_of_value_1}
+    """
+    if not date_values:
+        return {}
+
+    schema = os.getenv('KBC_TABLE_SCHEMA', 'public')
+    table = os.getenv('KBC_ATTENDANCE_TABLE_NAME', 'kbc_attendance')
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = %s AND table_name = %s
+            """,
+            [schema, table],
+        )
+        table_columns = [row[0] for row in cursor.fetchall()]
+
+    if not table_columns:
+        return {}
+
+    attendance_col = _pick_column(
+        table_columns,
+        os.getenv('KBC_ATTENDANCE_VALUE_COLUMN'),
+        ['Attendance', 'attendance'],
+    )
+    date_col = _pick_column(
+        table_columns,
+        os.getenv('KBC_ATTENDANCE_DATE_COLUMN'),
+        ['date', 'session_date', 'attendance_date'],
+    )
+    module_col = _pick_column(
+        table_columns,
+        os.getenv('KBC_ATTENDANCE_MODULE_COLUMN'),
+        ['module', 'module_name', 'activity', 'course', 'subject'],
+    )
+    if not attendance_col or not date_col or not module_col:
+        return {}
+
+    table_q = f'"{schema}"."{table}"'
+    attendance_q = f'"{attendance_col}"'
+    date_q = f'"{date_col}"'
+    module_q = f'"{module_col}"'
+
+    counts = defaultdict(int)
+    with connection.cursor() as cursor:
+        cursor.execute(
+            f"""
+            SELECT
+                CAST({date_q} AS text) AS session_date,
+                TRIM(COALESCE(CAST({module_q} AS text), '')) AS module_name,
+                CAST({attendance_q} AS text) AS attendance_value
+            FROM {table_q}
+            WHERE CAST({date_q} AS text) = ANY(%s)
+            """,
+            [list(date_values)],
+        )
+        rows = cursor.fetchall()
+
+    for session_date, module_name, attendance_value in rows:
+        try:
+            present = int(attendance_value or 0)
+        except Exception:
+            present = 0
+        if present != 1:
+            continue
+        module_key = _normalize_module_for_match(module_name)
+        if not module_key:
+            continue
+        counts[(str(session_date), module_key)] += 1
+
+    return dict(counts)
+
+
+def _lookup_attendance_count_fuzzy(session_date, session_module_key, attendance_counts_by_date_module):
+    """
+    Fuzzy lookup for attendance count when exact (date,module) key is not found.
+    Tries same-date module keys using tolerant module matching and returns max count.
+    """
+    if not session_date or not session_module_key:
+        return 0
+
+    exact = attendance_counts_by_date_module.get((session_date, session_module_key), 0)
+    if exact > 0:
+        return exact
+
+    best = 0
+    for (d, module_key), count in attendance_counts_by_date_module.items():
+        if d != session_date:
+            continue
+        if _module_text_match(session_module_key, module_key):
+            best = max(best, int(count or 0))
+    return best
+
+
+def _extract_lms_student_ids(raw_lms_students):
+    """
+    Extract LMS student IDs from qa_doctors_sessions.lms_students JSON payload.
+    Supports dict/list/json-string variants.
+    """
+    payload = raw_lms_students
+    if isinstance(payload, str):
+        text = payload.strip()
+        if not text:
+            return []
+        try:
+            payload = json.loads(text)
+        except Exception:
+            return []
+
+    students = []
+    if isinstance(payload, dict):
+        students = payload.get('students') or payload.get('Students') or []
+    elif isinstance(payload, list):
+        students = payload
+    else:
+        return []
+
+    ids = []
+    for student in students:
+        if not isinstance(student, dict):
+            continue
+        student_id = (
+            student.get('ID')
+            or student.get('id')
+            or student.get('StudentID')
+            or student.get('student_id')
+        )
+        if student_id is None:
+            continue
+        try:
+            ids.append(str(int(student_id)))
+        except Exception:
+            text = str(student_id).strip()
+            if text:
+                ids.append(text)
+    return ids
+
+
+def _module_text_match(session_module, attendance_module):
+    """
+    Compare module strings with tolerant matching:
+    exact normalized OR one contains the other OR token overlap >= 2.
+    """
+    left = _normalize_module_for_match(session_module)
+    right = _normalize_module_for_match(attendance_module)
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    if left in right or right in left:
+        return True
+
+    left_tokens = set(_tokenize_text(left))
+    right_tokens = set(_tokenize_text(right))
+    overlap = left_tokens.intersection(right_tokens)
+    return len(overlap) >= 2
+
+
+def _select_dominant_attendance_module(session_module, modules_by_student):
+    """
+    Choose the attendance module that best represents the session for one date cohort.
+    Priority:
+    1. Highest distinct-student count.
+    2. If tied, prefer best match with session module.
+    3. Fallback to stable lexical order.
+    """
+    counts = defaultdict(int)
+    for module_keys in modules_by_student.values():
+        for module_key in set(module_keys):
+            if module_key:
+                counts[module_key] += 1
+
+    if not counts:
+        return ''
+
+    session_module_key = _normalize_module_for_match(session_module)
+    best_module = ''
+    best_count = -1
+    best_match_rank = -1
+
+    for module_key, count in counts.items():
+        match_rank = 0
+        if session_module_key:
+            if module_key == session_module_key:
+                match_rank = 3
+            elif _module_text_match(session_module_key, module_key):
+                match_rank = 2
+            elif session_module_key in module_key or module_key in session_module_key:
+                match_rank = 1
+
+        if (
+            count > best_count
+            or (count == best_count and match_rank > best_match_rank)
+            or (count == best_count and match_rank == best_match_rank and module_key < best_module)
+        ):
+            best_module = module_key
+            best_count = count
+            best_match_rank = match_rank
+
+    return best_module
+
+
+def _load_attendance_presence_by_student_date(student_ids, date_values):
+    """
+    Load attendance rows from kbc_attendance for specific students and dates.
+    Returns:
+      {(student_id, date): [normalized_module_name, ...]} only for Attendance=1.
+    """
+    if not student_ids or not date_values:
+        return {}
+
+    schema = os.getenv('KBC_TABLE_SCHEMA', 'public')
+    table = os.getenv('KBC_ATTENDANCE_TABLE_NAME', 'kbc_attendance')
+    table_columns = _load_table_columns(schema, table)
+
+    if not table_columns:
+        return {}
+
+    attendance_col = _pick_column(
+        table_columns,
+        os.getenv('KBC_ATTENDANCE_VALUE_COLUMN'),
+        ['Attendance', 'attendance'],
+    )
+    id_col = _pick_column(
+        table_columns,
+        os.getenv('KBC_ATTENDANCE_ID_COLUMN'),
+        ['ID', 'id', 'student_id', 'StudentID'],
+    )
+    date_col = _pick_column(
+        table_columns,
+        os.getenv('KBC_ATTENDANCE_DATE_COLUMN'),
+        ['date', 'session_date', 'attendance_date'],
+    )
+    module_col = _pick_column(
+        table_columns,
+        os.getenv('KBC_ATTENDANCE_MODULE_COLUMN'),
+        ['module', 'module_name', 'activity', 'course', 'subject'],
+    )
+    if not attendance_col or not id_col or not date_col or not module_col:
+        return {}
+
+    table_q = f'"{schema}"."{table}"'
+    attendance_q = f'"{attendance_col}"'
+    id_q = f'"{id_col}"'
+    date_q = f'"{date_col}"'
+    module_q = f'"{module_col}"'
+
+    presence = defaultdict(list)
+    with connection.cursor() as cursor:
+        cursor.execute(
+            f"""
+            SELECT
+                CAST({id_q} AS text) AS student_id,
+                CAST({date_q} AS text) AS session_date,
+                TRIM(COALESCE(CAST({module_q} AS text), '')) AS module_name
+            FROM {table_q}
+            WHERE CAST({id_q} AS text) = ANY(%s)
+              AND CAST({date_q} AS text) = ANY(%s)
+              AND CAST(COALESCE({attendance_q}, 0) AS integer) = 1
+            """,
+            [list({str(s).strip() for s in student_ids if str(s).strip()}), list(date_values)],
+        )
+        rows = cursor.fetchall()
+
+    for student_id, session_date, module_name in rows:
+        key = (str(student_id).strip(), str(session_date))
+        module_key = _normalize_module_for_match(module_name)
+        if module_key and module_key not in presence[key]:
+            presence[key].append(module_key)
+
+    return dict(presence)
+
+
+def _resolve_doctor_group_names(doctor_id, group_id):
+    doctor_by_id, groups_by_doctor_id, _ = _load_kbc_dimensions()
+    doctor_key = int(doctor_id)
+    group_key = int(group_id)
+
+    doctor_name = doctor_by_id.get(doctor_key)
+    if not doctor_name:
+        raise ValueError('Doctor not found')
+
+    group_name = None
+    for grp in groups_by_doctor_id.get(doctor_key, []):
+        if int(grp['id']) == group_key:
+            group_name = grp['name']
+            break
+    if not group_name:
+        raise ValueError('Group not found')
+
+    return doctor_name, group_name
+
+
+def _parse_duration_to_minutes(value):
+    text = (value or '').lower()
+    if not text:
+        return 0
+    hours_match = re.search(r'(\d+)\s*hour', text)
+    mins_match = re.search(r'(\d+)\s*minute', text)
+    total = 0
+    if hours_match:
+        total += int(hours_match.group(1)) * 60
+    if mins_match:
+        total += int(mins_match.group(1))
+    if total == 0:
+        num_match = re.search(r'(\d+)', text)
+        if num_match:
+            total = int(num_match.group(1))
+    return total
+
+
+def _criteria_status(met_count, partial_count=0, not_met_count=0):
+    total = met_count + partial_count + not_met_count
+    if total == 0:
+        return 'Not Evaluated'
+    if met_count == total:
+        return 'Fully Achieved'
+    if met_count / total >= CHECKLIST_PARTIALLY_ACHIEVED_MIN / CHECKLIST_TOTAL_POINTS:
+        return 'Partially Achieved'
+    return 'Needs Improvement'
+
+
+def _session_checklist_counts(row, checklist_items):
+    if checklist_items:
+        counts = _checklist_status_counts(checklist_items)
+        return counts['met'], counts['partial'], counts['not_met']
+    counts = [max(0, int(row.get(field) or 0)) for field in ('met_count', 'partial_count', 'not_met_count')]
+    return _exclude_safeguarding_from_counts(row, *counts)
+
+
+def _filter_session_dates(rows, date_from, date_to):
+    for value in (date_from, date_to):
+        if value:
+            datetime.strptime(value, '%Y-%m-%d')
+    if date_from and date_to and date_from > date_to:
+        raise ValueError('date_from must be on or before date_to')
+    return [row for row in rows
+            if (not date_from or str(row.get('date') or '')[:10] >= date_from)
+            and (not date_to or str(row.get('date') or '')[:10] <= date_to)]
+
+
+def _normalize_checklist_status(value):
+    text = (value or '').strip().lower()
+    if text == 'met':
+        return 'Met'
+    if text in ('partial', 'partially met'):
+        return 'Partial'
+    if text in ('not met', 'not_met'):
+        return 'Not Met'
+    return 'Not Met'
+
+
+def _normalize_optional_checklist_status(value):
+    text = (value or '').strip().lower()
+    if text == 'met':
+        return 'Met'
+    if text in ('partial', 'partially met'):
+        return 'Partial'
+    if text in ('not met', 'not_met'):
+        return 'Not Met'
+    return None
+
+
+def _exclude_safeguarding_from_counts(row_obj, met_count, partial_count, not_met_count):
+    safeguarding_status = _normalize_optional_checklist_status(
+        row_obj.get('safeguarding_status') or row_obj.get('safegarding_status')
+    )
+    if safeguarding_status == 'Met' and met_count > 0:
+        met_count -= 1
+    elif safeguarding_status == 'Partial' and partial_count > 0:
+        partial_count -= 1
+    elif safeguarding_status == 'Not Met' and not_met_count > 0:
+        not_met_count -= 1
+    return max(0, met_count), max(0, partial_count), max(0, not_met_count)
+
+
+def _normalize_checklist_code(value):
+    return (value or '').strip().upper().replace(' ', '_')
+
+
+CHECKLIST_CODE_BY_ORDER = {
+    1: 'SESSION_DURATION',
+    2: 'PUNCTUALITY',
+    3: 'PROFESSIONAL_DEMEANOR',
+    4: 'LEARNING_OBJECTIVES',
+    5: 'CONTENT_ALIGNMENT',
+    6: 'STRUCTURE_AND_PACING',
+    7: 'LEARNER_ENGAGEMENT',
+    8: 'TEACHING_METHODS',
+    9: 'UNDERSTANDING_CHECKS',
+    10: 'REAL_WORLD_EXAMPLES',
+    11: 'SAFEGUARDING',
+    12: 'NEXT_STEPS',
+}
+
+CHECKLIST_CODE_ALIASES = {
+    'SESSION_DURATION': 'SESSION_DURATION',
+    'PUNCTUALITY': 'PUNCTUALITY',
+    'PROFESSIONAL_DEMEANOR': 'PROFESSIONAL_DEMEANOR',
+    'LEARNING_OBJECTIVES': 'LEARNING_OBJECTIVES',
+    'CONTENT_ALIGNMENT': 'CONTENT_ALIGNMENT',
+    'STRUCTURE_AND_PACING': 'STRUCTURE_AND_PACING',
+    'LEARNER_ENGAGEMENT': 'LEARNER_ENGAGEMENT',
+    'TEACHING_METHODS': 'TEACHING_METHODS',
+    'TEACHING_METHODS_AND_RESOURCES': 'TEACHING_METHODS',
+    'UNDERSTANDING_CHECKS': 'UNDERSTANDING_CHECKS',
+    'REAL_WORLD_EXAMPLES': 'REAL_WORLD_EXAMPLES',
+    'SAFEGUARDING': 'SAFEGUARDING',
+    'SAFEGUARDING_AND_SUPPORT': 'SAFEGUARDING',
+    'NEXT_STEPS': 'NEXT_STEPS',
+}
+
+CANCELLED_CHECKLIST_ITEMS = [
+    (1, '1) Session duration: Minimum of two hours'),
+    (2, '2) Punctuality: Session starts and ends on time'),
+    (3, '3) Professional demeanor: Maintained throughout the session'),
+    (4, '4) Learning objectives: Clearly explained at the beginning'),
+    (5, '5) Content alignment: Matches the curriculum/ apprenticeship standard'),
+    (6, '6) Structure and pacing: Session is well-organized and appropriately timed'),
+    (7, '7) Learner engagement: Evidence of interaction, questions, and activities'),
+    (8, '8) Teaching methods and resources: Appropriate and inclusive'),
+    (9, '9) Understanding checks: Conducted during the session'),
+    (10, '10) Real-world examples: Incorporated into the content'),
+    (11, '11) Safeguarding and support: Signposted where relevant'),
+    (12, '12) Next steps: Clear follow-up activities communicated'),
+]
+
+
+def _is_visible_checklist_code(code):
+    normalized = str(code or '').strip().upper()
+    return bool(normalized) and normalized not in CHECKLIST_EXCLUDED_CODES
+
+
+def _build_submitted_checklist_items(raw_items, default_evidence, default_status='Not Met'):
+    submitted_by_order = {}
+    if isinstance(raw_items, list):
+        for raw_item in raw_items:
+            if not isinstance(raw_item, dict):
+                continue
+            try:
+                order = int(raw_item.get('order') or 0)
+            except Exception:
+                order = 0
+            if 1 <= order <= 12:
+                submitted_by_order[order] = raw_item
+
+    items = []
+    for order, default_item in CANCELLED_CHECKLIST_ITEMS:
+        code = str(CHECKLIST_CODE_BY_ORDER.get(order) or '').strip()
+        if not _is_visible_checklist_code(code):
+            continue
+
+        submitted = submitted_by_order.get(order, {})
+        status = _normalize_checklist_status(submitted.get('status') or default_status)
+        evidence = str(submitted.get('evidence') or default_evidence or '').strip()
+        item_text = str(submitted.get('item') or default_item).strip()
+        code = str(submitted.get('code') or code).strip()
+        items.append(
+            {
+                'code': code,
+                'order': order,
+                'item': item_text,
+                'status': status,
+                'evidence': evidence,
+            }
+        )
+    return items
+
+
+def _checklist_status_counts(items):
+    visible_items = [
+        item
+        for item in items
+        if _is_visible_checklist_code(item.get('code'))
+    ]
+    return {
+        'met': sum(1 for item in visible_items if item.get('status') == 'Met'),
+        'partial': sum(1 for item in visible_items if item.get('status') == 'Partial'),
+        'not_met': sum(1 for item in visible_items if item.get('status') == 'Not Met'),
+    }
+
+
+def _derive_checklist_code(raw_code, checklist_item, checklist_order):
+    """
+    Return stable canonical code for the legacy checklist items.
+    Priority:
+    1) explicit checklist_code if it looks like a compact code
+    2) checklist_order mapping
+    3) checklist_item keyword fallback
+    """
+    normalized = _normalize_checklist_code(raw_code)
+    normalized_compact = re.sub(r'[^A-Z0-9_]+', '_', normalized).strip('_')
+    if normalized_compact in CHECKLIST_CODE_ALIASES:
+        return CHECKLIST_CODE_ALIASES[normalized_compact]
+
+    try:
+        order_num = int(checklist_order) if checklist_order is not None else None
+    except Exception:
+        order_num = None
+    if order_num in CHECKLIST_CODE_BY_ORDER:
+        return CHECKLIST_CODE_BY_ORDER[order_num]
+
+    item_text = (checklist_item or '').strip().lower()
+    if 'session duration' in item_text:
+        return 'SESSION_DURATION'
+    if 'punctuality' in item_text:
+        return 'PUNCTUALITY'
+    if 'professional demeanor' in item_text:
+        return 'PROFESSIONAL_DEMEANOR'
+    if 'learning objectives' in item_text:
+        return 'LEARNING_OBJECTIVES'
+    if 'content alignment' in item_text:
+        return 'CONTENT_ALIGNMENT'
+    if 'structure and pacing' in item_text:
+        return 'STRUCTURE_AND_PACING'
+    if 'learner engagement' in item_text:
+        return 'LEARNER_ENGAGEMENT'
+    if 'teaching methods' in item_text:
+        return 'TEACHING_METHODS'
+    if 'understanding checks' in item_text:
+        return 'UNDERSTANDING_CHECKS'
+    if 'real-world examples' in item_text or 'real world examples' in item_text:
+        return 'REAL_WORLD_EXAMPLES'
+    if 'safeguarding' in item_text:
+        return 'SAFEGUARDING'
+    if 'next steps' in item_text:
+        return 'NEXT_STEPS'
+
+    if normalized_compact in CHECKLIST_CODE_ALIASES:
+        return CHECKLIST_CODE_ALIASES[normalized_compact]
+    return normalized_compact
+
+
+def _has_evidence_value(value):
+    text = str(value or '').strip().lower()
+    if text in ('', 'no', 'none', 'null', 'n/a', 'na', 'false', '0'):
+        return False
+    if text.startswith('no '):
+        return False
+    if text.startswith('no-'):
+        return False
+    if text.startswith('no_'):
+        return False
+    if text.startswith('no evidence'):
+        return False
+    if text.startswith('not available'):
+        return False
+    if text.startswith('not provided'):
+        return False
+    return True
+
+
+def _load_checklist_map(session_ids):
+    if not session_ids:
+        return {}
+
+    qa_schema = os.getenv('QA_TABLE_SCHEMA', 'public')
+    checklist_table = os.getenv('QA_CHECKLIST_TABLE_NAME', 'qa_doctors_checklist_items')
+    checklist_q = f'"{qa_schema}"."{checklist_table}"'
+    checklist_columns = _load_table_columns(qa_schema, checklist_table)
+
+    if not checklist_columns:
+        return {}
+
+    session_col = _pick_column(checklist_columns, os.getenv('QA_CHECKLIST_SESSION_ID_COLUMN'), ['session_id'])
+    session_match_col = _pick_column(
+        checklist_columns,
+        os.getenv('QA_CHECKLIST_SESSION_MATCH_COLUMN'),
+        ['session_id_match', 'session_match_id', 'session_match'],
+    )
+    code_col = _pick_column(
+        checklist_columns,
+        os.getenv('QA_CHECKLIST_CODE_COLUMN'),
+        ['checklist_code', 'checklist_item_code', 'code'],
+    )
+    status_col = _pick_column(checklist_columns, os.getenv('QA_CHECKLIST_STATUS_COLUMN'), ['status'])
+    order_col = _pick_column(
+        checklist_columns,
+        os.getenv('QA_CHECKLIST_ORDER_COLUMN'),
+        ['checklist_order', 'checklist_item_order', 'order'],
+    )
+    item_col = _pick_column(
+        checklist_columns,
+        os.getenv('QA_CHECKLIST_ITEM_COLUMN'),
+        ['checklist_item', 'item', 'label', 'name'],
+    )
+    evidence_col = _pick_column(checklist_columns, os.getenv('QA_CHECKLIST_EVIDENCE_COLUMN'), ['evidence'])
+
+    if not session_col or not status_col:
+        return {}
+
+    session_q = f'"{session_col}"'
+    session_match_q = f'"{session_match_col}"' if session_match_col else None
+    code_expr = f'"{code_col}"' if code_col else (f'"{item_col}"' if item_col else 'NULL')
+    order_expr = f'"{order_col}"' if order_col else 'NULL'
+    item_expr = f'"{item_col}"' if item_col else 'NULL'
+    evidence_expr = f'"{evidence_col}"' if evidence_col else 'NULL'
+    status_q = f'"{status_col}"'
+
+    normalized_session_ids = {str(s).strip() for s in session_ids if str(s).strip()}
+    items_by_session = defaultdict(dict)
+    with connection.cursor() as cursor:
+        where_sql = f"TRIM(CAST({session_q} AS text)) = ANY(%s)"
+        params = [list(normalized_session_ids)]
+        if session_match_q:
+            where_sql += f" OR TRIM(CAST({session_match_q} AS text)) = ANY(%s)"
+            params.append(list(normalized_session_ids))
+
+        cursor.execute(
+            f"""
+            SELECT
+                TRIM(CAST({session_q} AS text)) AS session_id,
+                {f"TRIM(CAST({session_match_q} AS text))" if session_match_q else "NULL"} AS session_id_match,
+                {code_expr} AS checklist_code,
+                {status_q} AS status,
+                {order_expr} AS checklist_order,
+                {item_expr} AS checklist_item,
+                {evidence_expr} AS evidence
+            FROM {checklist_q}
+            WHERE {where_sql}
+            ORDER BY checklist_order ASC NULLS LAST
+            """,
+            params,
+        )
+        rows = cursor.fetchall()
+
+        # Pass 1: exact session_id matches (highest priority).
+        for session_id, session_id_match, checklist_code, status, _order, checklist_item, evidence in rows:
+            code = _derive_checklist_code(checklist_code, checklist_item, _order)
+            if not _is_visible_checklist_code(code):
+                continue
+
+            row_payload = {
+                'code': code,
+                'status': _normalize_checklist_status(status),
+                'order': int(_order) if _order is not None else None,
+                'item': (checklist_item or '').strip(),
+                'evidence': str(evidence or '').strip(),
+                'has_evidence': _has_evidence_value(evidence),
+            }
+
+            sid = str(session_id or '').strip()
+            if sid and sid in normalized_session_ids and code not in items_by_session[sid]:
+                items_by_session[sid][code] = row_payload
+
+        # Pass 2: fallback via session_id_match only for missing checklist codes.
+        for session_id, session_id_match, checklist_code, status, _order, checklist_item, evidence in rows:
+            code = _derive_checklist_code(checklist_code, checklist_item, _order)
+            if not _is_visible_checklist_code(code):
+                continue
+
+            row_payload = {
+                'code': code,
+                'status': _normalize_checklist_status(status),
+                'order': int(_order) if _order is not None else None,
+                'item': (checklist_item or '').strip(),
+                'evidence': str(evidence or '').strip(),
+                'has_evidence': _has_evidence_value(evidence),
+            }
+
+            sid_match = str(session_id_match or '').strip()
+            if sid_match and sid_match in normalized_session_ids and code not in items_by_session[sid_match]:
+                items_by_session[sid_match][code] = row_payload
+
+    return {
+        key: sorted(values.values(), key=lambda x: (x['order'] is None, x['order'] if x['order'] is not None else 999))
+        for key, values in items_by_session.items()
+    }
+
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def get_doctors(request):
+    """Get distinct doctors from qa_doctors_sessions.trainer."""
+    try:
+        doctor_by_id = _load_dashboard_doctor_names()
+    except Exception as exc:
+        return Response({'error': str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    doctors = [{'id': doctor_id, 'display_name': _public_doctor_display_name(name)} for doctor_id, name in doctor_by_id.items()]
+    return Response(doctors)
+
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def search_doctors(request):
+    """
+    Search doctors by name and return nested groups/modules for each doctor.
+    Query param: q
+    """
+    query = (request.GET.get('q') or '').strip().lower()
+    if len(query) < 2:
+        return Response([])
+
+    try:
+        doctor_by_id, groups_by_doctor_id, modules_by_group_id = _load_dashboard_doctor_dimensions()
+    except Exception as exc:
+        return Response({'error': str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    results = []
+    for doctor_id, doctor_name in doctor_by_id.items():
+        if query not in doctor_name.lower():
+            continue
+
+        doctor_groups = []
+        for group in groups_by_doctor_id.get(doctor_id, []):
+            group_id = int(group['id'])
+            doctor_groups.append(
+                {
+                    'id': group_id,
+                    'name': group['name'],
+                    'students_count': group.get('students_count', 0),
+                    'modules': modules_by_group_id.get(group_id, []),
+                }
+            )
+
+        results.append(
+            {
+                'id': doctor_id,
+                'display_name': _public_doctor_display_name(doctor_name),
+                'groups': doctor_groups,
+            }
+        )
+
+    return Response(results[:20])
+
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def get_doctor_groups(request, doctor_id):
+    """Get subject groups from qa_doctors_sessions for the selected doctor."""
+    try:
+        doctor_key = int(doctor_id)
+        doctor_by_id, groups_by_doctor_id, _ = _load_dashboard_doctor_dimensions()
+    except ValueError:
+        return Response({'error': 'doctor_id must be integer'}, status=status.HTTP_400_BAD_REQUEST)
+    except Exception as exc:
+        return Response({'error': str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    if doctor_key not in doctor_by_id:
+        return Response({'error': 'Doctor not found'}, status=status.HTTP_404_NOT_FOUND)
+
+    return Response(groups_by_doctor_id.get(doctor_key, []))
+
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def get_group_modules(request, group_id):
+    """Get modules from the same QA dimensions as the doctor/group selectors."""
+    try:
+        group_key = int(group_id)
+        _, _, modules_by_group_id = _load_dashboard_doctor_dimensions()
+    except ValueError:
+        return Response({'error': 'group_id must be integer'}, status=status.HTTP_400_BAD_REQUEST)
+    except Exception as exc:
+        return Response({'error': str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    if group_key not in modules_by_group_id:
+        return Response({'error': 'Group not found'}, status=status.HTTP_404_NOT_FOUND)
+
+    return Response(modules_by_group_id.get(group_key, []))
+
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def get_qa_sessions_by_filters(request):
+    """Legacy listing endpoint using the same validated QA filters as the dashboard."""
+    response = _dashboard_response(request)
+    if response.status_code != 200:
+        return response
+    data = response.data
+    return Response({
+        'filters': {
+            'doctor_id': data['doctor']['id'], 'doctor_name': data['doctor']['name'],
+            'group_id': data['group']['id'], 'group_name': data['group']['name'],
+            'module_id': data['module']['id'], 'module_name': data['module']['name'],
+        },
+        'match': {'mode': 'exact_qa_dimensions'},
+        'count': len(data['sessions']),
+        'results': data['sessions'],
+    })
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def create_cancelled_session(request):
+    """Create a manually entered cancelled QA session with 11 visible not-met checklist items."""
+    payload = request.data or {}
+    session_date_text = str(payload.get('session_date') or '').strip()
+    subject = re.sub(r'\s+', ' ', str(payload.get('subject') or '').strip())
+    trainer = re.sub(
+        r'\s+',
+        ' ',
+        str(payload.get('trainer') or payload.get('doctor_name') or '').strip(),
+    )
+    lms_module = re.sub(
+        r'\s+',
+        ' ',
+        str(payload.get('lms_module') or subject).strip(),
+    )
+    evidence_text = (
+        str(payload.get('evidence') or '').strip()
+        or 'Session was cancelled or ended before delivery began.'
+    )
+
+    try:
+        session_date = datetime.strptime(session_date_text, '%Y-%m-%d').date()
+    except ValueError:
+        return Response({'error': 'session_date must use YYYY-MM-DD'}, status=status.HTTP_400_BAD_REQUEST)
+
+    if not subject or subject in {'-', '--'}:
+        return Response({'error': 'subject is required'}, status=status.HTTP_400_BAD_REQUEST)
+    if not trainer:
+        return Response({'error': 'trainer is required'}, status=status.HTTP_400_BAD_REQUEST)
+    if not lms_module or lms_module in {'-', '--'}:
+        lms_module = subject
+
+    try:
+        students_count = int(payload.get('students_count') or 0)
+    except Exception:
+        students_count = 0
+    students_count = max(0, students_count)
+    checklist_items = _build_submitted_checklist_items(
+        payload.get('checklist_items'),
+        evidence_text,
+        default_status='Not Met',
+    )
+    checklist_counts = _checklist_status_counts(checklist_items)
+
+    session_id = f"manual-cancelled-{uuid.uuid4().hex[:12]}"
+    qa_schema = os.getenv('QA_TABLE_SCHEMA', 'public')
+    qa_table = os.getenv('QA_TABLE_NAME', 'qa_doctors_sessions')
+    checklist_table = os.getenv('QA_CHECKLIST_TABLE_NAME', 'qa_doctors_checklist_items')
+    quote = connection.ops.quote_name
+    qa_table_q = f'{quote(qa_schema)}.{quote(qa_table)}'
+    checklist_table_q = f'{quote(qa_schema)}.{quote(checklist_table)}'
+
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                INSERT INTO {qa_table_q} (
+                    session_id,
+                    meeting_id,
+                    trainer,
+                    duration,
+                    met_count,
+                    partial_count,
+                    not_met_count,
+                    date,
+                    subject,
+                    {quote('Engagement')},
+                    lms_module,
+                    lms_students,
+                    lms_students_count,
+                    duration_score,
+                    engagement_score,
+                    ksb_coverage,
+                    strengths,
+                    areas_for_development,
+                    overall_judgement,
+                    teaching_quality_rating,
+                    teaching_quality_comments,
+                    safeguarding_status,
+                    safeguarding_comments,
+                    cancelled_session
+                )
+                VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s,
+                    %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s, %s, %s, %s, %s, %s
+                )
+                """,
+                [
+                    session_id,
+                    None,
+                    trainer,
+                    '0 minutes',
+                    checklist_counts['met'],
+                    checklist_counts['partial'],
+                    checklist_counts['not_met'],
+                    session_date,
+                    subject,
+                    0,
+                    lms_module,
+                    '[]',
+                    students_count,
+                    0,
+                    0,
+                    '{}',
+                    '[]',
+                    '[]',
+                    'Not Delivered / Cancelled',
+                    None,
+                    'Session cancelled.',
+                    'Not applicable',
+                    'Session cancelled.',
+                    'true',
+                ],
+            )
+
+            checklist_rows = [
+                [
+                    session_id,
+                    f"{session_id}_{item['order']}",
+                    item['item'],
+                    item['status'],
+                    item['order'],
+                    item['evidence'],
+                ]
+                for item in checklist_items
+            ]
+            cursor.executemany(
+                f"""
+                INSERT INTO {checklist_table_q} (
+                    session_id,
+                    session_id_match,
+                    checklist_item,
+                    status,
+                    checklist_order,
+                    evidence
+                )
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                checklist_rows,
+            )
+    except Exception as exc:
+        return Response({'error': str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    _TUTOR_DASHBOARD_CACHE.clear()
+
+    return Response(
+        {
+            'session': {
+                'id': session_id,
+                'session_date': session_date.isoformat(),
+                'subject': subject,
+                'trainer': trainer,
+                'duration_minutes': 0,
+                'students_count': students_count,
+                'met_count': checklist_counts['met'],
+                'partial_count': checklist_counts['partial'],
+                'not_met_count': checklist_counts['not_met'],
+                'cancelled_session': True,
+                'checklist': [
+                    {
+                        'code': item['code'],
+                        'status': item['status'],
+                        'order': item['order'],
+                        'item': item['item'],
+                        'evidence': item['evidence'],
+                        'has_evidence': True,
+                    }
+                    for item in checklist_items
+                ],
+            }
+        },
+        status=status.HTTP_201_CREATED,
+    )
+
+
+@api_view(['PUT', 'PATCH', 'DELETE'])
+@permission_classes([AllowAny])
+def manage_cancelled_session(request, session_id):
+    """Edit or delete a QA session row."""
+    session_id = str(session_id or '').strip()
+    if not session_id:
+        return Response({'error': 'session_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+    qa_schema = os.getenv('QA_TABLE_SCHEMA', 'public')
+    qa_table = os.getenv('QA_TABLE_NAME', 'qa_doctors_sessions')
+    checklist_table = os.getenv('QA_CHECKLIST_TABLE_NAME', 'qa_doctors_checklist_items')
+    quote = connection.ops.quote_name
+    qa_table_q = f'{quote(qa_schema)}.{quote(qa_table)}'
+    checklist_table_q = f'{quote(qa_schema)}.{quote(checklist_table)}'
+
+    if request.method == 'DELETE':
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    DELETE FROM {checklist_table_q}
+                    WHERE session_id = %s
+                    """,
+                    [session_id],
+                )
+                cursor.execute(
+                    f"""
+                    DELETE FROM {qa_table_q}
+                    WHERE session_id = %s
+                    """,
+                    [session_id],
+                )
+                deleted_sessions = cursor.rowcount
+        except Exception as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        _TUTOR_DASHBOARD_CACHE.clear()
+        return Response({
+            'deleted': True,
+            'already_deleted': deleted_sessions == 0,
+            'session_id': session_id,
+        })
+
+    payload = request.data or {}
+    session_date_text = str(payload.get('session_date') or '').strip()
+    subject = re.sub(r'\s+', ' ', str(payload.get('subject') or '').strip())
+    trainer = re.sub(
+        r'\s+',
+        ' ',
+        str(payload.get('trainer') or payload.get('doctor_name') or '').strip(),
+    )
+    lms_module = re.sub(
+        r'\s+',
+        ' ',
+        str(payload.get('lms_module') or subject).strip(),
+    )
+    evidence_text = (
+        str(payload.get('evidence') or '').strip()
+        or 'Session was cancelled or ended before delivery began.'
+    )
+
+    try:
+        session_date = datetime.strptime(session_date_text, '%Y-%m-%d').date()
+    except ValueError:
+        return Response({'error': 'session_date must use YYYY-MM-DD'}, status=status.HTTP_400_BAD_REQUEST)
+
+    if not subject or subject in {'-', '--'}:
+        return Response({'error': 'subject is required'}, status=status.HTTP_400_BAD_REQUEST)
+    if not trainer:
+        return Response({'error': 'trainer is required'}, status=status.HTTP_400_BAD_REQUEST)
+    if not lms_module or lms_module in {'-', '--'}:
+        lms_module = subject
+
+    try:
+        students_count = int(payload.get('students_count') or 0)
+    except Exception:
+        students_count = 0
+    students_count = max(0, students_count)
+    raw_checklist_items = payload.get('checklist_items')
+    submitted_checklist_items = (
+        _build_submitted_checklist_items(raw_checklist_items, evidence_text)
+        if isinstance(raw_checklist_items, list)
+        else None
+    )
+    checklist_counts = _checklist_status_counts(submitted_checklist_items or [])
+
+    try:
+        with connection.cursor() as cursor:
+            if submitted_checklist_items is not None:
+                cursor.execute(
+                    f"""
+                    UPDATE {qa_table_q}
+                    SET
+                        trainer = %s,
+                        date = %s,
+                        subject = %s,
+                        lms_module = %s,
+                        lms_students_count = %s,
+                        met_count = %s,
+                        partial_count = %s,
+                        not_met_count = %s
+                    WHERE session_id = %s
+                    """,
+                    [
+                        trainer,
+                        session_date,
+                        subject,
+                        lms_module,
+                        students_count,
+                        checklist_counts['met'],
+                        checklist_counts['partial'],
+                        checklist_counts['not_met'],
+                        session_id,
+                    ],
+                )
+            else:
+                cursor.execute(
+                    f"""
+                    UPDATE {qa_table_q}
+                    SET
+                        trainer = %s,
+                        date = %s,
+                        subject = %s,
+                        lms_module = %s,
+                        lms_students_count = %s
+                    WHERE session_id = %s
+                    """,
+                    [trainer, session_date, subject, lms_module, students_count, session_id],
+                )
+            updated_sessions = cursor.rowcount
+            update_checklist_evidence = str(payload.get('update_checklist_evidence') or '').strip().lower() in {
+                '1',
+                'true',
+                'yes',
+                'y',
+                't',
+            }
+            if updated_sessions and submitted_checklist_items is not None:
+                cursor.execute(
+                    f"""
+                    DELETE FROM {checklist_table_q}
+                    WHERE session_id = %s
+                    """,
+                    [session_id],
+                )
+                checklist_rows = [
+                    [
+                        session_id,
+                        f"{session_id}_{item['order']}",
+                        item['item'],
+                        item['status'],
+                        item['order'],
+                        item['evidence'],
+                    ]
+                    for item in submitted_checklist_items
+                ]
+                cursor.executemany(
+                    f"""
+                    INSERT INTO {checklist_table_q} (
+                        session_id,
+                        session_id_match,
+                        checklist_item,
+                        status,
+                        checklist_order,
+                        evidence
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    checklist_rows,
+                )
+            elif updated_sessions and update_checklist_evidence:
+                cursor.execute(
+                    f"""
+                    UPDATE {checklist_table_q}
+                    SET evidence = %s
+                    WHERE session_id = %s
+                    """,
+                    [evidence_text, session_id],
+                )
+    except Exception as exc:
+        return Response({'error': str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    if updated_sessions == 0:
+        return Response({'error': 'Session not found'}, status=status.HTTP_404_NOT_FOUND)
+
+    _TUTOR_DASHBOARD_CACHE.clear()
+
+    return Response(
+        {
+            'session': {
+                'id': session_id,
+                'session_date': session_date.isoformat(),
+                'subject': subject,
+                'trainer': trainer,
+                'duration_minutes': 0,
+                'students_count': students_count,
+                'met_count': checklist_counts['met'] if submitted_checklist_items is not None else 0,
+                'partial_count': checklist_counts['partial'] if submitted_checklist_items is not None else 0,
+                'not_met_count': checklist_counts['not_met'] if submitted_checklist_items is not None else 0,
+                'cancelled_session': True,
+            }
+        }
+    )
+
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def get_dashboard_data(request):
+    return _dashboard_response(request)
+
+
+def _dashboard_response(request):
+    """Get complete dashboard data from qa_doctors_sessions based on filters."""
+    doctor_id = request.GET.get('doctor_id')
+    group_id = request.GET.get('group_id')
+    module_id = request.GET.get('module_id')
+    date_from = request.GET.get('date_from')
+    date_to = request.GET.get('date_to')
+    status_filter = request.GET.get('status')
+
+    if not doctor_id:
+        return Response(
+            {'error': 'doctor_id is required'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    try:
+        doctor_key = int(doctor_id)
+        group_key = int(group_id) if group_id is not None else 0
+        selected_module_key = int(module_id) if module_id is not None else 0
+    except ValueError:
+        return Response({'error': 'doctor_id, group_id and module_id must be integers'}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        doctor_by_id, groups_by_doctor_id, _ = _load_dashboard_doctor_dimensions()
+        doctor_name = doctor_by_id.get(doctor_key)
+        if not doctor_name:
+            return Response({'error': 'Doctor not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        group_name = 'All Groups'
+        if group_key != 0:
+            group_match = next((g for g in groups_by_doctor_id.get(doctor_key, []) if int(g['id']) == group_key), None)
+            if not group_match:
+                return Response({'error': 'Group not found'}, status=status.HTTP_404_NOT_FOUND)
+            group_name = group_match['name']
+
+        module_name = 'All Modules'
+        if selected_module_key:
+            eligible_groups = [g for g in groups_by_doctor_id.get(doctor_key, []) if not group_key or g['id'] == group_key]
+            module_match = next((m for g in eligible_groups for m in g.get('modules', []) if m['id'] == selected_module_key), None)
+            if not module_match:
+                return Response({'error': 'Module not found for this doctor/group'}, status=status.HTTP_404_NOT_FOUND)
+            module_name = module_match['name']
+    except Exception as exc:
+        return Response({'error': str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    try:
+        row_dicts_all = _load_all_qa_session_rows()
+    except Exception as exc:
+        return Response({'error': str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    row_dicts = list(row_dicts_all)
+    doctor_names = list(doctor_by_id.values())
+    attributions = _build_session_attributions(row_dicts_all, doctor_names)
+
+    def _normalize_subject_match_text(value):
+        # Keep cancellation marker as part of identity so
+        # "Canceled: X" does not match normal "X".
+        text = _clean_subject_for_group(value)
+        return re.sub(r'\s+', ' ', text).strip()
+
+    def _subject_matches_group(subject_value, group_value):
+        subject_text = _normalize_subject_match_text(subject_value)
+        selected_text = _normalize_subject_match_text(group_value)
+        if not subject_text or not selected_text:
+            return False
+
+        # Exact module/group match only.
+        return subject_text.lower() == selected_text.lower()
+
+    # A shared subject does not make every session belong to every tutor who
+    # taught it. Include only the session owner and the covering tutor.
+    owner_filtered = []
+    for row in row_dicts:
+        if doctor_name in attributions[_session_key(row)]['visible_to']:
+            owner_filtered.append(row)
+
+    # Always apply selected doctor scope.
+    row_dicts = owner_filtered
+
+    # Filter by selected subject (Group dropdown) unless "All Groups"
+    if group_key != 0:
+        def _filter_rows_by_group(rows):
+            group_filtered = []
+            for row in rows:
+                if _subject_matches_group(row.get('subject'), group_name):
+                    group_filtered.append(row)
+            return group_filtered
+
+        # Keep filtering inside selected doctor scope.
+        group_filtered = _filter_rows_by_group(row_dicts)
+
+        row_dicts = group_filtered
+
+    # Filter by module on subject unless "All Modules"
+    if selected_module_key != 0:
+        row_dicts = [row for row in row_dicts if _normalize_module_for_match(
+            row.get('lms_module') or row.get('LMS_Module') or row.get('module') or _clean_subject_for_group(row.get('subject'))
+        ) == _normalize_module_for_match(module_name)]
+
+    # Optional date filters
+    try:
+        row_dicts = _filter_session_dates(row_dicts, date_from, date_to)
+    except ValueError:
+        return Response({'error': 'Use a valid YYYY-MM-DD date range'}, status=status.HTTP_400_BAD_REQUEST)
+    cancelled_filter = request.GET.get('cancelled_filter', '')
+    if cancelled_filter in {'cancelled', 'not_cancelled'}:
+        row_dicts = [r for r in row_dicts if _as_bool(r.get('cancelled_session')) == (cancelled_filter == 'cancelled')]
+
+    def as_int(v):
+        try:
+            return int(v or 0)
+        except Exception:
+            return 0
+
+    def as_bool(v):
+        text = str(v or '').strip().lower()
+        return text in {'1', 'true', 'yes', 'y', 't'}
+
+    def as_int_loose(v):
+        try:
+            return int(v)
+        except Exception:
+            text = str(v or '')
+            match = re.search(r'\d+', text)
+            return int(match.group(0)) if match else 0
+
+    def as_bool(v):
+        text = str(v or '').strip().lower()
+        return text in {'1', 'true', 'yes', 'y', 't'}
+
+    def as_percentage(v):
+        if v is None or str(v).strip() == '':
+            return None
+        try:
+            value = float(v)
+        except Exception:
+            return None
+        if value < 0:
+            return 0.0
+        if value > 100:
+            return 100.0
+        return round(value, 2)
+
+    session_ids = {str(r.get('session_id') or '') for r in row_dicts if r.get('session_id')}
+    checklist_by_session = _load_checklist_map(session_ids)
+    date_values = {str(r.get('date') or '') for r in row_dicts if r.get('date')}
+    all_session_student_ids = set()
+    for r in row_dicts:
+        for sid in _extract_lms_student_ids(r.get('lms_students')):
+            all_session_student_ids.add(str(sid))
+    attendance_presence_by_student_date = _load_attendance_presence_by_student_date(
+        all_session_student_ids,
+        date_values,
+    )
+
+    sessions_data = []
+    for idx, row in enumerate(row_dicts, start=1):
+        session_id = str(row.get('session_id') or '')
+        checklist_items = checklist_by_session.get(session_id, [])
+        duration_text = str(row.get('duration') or '').strip()
+        duration_minutes = _parse_duration_to_minutes(duration_text)
+
+        met, partial, not_met = _session_checklist_counts(row, checklist_items)
+
+        session_date = str(row.get('date') or '')
+        session_module = (
+            row.get('lms_module')
+            or row.get('LMS_Module')
+            or row.get('module')
+            or ''
+        )
+        session_student_ids = _extract_lms_student_ids(row.get('lms_students'))
+        attended_students = 0
+        if session_date and session_student_ids:
+            attendance_modules_by_student = {}
+            for sid in session_student_ids:
+                attendance_modules_by_student[str(sid)] = attendance_presence_by_student_date.get(
+                    (str(sid), session_date),
+                    [],
+                )
+            dominant_module_key = _select_dominant_attendance_module(
+                session_module,
+                attendance_modules_by_student,
+            )
+            if dominant_module_key:
+                for module_keys in attendance_modules_by_student.values():
+                    if dominant_module_key in module_keys:
+                        attended_students += 1
+            else:
+                for module_keys in attendance_modules_by_student.values():
+                    if module_keys:
+                        attended_students += 1
+        if duration_minutes <= 0:
+            attended_students = 0
+
+        engaged_speaker_count = as_int(
+            row.get('engaged_speaker_count')
+            or row.get('engaged_speakers_count')
+            or row.get('engaged_speakers')
+        )
+
+        raw_trainer = str(row.get('trainer') or '').strip()
+        attribution = attributions[_session_key(row)]
+
+        session_row = {
+            'id': _session_key(row),
+            'session_date': str(row.get('date')) if row.get('date') else None,
+            'duration_text': duration_text,
+            'duration_minutes': duration_minutes,
+            'trainer': raw_trainer,
+            **{key: value for key, value in attribution.items() if key != 'visible_to'},
+            'subject': row.get('subject') or module_name,
+            'lms_module': session_module,
+            'engagement': as_percentage(row.get('Engagement')),
+            'students_count': as_int(row.get('lms_students_count')),
+            'attended_students': attended_students,
+            'engaged_speaker_count': engaged_speaker_count,
+            'met_count': met,
+            'partial_count': partial,
+            'not_met_count': not_met,
+            'criteria_status': _criteria_status(met, partial, not_met),
+            'checklist_total': met + partial + not_met,
+            'compliance_rate': round(met / (met + partial + not_met) * 100, 2) if met + partial + not_met else 0,
+            'checklist': checklist_items,
+        }
+        sessions_data.append(session_row)
+
+    if status_filter:
+        sessions_data = [s for s in sessions_data if s['criteria_status'] == status_filter]
+
+    total_sessions = len(sessions_data)
+    counted_sessions = [s for s in sessions_data if s['is_delivered'] and s['effective_doctor'] == doctor_name]
+    counted_total = len(counted_sessions)
+    achieved_sessions = sum(1 for s in counted_sessions if s['criteria_status'] == 'Fully Achieved')
+    achievement_percentage = (achieved_sessions / counted_total * 100) if counted_total else 0
+    total_activities = len({(s['subject'] or '').strip() for s in sessions_data if (s['subject'] or '').strip()})
+    avg_duration = (sum(s['duration_minutes'] for s in counted_sessions) / counted_total) if counted_total else 0
+    avg_met = (sum(s['met_count'] for s in counted_sessions) / counted_total) if counted_total else 0
+    sum_met = sum(s['met_count'] for s in counted_sessions)
+    sum_partial = sum(s['partial_count'] for s in counted_sessions)
+    sum_not_met = sum(s['not_met_count'] for s in counted_sessions)
+    observations = sum_met + sum_partial + sum_not_met
+    last_session_date = max((s['session_date'] for s in sessions_data if s['session_date']), default=None)
+    total_students = max((as_int(r.get('lms_students_count')) for r in row_dicts), default=0)
+
+    by_date = defaultdict(list)
+    for s in counted_sessions:
+        if s['session_date']:
+            by_date[s['session_date']].append(s)
+    achievement_over_time = []
+    for date_key in sorted(by_date.keys()):
+        bucket = by_date[date_key]
+        achieved = sum(1 for s in bucket if s['criteria_status'] == 'Fully Achieved')
+        rate = (achieved / len(bucket) * 100) if bucket else 0
+        achievement_over_time.append({'date': date_key, 'rate': round(rate, 2)})
+
+    student_engagement = [
+        {
+            'session_id': s['id'],
+            'session': s.get('subject') or f"Session {idx + 1}",
+            'date': s.get('session_date'),
+            'engagement': as_percentage(s.get('engagement')),
+            'attendance': as_int(s.get('attended_students')),
+            'engaged_speaker_count': as_int(s.get('engaged_speaker_count')),
+        }
+        for idx, s in enumerate(
+            sorted(
+                (s for s in counted_sessions if s.get('session_date')),
+                key=lambda x: x.get('session_date')
+            )
+        )
+    ]
+
+    return Response({
+        'doctor': {'id': doctor_key, 'name': doctor_name},
+        'group': {'id': group_key, 'name': group_name, 'total_students': total_students},
+        'module': {'id': selected_module_key, 'name': module_name, 'code': 'ALL' if selected_module_key == 0 else ''},
+        'kpis': {
+            'total_sessions': total_sessions,
+            'adjusted_sessions': counted_total,
+            'observations': observations,
+            'compliance_rate': round(sum_met / observations * 100, 2) if observations else 0,
+            'achieved_sessions': achieved_sessions,
+            'achievement_percentage': round(achievement_percentage, 2),
+            'total_students': total_students,
+            'total_activities': total_activities,
+            'avg_duration': round(avg_duration, 2),
+            'avg_met': round(avg_met, 2),
+            'sum_partial': sum_partial,
+            'sum_not_met': sum_not_met,
+            'last_session_date': last_session_date,
+        },
+        'charts': {
+            'totals': {
+                'met': sum_met,
+                'partial': sum_partial,
+                'not_met': sum_not_met,
+            },
+            'achieved_rate_over_time': achievement_over_time,
+            'student_engagement': student_engagement,
+        },
+        'sessions': sessions_data,
+    })
+
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def get_tutors_summary(request):
+    """Summary across all tutors using the same counting logic as doctor dashboard."""
+    date_from = request.GET.get('date_from')
+    date_to = request.GET.get('date_to')
+    cancelled_filter = str(request.GET.get('cancelled_filter') or '').strip().lower()
+
+    try:
+        doctor_by_id, groups_by_doctor_id, _ = _load_dashboard_doctor_dimensions()
+    except Exception as exc:
+        return Response({'error': str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    doctor_id_by_name = {name: doctor_id for doctor_id, name in doctor_by_id.items()}
+
+    try:
+        row_dicts = list(_load_all_qa_session_rows())
+    except Exception as exc:
+        return Response({'error': str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    def as_int(v):
+        try:
+            return int(v or 0)
+        except Exception:
+            return 0
+
+    def as_bool(v):
+        text = str(v or '').strip().lower()
+        return text in {'1', 'true', 'yes', 'y', 't'}
+
+    doctor_names_all = list(doctor_by_id.values())
+    attributions = _build_session_attributions(row_dicts, doctor_names_all)
+    try:
+        row_dicts = _filter_session_dates(row_dicts, date_from, date_to)
+    except ValueError:
+        return Response({'error': 'Use a valid YYYY-MM-DD date range'}, status=status.HTTP_400_BAD_REQUEST)
+    if cancelled_filter == 'cancelled':
+        row_dicts = [r for r in row_dicts if as_bool(r.get('cancelled_session'))]
+    elif cancelled_filter == 'not_cancelled':
+        row_dicts = [r for r in row_dicts if not as_bool(r.get('cancelled_session'))]
+
+    session_ids = {str(r.get('session_id') or '').strip() for r in row_dicts if r.get('session_id')}
+    checklist_by_session = _load_checklist_map(session_ids)
+
+    trainers = []
+    checklist_code_stats = defaultdict(
+        lambda: {'met': 0, 'partial': 0, 'not_met': 0, 'total': 0, 'order': None, 'label': ''}
+    )
+    checklist_code_not_met_by_doctor = defaultdict(
+        lambda: defaultdict(lambda: {'count': 0, 'sessions': []})
+    )
+    checklist_code_partial_by_doctor = defaultdict(
+        lambda: defaultdict(lambda: {'count': 0, 'sessions': []})
+    )
+    checklist_code_not_met_unmapped = defaultdict(lambda: {'count': 0, 'sessions': []})
+    checklist_code_partial_unmapped = defaultdict(lambda: {'count': 0, 'sessions': []})
+    evidence_with = 0
+    evidence_without = 0
+
+    prepared_rows = []
+    for row in row_dicts:
+        session_id = str(row.get('session_id') or '').strip()
+        checklist_items = checklist_by_session.get(session_id, [])
+        attribution = attributions[_session_key(row)]
+        session_date = str(row.get('date') or '')
+        session_subject = str(
+            row.get('subject')
+            or row.get('hg_subject')
+            or row.get('lms_module')
+            or row.get('module')
+            or ''
+        ).strip()
+        met, partial, not_met = _session_checklist_counts(row, checklist_items)
+
+        prepared_rows.append(
+            {
+                'row': row,
+                'session_id': session_id,
+                'session_date': session_date,
+                'session_subject': session_subject or 'Unknown Subject',
+                **{key: value for key, value in attribution.items() if key != 'visible_to'},
+                'checklist_items': checklist_items,
+                'met': met,
+                'partial': partial,
+                'not_met': not_met,
+            }
+        )
+
+    active_rows = [item for item in prepared_rows if not item['cancelled_session']]
+    total_sessions_all = len(active_rows)
+    total_met_all = 0
+    total_partial_all = 0
+    total_not_met_all = 0
+
+    for item in active_rows:
+        checklist_items = item['checklist_items']
+        effective_doctor = item['effective_doctor']
+        session_id = item['session_id']
+        session_date = item['session_date']
+        session_subject = item['session_subject']
+
+        total_met_all += item['met']
+        total_partial_all += item['partial']
+        total_not_met_all += item['not_met']
+
+        if checklist_items:
+            for checklist_item in checklist_items:
+                code = checklist_item.get('code')
+                if not code:
+                    continue
+                checklist_code_stats[code]['total'] += 1
+                if checklist_item['status'] == 'Met':
+                    checklist_code_stats[code]['met'] += 1
+                elif checklist_item['status'] == 'Partial':
+                    checklist_code_stats[code]['partial'] += 1
+                    if effective_doctor:
+                        doctor_payload = checklist_code_partial_by_doctor[code][effective_doctor]
+                        doctor_payload['count'] += 1
+                        doctor_payload['sessions'].append(
+                            {
+                                'session_id': session_id or None,
+                                'date': session_date or None,
+                                'subject': session_subject,
+                            }
+                        )
+                    else:
+                        unmapped_payload = checklist_code_partial_unmapped[code]
+                        unmapped_payload['count'] += 1
+                        unmapped_payload['sessions'].append(
+                            {
+                                'session_id': session_id or None,
+                                'date': session_date or None,
+                                'subject': session_subject,
+                            }
+                        )
+                else:
+                    checklist_code_stats[code]['not_met'] += 1
+                    if effective_doctor:
+                        doctor_payload = checklist_code_not_met_by_doctor[code][effective_doctor]
+                        doctor_payload['count'] += 1
+                        doctor_payload['sessions'].append(
+                            {
+                                'session_id': session_id or None,
+                                'date': session_date or None,
+                                'subject': session_subject,
+                            }
+                        )
+                    else:
+                        unmapped_payload = checklist_code_not_met_unmapped[code]
+                        unmapped_payload['count'] += 1
+                        unmapped_payload['sessions'].append(
+                            {
+                                'session_id': session_id or None,
+                                'date': session_date or None,
+                                'subject': session_subject,
+                            }
+                        )
+
+                item_order = checklist_item.get('order')
+                current_order = checklist_code_stats[code]['order']
+                if item_order is not None and (current_order is None or item_order < current_order):
+                    checklist_code_stats[code]['order'] = item_order
+
+                if not checklist_code_stats[code]['label']:
+                    item_label = str(checklist_item.get('item') or '').strip()
+                    checklist_code_stats[code]['label'] = item_label.split(':')[0].strip() if item_label else code
+
+                if checklist_item.get('has_evidence'):
+                    evidence_with += 1
+                else:
+                    evidence_without += 1
+
+    # Use same doctor matching strategy as get_dashboard_data (token intersection).
+    doctor_names = list(doctor_by_id.values())
+    for doctor_name in doctor_by_id.values():
+        doctor_rows = [item for item in active_rows if item['effective_doctor'] == doctor_name]
+
+        if not doctor_rows:
+            continue
+
+        sessions_count = 0
+        full_met_sessions = 0
+        met_total = 0
+        partial_total = 0
+        not_met_total = 0
+        last_session_date = None
+
+        for item in doctor_rows:
+            sessions_count += 1
+            met = item['met']
+            partial = item['partial']
+            not_met = item['not_met']
+
+            met_total += met
+            partial_total += partial
+            not_met_total += not_met
+            if _criteria_status(met, partial, not_met) == 'Fully Achieved':
+                full_met_sessions += 1
+
+            session_date = item['session_date']
+            if session_date and (not last_session_date or session_date > last_session_date):
+                last_session_date = session_date
+
+        observations = met_total + partial_total + not_met_total
+        compliance_rate = (met_total / observations * 100) if observations > 0 else 0
+        trainers.append(
+            {
+                'name': doctor_name,
+                'id': doctor_id_by_name[doctor_name],
+                'sessions_count': sessions_count,
+                'full_met_sessions': full_met_sessions,
+                'observations': observations,
+                'met': met_total,
+                'partial': partial_total,
+                'not_met': not_met_total,
+                'compliance_rate': round(compliance_rate, 2),
+                'last_session_date': last_session_date,
+            }
+        )
+
+    trainers.sort(key=lambda x: (x['observations'], x['met']), reverse=True)
+
+    total_met = total_met_all
+    total_partial = total_partial_all
+    total_not_met = total_not_met_all
+    total_observations = total_met + total_partial + total_not_met
+    overall_compliance = (total_met / total_observations * 100) if total_observations > 0 else 0
+    evidence_total = evidence_with + evidence_without
+    evidence_coverage = (evidence_with / evidence_total * 100) if evidence_total > 0 else 0
+    cancelled_sessions = sorted(
+        [
+            {
+                'doctor_id': doctor_id_by_name.get(item['owner_doctor'] or ''),
+                'doctor_name': item['owner_doctor'] or 'Unknown Doctor',
+                'date': item['session_date'] or None,
+                'subject': item['session_subject'] or 'Unknown Subject',
+                'session_id': item['session_id'] or None,
+                'trainer': str(item['row'].get('trainer') or '').strip() or None,
+            }
+            for item in prepared_rows
+            if item['cancelled_session']
+        ],
+        key=lambda x: ((x.get('date') or ''), (x.get('doctor_name') or ''), (x.get('subject') or '')),
+        reverse=True,
+    )
+
+    checklist_stats = []
+    for code, stat in checklist_code_stats.items():
+        total = stat['total'] or 1
+        met_rate = stat['met'] / total * 100
+        partial_rate = stat['partial'] / total * 100
+        not_met_rate = stat['not_met'] / total * 100
+        open_count = stat['partial'] + stat['not_met']
+        open_rate = open_count / total * 100
+        checklist_stats.append(
+            {
+                'code': code,
+                'label': stat['label'] or code,
+                'order': stat['order'],
+                'met': stat['met'],
+                'partial': stat['partial'],
+                'not_met': stat['not_met'],
+                'total': stat['total'],
+                'met_rate': round(met_rate, 2),
+                'partial_rate': round(partial_rate, 2),
+                'not_met_rate': round(not_met_rate, 2),
+                'open_count': open_count,
+                'open_rate': round(open_rate, 2),
+                'not_met_by_doctor': [
+                    {
+                        'id': doctor_id_by_name.get(doctor_name),
+                        'name': doctor_name,
+                        'count': payload['count'],
+                        'sessions': sorted(
+                            payload['sessions'],
+                            key=lambda x: (x.get('date') or ''),
+                            reverse=True,
+                        ),
+                    }
+                    for doctor_name, payload in sorted(
+                        checklist_code_not_met_by_doctor.get(code, {}).items(),
+                        key=lambda x: x[1]['count'],
+                        reverse=True,
+                    )
+                ],
+                'not_met_unmapped': {
+                    'count': checklist_code_not_met_unmapped.get(code, {}).get('count', 0),
+                    'sessions': sorted(
+                        checklist_code_not_met_unmapped.get(code, {}).get('sessions', []),
+                        key=lambda x: (x.get('date') or ''),
+                        reverse=True,
+                    ),
+                },
+                'partial_by_doctor': [
+                    {
+                        'id': doctor_id_by_name.get(doctor_name),
+                        'name': doctor_name,
+                        'count': payload['count'],
+                        'sessions': sorted(
+                            payload['sessions'],
+                            key=lambda x: (x.get('date') or ''),
+                            reverse=True,
+                        ),
+                    }
+                    for doctor_name, payload in sorted(
+                        checklist_code_partial_by_doctor.get(code, {}).items(),
+                        key=lambda x: x[1]['count'],
+                        reverse=True,
+                    )
+                ],
+                'partial_unmapped': {
+                    'count': checklist_code_partial_unmapped.get(code, {}).get('count', 0),
+                    'sessions': sorted(
+                        checklist_code_partial_unmapped.get(code, {}).get('sessions', []),
+                        key=lambda x: (x.get('date') or ''),
+                        reverse=True,
+                    ),
+                },
+            }
+        )
+
+    checklist_stats.sort(key=lambda x: (x['order'] is None, x['order'] if x['order'] is not None else 999, x['code']))
+
+    # Strengths: highest met rate first.
+    strengths = sorted(
+        checklist_stats,
+        key=lambda x: (x['met_rate'], -x['not_met_rate'], x['met']),
+        reverse=True,
+    )
+    top_strength_codes = {item['code'] for item in strengths[:6]}
+
+    # Improvements: lowest met rate first, excluding strengths to avoid overlap.
+    improvements_pool = [item for item in checklist_stats if item['code'] not in top_strength_codes]
+    improvements = sorted(
+        improvements_pool,
+        key=lambda x: (x['met_rate'], -x['not_met_rate'], -x['met']),
+    )
+    open_actions = sorted(checklist_stats, key=lambda x: (x['open_count'], x['open_rate']), reverse=True)
+
+    dates = [str(r.get('date') or '') for r in row_dicts if r.get('date')]
+    period = {'from': min(dates) if dates else None, 'to': max(dates) if dates else None}
+
+    return Response(
+        {
+            'period': period,
+            'totals': {
+                'total_sessions': total_sessions_all,
+                'matched_sessions': sum(t['sessions_count'] for t in trainers),
+                'compliance_rate': round(overall_compliance, 2),
+                'met': total_met,
+                'partial': total_partial,
+                'not_met': total_not_met,
+                'observations': total_observations,
+                'trainers_count': len(trainers),
+                'evidence_with': evidence_with,
+                'evidence_without': evidence_without,
+                'evidence_coverage_rate': round(evidence_coverage, 2),
+            },
+            'trainers': trainers,
+            'checklist_stats': checklist_stats,
+            'strengths': strengths[:6],
+            'improvements': improvements[:6],
+            'open_actions': open_actions[:5],
+            'cancelled_sessions': cancelled_sessions,
+        }
+    )
+
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def get_session_report(request):
+    """
+    Return detailed QA observation report payload for a single session.
+    Sources:
+      - qa_doctors_sessions (session-level fields)
+      - qa_doctors_checklist_items (visible checklist + evidence)
+    """
+    session_id = str(request.GET.get('session_id') or '').strip()
+    if not session_id:
+        return Response({'error': 'session_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+    qa_schema = os.getenv('QA_TABLE_SCHEMA', 'public')
+    qa_table = os.getenv('QA_TABLE_NAME', 'qa_doctors_sessions')
+    qa_table_q = f'"{qa_schema}"."{qa_table}"'
+
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT *
+                FROM {qa_table_q}
+                WHERE CAST(session_id AS text) = %s
+                ORDER BY date DESC NULLS LAST
+                LIMIT 1
+                """,
+                [session_id],
+            )
+            row = cursor.fetchone()
+            if not row:
+                return Response({'error': 'Session not found'}, status=status.HTTP_404_NOT_FOUND)
+            columns = [col[0] for col in cursor.description]
+    except Exception as exc:
+        return Response({'error': str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    session_row = dict(zip(columns, row))
+    checklist_items = _load_checklist_map({session_id}).get(session_id, [])
+
+    def _text(v, default=''):
+        if v is None:
+            return default
+        value = str(v).strip()
+        return value if value else default
+
+    def _as_bool(v):
+        if isinstance(v, bool):
+            return v
+        return str(v or '').strip().lower() in {'1', 'true', 't', 'yes', 'y'}
+
+    def _as_int(v):
+        try:
+            return int(float(v))
+        except (TypeError, ValueError):
+            return 0
+
+    def _as_json(v):
+        if v is None:
+            return {}
+        if isinstance(v, (dict, list)):
+            return v
+        text = str(v).strip()
+        if not text:
+            return {}
+        try:
+            return json.loads(text)
+        except Exception:
+            return {'raw': text}
+
+    def _as_text(value):
+        """
+        Convert scalar/dict/list into readable plain text (no JSON formatting in UI).
+        """
+        if value is None:
+            return ''
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, (int, float, bool)):
+            return str(value)
+        if isinstance(value, list):
+            parts = []
+            for item in value:
+                text = _as_text(item)
+                if text:
+                    parts.append(text)
+            return '\n'.join(parts)
+        if isinstance(value, dict):
+            parts = []
+            for key, val in value.items():
+                text = _as_text(val)
+                if text:
+                    parts.append(f"{key}: {text}")
+            return '\n'.join(parts)
+        return str(value).strip()
+
+    def _pick_row_value(row_obj, col_names):
+        for col in col_names:
+            if col in row_obj and row_obj.get(col) not in (None, ''):
+                return row_obj.get(col)
+        return None
+
+    cancelled_session = _as_bool(session_row.get('cancelled_session'))
+    teaching_quality_comment_raw = _pick_row_value(
+        session_row,
+        ['teaching_quality_comments', 'teaching_quality_comment'],
+    )
+    safeguarding_status_raw = _pick_row_value(
+        session_row,
+        ['safeguarding_status', 'safegarding_status'],
+    )
+    safeguarding_comment_raw = _pick_row_value(
+        session_row,
+        ['safeguarding_comments', 'safeguarding_comment', 'safegarding_comment'],
+    )
+
+    observed = len(checklist_items) > 0 or any(
+        _text(v)
+        for v in [
+            session_row.get('overall_judgement'),
+            teaching_quality_comment_raw,
+            session_row.get('areas_for_development'),
+        ]
+    ) or session_row.get('teaching_quality_rating') is not None
+    if cancelled_session:
+        observation_status = 'Not Delivered / Cancelled'
+    elif observed:
+        observation_status = 'Observed'
+    else:
+        observation_status = 'Scheduled / No Observation'
+
+    if checklist_items:
+        met_count = sum(1 for item in checklist_items if item.get('status') == 'Met')
+        partial_count = sum(1 for item in checklist_items if item.get('status') == 'Partial')
+        not_met_count = sum(1 for item in checklist_items if item.get('status') == 'Not Met')
+    else:
+        met_count = _as_int(session_row.get('met_count'))
+        partial_count = _as_int(session_row.get('partial_count'))
+        not_met_count = _as_int(session_row.get('not_met_count'))
+        met_count, partial_count, not_met_count = _exclude_safeguarding_from_counts(
+            session_row,
+            met_count,
+            partial_count,
+            not_met_count,
+        )
+    checklist_total = len(checklist_items) or (met_count + partial_count + not_met_count)
+
+    # Build text fields for report categories (plain text, not JSON).
+    duration_score_val = _pick_row_value(
+        session_row,
+        ['duration_score', 'duration_rating', 'session_duration_score'],
+    )
+    ksbs_covered_val = _pick_row_value(
+        session_row,
+        ['ksbs_covered', 'ksb_covered', 'ksb_coverage', 'ksbs_coverage', 'ksb_evaluation'],
+    )
+    strengths_val = _pick_row_value(session_row, ['strengths', 'key_strengths'])
+    areas_for_development_val = session_row.get('areas_for_development')
+    overall_judgement_val = session_row.get('overall_judgement')
+
+    met_items_labels = [
+        str(item.get('item') or item.get('code') or '').split(':')[0].strip()
+        for item in checklist_items
+        if item.get('status') == 'Met'
+    ]
+    partial_items_labels = [
+        str(item.get('item') or item.get('code') or '').split(':')[0].strip()
+        for item in checklist_items
+        if item.get('status') == 'Partial'
+    ]
+    not_met_items_labels = [
+        str(item.get('item') or item.get('code') or '').split(':')[0].strip()
+        for item in checklist_items
+        if item.get('status') == 'Not Met'
+    ]
+
+    engaged_speakers_count_val = _pick_row_value(
+        session_row,
+        ['engaged_speakers_count', 'engaged_speaker_count', 'engaged_speakers'],
+    )
+    engaged_val = _pick_row_value(
+        session_row,
+        ['engaged_speakers_count', 'engaged_speaker_count', 'engaged_speakers', 'engaged_learners', 'active_learners'],
+    )
+    engagement_val = session_row.get('Engagement')
+    learner_engagement_text = []
+    if engaged_val not in (None, ''):
+        learner_engagement_text.append(f"Actively engaged: {engaged_val}")
+    if engagement_val not in (None, ''):
+        learner_engagement_text.append(f"Engagement rate: {engagement_val}%")
+
+    quality_eval_text = _text(session_row.get('teaching_quality_rating'))
+    quality_comment_text = _text(teaching_quality_comment_raw)
+    safeguarding_eval_text = _text(safeguarding_status_raw)
+    safeguarding_comment_text = _text(safeguarding_comment_raw)
+
+    qa_checklist_text = (
+        f"{met_count} Pass | {partial_count} Partial | {not_met_count} Not Met"
+        + (
+            f"\nPass: {', '.join([x for x in met_items_labels if x])}" if met_items_labels else ''
+        )
+        + (
+            f"\nPartial: {', '.join([x for x in partial_items_labels if x])}" if partial_items_labels else ''
+        )
+        + (
+            f"\nNot Met: {', '.join([x for x in not_met_items_labels if x])}" if not_met_items_labels else ''
+        )
+    )
+
+    if not strengths_val:
+        strengths_val = ', '.join([x for x in met_items_labels if x]) if met_items_labels else ''
+
+    return Response(
+        {
+            'session': {
+                'session_id': session_id,
+                'date': _text(session_row.get('date')),
+                'subject': _text(session_row.get('subject')) or _text(session_row.get('hg_subject')) or _text(session_row.get('lms_module')),
+                'trainer': _text(session_row.get('trainer')),
+                'duration': _text(session_row.get('duration')),
+                'engagement': session_row.get('Engagement'),
+                'lms_module': _text(session_row.get('lms_module')) or _text(session_row.get('LMS_Module')) or _text(session_row.get('module')),
+                'lms_students_count': session_row.get('lms_students_count') or 0,
+                'meeting_id': _text(session_row.get('meeting_id')),
+                'observation_status': observation_status,
+                'cancelled_session': cancelled_session,
+                'engaged_speakers_count': int(engaged_speakers_count_val) if str(engaged_speakers_count_val or '').strip().isdigit() else None,
+            },
+            'qa_observation': {
+                'overall_judgement': _text(session_row.get('overall_judgement')),
+                'teaching_quality_rating': session_row.get('teaching_quality_rating'),
+                'teaching_quality_comment': _text(teaching_quality_comment_raw),
+                'safeguarding_status': _text(safeguarding_status_raw),
+                'safeguarding_comment': _text(safeguarding_comment_raw),
+                'areas_for_development': _as_json(session_row.get('areas_for_development')),
+            },
+            'observation_flags': {
+                'observed': observed and not cancelled_session,
+                'cancelled': cancelled_session,
+                'pending': (not observed) and (not cancelled_session),
+            },
+            'source_columns': {
+                'overall_judgement': 'qa_doctors_sessions.overall_judgement',
+                'teaching_quality_rating': 'qa_doctors_sessions.teaching_quality_rating',
+                'teaching_quality_comment': 'qa_doctors_sessions.teaching_quality_comments OR qa_doctors_sessions.teaching_quality_comment',
+                'safeguarding_status': 'qa_doctors_sessions.safeguarding_status OR qa_doctors_sessions.safegarding_status',
+                'safeguarding_comment': 'qa_doctors_sessions.safeguarding_comments OR qa_doctors_sessions.safeguarding_comment OR qa_doctors_sessions.safegarding_comment',
+                'areas_for_development': 'qa_doctors_sessions.areas_for_development',
+                'cancelled_session': 'qa_doctors_sessions.cancelled_session',
+                'checklist_items': 'qa_doctors_checklist_items.*',
+            },
+            'checklist_summary': {
+                'met': met_count,
+                'partial': partial_count,
+                'not_met': not_met_count,
+                'total': checklist_total,
+                'compliance_rate': round((met_count / checklist_total * 100), 2) if checklist_total else 0,
+            },
+            'report_text_sections': {
+                'duration_score': _as_text(duration_score_val),
+                'ksbs_covered': _as_text(ksbs_covered_val),
+                'quality_of_teaching_evaluation': quality_eval_text,
+                'quality_of_teaching_comments': quality_comment_text,
+                'learner_engagement': '\n'.join(learner_engagement_text).strip(),
+                'safeguarding_evaluation': safeguarding_eval_text,
+                'safeguarding_comments': safeguarding_comment_text,
+                'qa_checklist': qa_checklist_text.strip(),
+                'strengths': _as_text(strengths_val),
+                'areas_for_development': _as_text(_as_json(areas_for_development_val)),
+                'overall_judgement': _as_text(overall_judgement_val),
+            },
+            'checklist_items': checklist_items,
+        }
+    )
+
